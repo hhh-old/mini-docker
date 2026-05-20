@@ -25,7 +25,8 @@ const (
 	CLONE_NEWUSER = unix.CLONE_NEWUSER
 )
 
-// uintptr:无符号整数,
+// NewNamespaceFlags 创建默认的 Namespace 标志位组合
+// 对齐 Docker 的默认隔离：UTS + IPC + PID + Mount + Network
 func NewNamespaceFlags() uintptr {
 	return uintptr(
 		unix.CLONE_NEWUTS |
@@ -33,6 +34,32 @@ func NewNamespaceFlags() uintptr {
 			unix.CLONE_NEWPID |
 			unix.CLONE_NEWNS |
 			unix.CLONE_NEWNET,
+	)
+}
+
+// NewUserNamespaceFlags 创建包含 User Namespace 的标志位组合
+// User Namespace 允许容器内 root 映射为宿主机普通用户（rootless 容器）
+//
+// Docker 的 User Namespace 映射：
+// ┌──────────────┬──────────────┐
+// │ 容器内 UID   │ 宿主机 UID   │
+// ├──────────────┼──────────────┤
+// │ 0 (root)     │ 100000       │
+// │ 1            │ 100001       │
+// │ ...          │ ...          │
+// │ 65534        │ 165534       │
+// └──────────────┴──────────────┘
+//
+// 这样即使容器内进程自认为是 root，实际上在宿主机只是普通用户，
+// 无法破坏宿主机文件系统。
+func NewUserNamespaceFlags() uintptr {
+	return uintptr(
+		unix.CLONE_NEWUTS |
+			unix.CLONE_NEWIPC |
+			unix.CLONE_NEWPID |
+			unix.CLONE_NEWNS |
+			unix.CLONE_NEWNET |
+			unix.CLONE_NEWUSER,
 	)
 }
 
@@ -75,6 +102,18 @@ func setCloneFlags(cmd *exec.Cmd, flags uintptr, tty bool) {
 	if tty {
 		cmd.SysProcAttr.Setctty = true // 设置控制终端
 		cmd.SysProcAttr.Setsid = true  // 创建新的会话
+	}
+
+	// 如果包含 User Namespace，配置 UID/GID 映射
+	if flags&uintptr(unix.CLONE_NEWUSER) != 0 {
+		// Go 的 SysProcAttr 支持 User Namespace 的 UID/GID 映射
+		// 容器内 UID 0 → 宿主机当前用户
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		}
 	}
 }
 

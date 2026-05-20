@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"mini-docker/volume"
 )
 
 const (
@@ -22,7 +24,7 @@ type ContainerInfo struct {
 	Pid           int      `json:"pid"`
 	Image         string   `json:"image"`
 	Cmd           []string `json:"cmd"`
-	Status        string   `json:"status"`
+	Status        string   `json:"status"` // created, running, paused, exited, stopped, dead, restarting
 	CreatedAt     string   `json:"created_at"`
 	RootFS        string   `json:"rootfs"`
 	CgroupName    string   `json:"cgroup_name"`
@@ -33,18 +35,24 @@ type ContainerInfo struct {
 	OverlayMerged string   `json:"overlay_merged"`
 	OverlayUpper  string   `json:"overlay_upper"`
 	OverlayWork   string   `json:"overlay_work"`
+	RestartPolicy string   `json:"restart_policy"` // no, always, on-failure
+	ExitCode      int      `json:"exit_code"`
+	FinishedAt    string   `json:"finished_at"`
+	Volumes       []string `json:"volumes"` // 记录容器的 volume 挂载
 }
 
 type RunConfig struct {
-	Tty       bool
-	Detach    bool
-	Memory    string
-	CpuShares string
-	Network   string
-	Name      string
-	PortMap   string
-	Image     string
-	Cmd       []string //用于存储要在容器内执行的命令及其参数,对于 ./mini-docker run -it myos /bin/sh ，它就是 ["/bin/sh"] ，最终会让容器启动一个交互式 shell。
+	Tty           bool
+	Detach        bool
+	Memory        string
+	CpuShares     string
+	Network       string
+	Name          string
+	PortMap       string
+	Image         string
+	Cmd           []string //用于存储要在容器内执行的命令及其参数,对于 ./mini-docker run -it myos /bin/sh ，它就是 ["/bin/sh"] ，最终会让容器启动一个交互式 shell。
+	RestartPolicy string   // no(默认), always, on-failure
+	Volumes       []string // -v 参数列表，如 ["/host/path:/container/path", "mydata:/data"]
 }
 
 type CgroupManager interface {
@@ -88,6 +96,8 @@ func Run(config RunConfig, cg CgroupManager, netManager NetworkManager) error {
 		OverlayMerged: overlay.Merged,
 		OverlayUpper:  overlay.Upper,
 		OverlayWork:   overlay.Work,
+		RestartPolicy: config.RestartPolicy,
+		Volumes:       config.Volumes,
 	}
 	// /proc/self/exe —— 它指向当前可执行文件自身（即 mini-docker ）。这意味着子进程启动的还是 mini-docker 自己，但第一个参数变成了 "init" 。
 	cmd := exec.Command("/proc/self/exe", append([]string{"init"}, rootFSPath)...)
@@ -102,6 +112,31 @@ func Run(config RunConfig, cg CgroupManager, netManager NetworkManager) error {
 		"MINI_DOCKER_OVERLAY_UPPER="+overlay.Upper,
 		"MINI_DOCKER_OVERLAY_WORK="+overlay.Work,
 	)
+
+	// 解析 Volume 挂载，传递给 init 进程
+	// 对齐 Docker 的 -v 参数：将宿主机目录 bind mount 到容器内
+	var volumeMounts []string
+	for _, volSpec := range config.Volumes {
+		mount, err := volume.ParseVolumeMount(volSpec)
+		if err != nil {
+			fmt.Printf("警告: 解析卷挂载 %s 失败: %v\n", volSpec, err)
+			continue
+		}
+		hostPath, err := volume.ResolveMountPath(mount)
+		if err != nil {
+			fmt.Printf("警告: 解析卷路径 %s 失败: %v\n", volSpec, err)
+			continue
+		}
+		// 传递格式: hostPath:containerPath[:ro]
+		mountSpec := hostPath + ":" + mount.Destination
+		if mount.ReadOnly {
+			mountSpec += ":ro"
+		}
+		volumeMounts = append(volumeMounts, mountSpec)
+	}
+	if len(volumeMounts) > 0 {
+		cmd.Env = append(cmd.Env, "MINI_DOCKER_VOLUMES="+strings.Join(volumeMounts, ","))
+	}
 
 	nsFlags := NewNamespaceFlags()
 	//通过 Cloneflags 在 fork 时创建新的命名空间
@@ -175,6 +210,11 @@ func InitProcess(rootFSPath string, cmd []string) error {
 	if err := setHostname("mini-docker"); err != nil {
 		return fmt.Errorf("设置主机名失败: %w", err)
 	}
+
+	// 应用 Capability 限制（对齐 Docker 的安全模型）
+	// 在 pivot_root 之后、exec 之前设置，因为 setHostname 需要 CAP_SYS_ADMIN
+	ApplyCapabilitiesFromEnv()
+
 	//  用用户命令替换当前进程
 	//./mini-docker run -it myos /bin/sh
 	//│
@@ -212,20 +252,93 @@ func Exec(containerID string, cmd []string) error {
 		return fmt.Errorf("容器 %s 未在运行", containerID)
 	}
 
-	nsTypes := []string{"ipc", "uts", "net", "pid", "mnt"}
-	for _, nsType := range nsTypes {
-		nsPath := GetNamespacePath(containerInfo.Pid, nsType)
-		if err := SetNamespace(nsPath); err != nil {
-			return fmt.Errorf("加入 namespace %s 失败: %w", nsType, err)
-		}
+	// 使用 nsenter 命令进入容器的所有 namespace 执行命令
+	// 原因：Go 运行时是多线程的，直接调用 setns() 加入 mount namespace
+	// 会返回 EINVAL（setns 要求调用进程单线程）
+	// Docker 的做法也是通过 nsenter 或 fork 子进程后再 setns
+	//
+	// nsenter 参数说明：
+	//   -t <pid>   → 目标进程 PID
+	//   -m         → 进入 mount namespace
+	//   -u         → 进入 UTS namespace
+	//   -i         → 进入 IPC namespace
+	//   -n         → 进入 network namespace
+	//   -p         → 进入 PID namespace
+	//   --         → 后面是要执行的命令
+	nsenterCmd := exec.Command("nsenter",
+		"-t", fmt.Sprintf("%d", containerInfo.Pid),
+		"-m", "-u", "-i", "-n", "-p",
+		"--",
+	)
+	nsenterCmd.Args = append(nsenterCmd.Args, cmd...)
+
+	nsenterCmd.Stdin = os.Stdin
+	nsenterCmd.Stdout = os.Stdout
+	nsenterCmd.Stderr = os.Stderr
+
+	return nsenterCmd.Run()
+}
+
+// Start 重新启动已停止的容器
+// 对齐 Docker 的 docker start 命令
+func Start(containerID string) error {
+	containerInfo, err := loadContainerInfo(containerID)
+	if err != nil {
+		return fmt.Errorf("查找容器失败: %w", err)
 	}
 
-	execCmd := exec.Command(cmd[0], cmd[1:]...)
-	execCmd.Stdin = os.Stdin
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
+	// 只有 exited/stopped 状态的容器可以启动
+	if containerInfo.Status != "exited" && containerInfo.Status != "stopped" && containerInfo.Status != "created" {
+		return fmt.Errorf("容器 %s 状态为 %s，无法启动（仅 exited/stopped/created 可启动）", containerID, containerInfo.Status)
+	}
 
-	return execCmd.Run()
+	rootFSPath := containerInfo.RootFS
+	if rootFSPath == "" {
+		rootFSPath = filepath.Join(imageStoreDir, containerInfo.Image, "rootfs")
+	}
+
+	// 重新创建 Overlay 目录
+	overlay, err := createOverlayDirs(containerInfo.ID)
+	if err != nil {
+		return fmt.Errorf("创建 OverlayFS 目录失败: %w", err)
+	}
+	containerInfo.OverlayMerged = overlay.Merged
+	containerInfo.OverlayUpper = overlay.Upper
+	containerInfo.OverlayWork = overlay.Work
+
+	// 重新创建并启动容器进程
+	cmd := exec.Command("/proc/self/exe", append([]string{"init"}, rootFSPath)...)
+	cmd.Args = append(cmd.Args, containerInfo.Cmd...)
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	cmd.Env = append(os.Environ(),
+		"MINI_DOCKER_OVERLAY_MERGED="+overlay.Merged,
+		"MINI_DOCKER_OVERLAY_UPPER="+overlay.Upper,
+		"MINI_DOCKER_OVERLAY_WORK="+overlay.Work,
+	)
+
+	nsFlags := NewNamespaceFlags()
+	setCloneFlags(cmd, nsFlags, true) // start 时默认分配终端
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动容器进程失败: %w", err)
+	}
+
+	containerInfo.Pid = cmd.Process.Pid
+	containerInfo.Status = "running"
+	containerInfo.ExitCode = 0
+	containerInfo.FinishedAt = ""
+
+	if err := saveContainerInfo(containerInfo); err != nil {
+		return fmt.Errorf("保存容器信息失败: %w", err)
+	}
+
+	fmt.Printf("容器 %s 已启动 (PID: %d)\n", containerID[:12], cmd.Process.Pid)
+
+	return nil
 }
 
 func Stop(containerID string) error {
@@ -250,7 +363,9 @@ func Stop(containerID string) error {
 		}
 	}
 
-	containerInfo.Status = "stopped"
+	containerInfo.Status = "exited"
+	containerInfo.ExitCode = 143 // SIGTERM 默认退出码
+	containerInfo.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
 	cleanupContainerNetwork(containerInfo)
 	cleanupCgroup(containerInfo.CgroupName)
 	return saveContainerInfo(containerInfo)
@@ -298,8 +413,9 @@ func Remove(containerID string) error {
 		return fmt.Errorf("查找容器失败: %w", err)
 	}
 
-	if containerInfo.Status == "running" || containerInfo.Status == "paused" {
-		return fmt.Errorf("容器 %s 正在运行，请先停止容器", containerID)
+	// exited 和 stopped 状态的容器都可以删除
+	if containerInfo.Status == "running" || containerInfo.Status == "paused" || containerInfo.Status == "restarting" {
+		return fmt.Errorf("容器 %s 正在运行（状态: %s），请先停止容器", containerID, containerInfo.Status)
 	}
 
 	cleanupOverlay(containerInfo)
@@ -406,9 +522,11 @@ func createOverlayDirs(containerID string) (*OverlayDirs, error) {
 	}, nil
 }
 
-// 执行清理（销毁 cgroup、卸载 OverlayFS、更新状态）
+// cleanupContainer 执行清理（销毁 cgroup、断开网络、更新状态为 exited）
 func cleanupContainer(info *ContainerInfo, cg CgroupManager, netManager NetworkManager) {
-	info.Status = "stopped"
+	info.Status = "exited"
+	info.ExitCode = 0
+	info.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
 	_ = saveContainerInfo(info)
 
 	if netManager != nil {
@@ -542,6 +660,38 @@ func cleanupPortMapping(portMap string, containerIP string) {
 		"-p", "tcp", "-d", containerIP, "--dport", containerPort,
 		"-j", "MASQUERADE")
 	_ = cmd.Run()
+}
+
+// ReadContainerLogs 读取容器日志（对齐 Docker 的 json-log 格式）
+func ReadContainerLogs(containerID string) ([]string, error) {
+	shortID := containerID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+
+	logPath := filepath.Join(containerDataDir, shortID, shortID+"-json.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		// 尝试旧路径
+		return nil, fmt.Errorf("读取日志失败: %w", err)
+	}
+
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]string
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			lines = append(lines, line) // 非JSON行直接输出
+			continue
+		}
+		if logMsg, ok := entry["log"]; ok {
+			lines = append(lines, logMsg)
+		}
+	}
+
+	return lines, nil
 }
 
 func releaseContainerIP(networkName string, ip string) {

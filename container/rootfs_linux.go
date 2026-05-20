@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -86,6 +87,12 @@ func SetupRootFS(rootFSPath string, overlay *OverlayDirs) error {
 		return fmt.Errorf("挂载 tmpfs 失败: %w", err)
 	}
 
+	// 挂载 Volume（对齐 Docker 的 -v 参数）
+	// 在 pivot_root 之后，容器内的路径已经是新根，可以直接 bind mount
+	if err := mountVolumes(); err != nil {
+		fmt.Printf("  警告: 挂载卷失败: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -124,6 +131,61 @@ func mountTmp() error {
 		return err
 	}
 	return unix.Mount("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "size=64m")
+}
+
+// mountVolumes 挂载 Volume（bind mount）
+// 对齐 Docker 的数据卷机制：
+// - bind mount：mount --bind /host/path /container/path
+// - named volume：与 bind mount 相同，源路径指向 /var/lib/mini-docker/volumes/<name>/_data
+//
+// Docker 的 Volume 本质就是 bind mount，容器退出后 Volume 数据不丢失。
+// 而容器的 OverlayFS upper 层会被删除，所以非 Volume 的修改会丢失。
+func mountVolumes() error {
+	volumesStr := os.Getenv("MINI_DOCKER_VOLUMES")
+	if volumesStr == "" {
+		return nil
+	}
+
+	volumeSpecs := strings.Split(volumesStr, ",")
+	for _, spec := range volumeSpecs {
+		parts := strings.Split(spec, ":")
+		if len(parts) < 2 {
+			fmt.Printf("  警告: 无效的卷挂载规格: %s\n", spec)
+			continue
+		}
+
+		hostPath := parts[0]
+		containerPath := parts[1]
+		readOnly := len(parts) >= 3 && parts[2] == "ro"
+
+		// 确保容器内目标目录存在
+		if err := os.MkdirAll(containerPath, 0755); err != nil {
+			fmt.Printf("  警告: 创建容器挂载点 %s 失败: %v\n", containerPath, err)
+			continue
+		}
+
+		// 执行 bind mount
+		flags := unix.MS_BIND | unix.MS_REC
+		if readOnly {
+			flags |= unix.MS_RDONLY
+		}
+
+		if err := unix.Mount(hostPath, containerPath, "bind", uintptr(flags), ""); err != nil {
+			fmt.Printf("  警告: bind mount %s -> %s 失败: %v\n", hostPath, containerPath, err)
+			continue
+		}
+
+		// 只读挂载需要重新 mount 一次设置 MS_RDONLY
+		if readOnly {
+			if err := unix.Mount(hostPath, containerPath, "bind", uintptr(flags|unix.MS_REMOUNT), ""); err != nil {
+				fmt.Printf("  警告: 设置只读挂载 %s 失败: %v\n", containerPath, err)
+			}
+		}
+
+		fmt.Printf("  卷已挂载: %s -> %s\n", hostPath, containerPath)
+	}
+
+	return nil
 }
 
 func MountOverlayFS(lowerDirs []string, upperDir string, workDir string, mergedDir string) error {
