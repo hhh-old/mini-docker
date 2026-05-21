@@ -24,15 +24,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"mini-docker/cgroup"
 	"mini-docker/container"
+	"mini-docker/containerd"
 	"mini-docker/image"
 	"mini-docker/network"
 )
 
-// handleRun 处理 run 请求
+// handleRun 处理 run 请求（创建并运行容器）
 func (d *Daemon) handleRun(req Request) Response {
 	imageName := req.Args["image"]
 	cmdStr := req.Args["cmd"]
@@ -43,11 +45,10 @@ func (d *Daemon) handleRun(req Request) Response {
 	tty := req.Args["tty"] == "true"
 	detach := req.Args["detach"] == "true"
 
-	// Daemon 无法处理交互模式：没有终端 I/O
-	// 交互模式由 CLI 直接运行，不会到达这里
 	if tty && !detach {
 		return Response{Success: false, Message: "交互模式请直接运行，不要通过 Daemon"}
 	}
+
 	memory := req.Args["memory"]
 	cpuShares := req.Args["cpu_shares"]
 	netName := req.Args["network"]
@@ -58,80 +59,120 @@ func (d *Daemon) handleRun(req Request) Response {
 		restartPolicy = "no"
 	}
 
-	// 解析 volumes 参数
 	var volumes []string
 	if volsStr := req.Args["volumes"]; volsStr != "" {
 		volumes = strings.Split(volsStr, "|")
 	}
 
-	// 构造容器运行配置
-	config := container.RunConfig{
+	rootFSPath := filepath.Join("/var/lib/mini-docker/images", imageName, "rootfs")
+	if _, err := os.Stat(rootFSPath); os.IsNotExist(err) {
+		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 不存在，请先使用 mini-docker pull 拉取", imageName)}
+	}
+
+	containerID := fmt.Sprintf("%d", time.Now().UnixNano())
+	if name == "" {
+		name = containerID[:12]
+	}
+
+	overlay, err := container.CreateOverlayDirs(containerID)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("创建 OverlayFS 目录失败: %v", err)}
+	}
+
+	taskConfig := &containerd.TaskConfig{
+		ID:            containerID,
+		Image:         imageName,
+		Hostname:      name,
+		Cmd:           strings.Fields(cmdStr),
 		Tty:           tty,
-		Detach:        detach,
 		Memory:        memory,
 		CpuShares:     cpuShares,
 		Network:       netName,
-		Name:          name,
 		PortMap:       portMap,
+		RestartPolicy: restartPolicy,
+		Volumes:       volumes,
+		RootFSPath:    rootFSPath,
+		Overlay: &containerd.OverlayConfig{
+			Merged: overlay.Merged,
+			Upper:  overlay.Upper,
+			Work:   overlay.Work,
+		},
+	}
+
+	shimPID, err := d.service.CreateTask(taskConfig)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
+	}
+
+	state, _ := d.service.GetTaskState(containerID)
+	if state != nil {
+		if memory != "" || cpuShares != "" {
+			cg := &cgroup.CgroupManager{CgroupName: "mini-docker-" + containerID[:12]}
+			if memory != "" {
+				cg.MemoryLimit = memory
+			}
+			if cpuShares != "" {
+				cg.CpuShares = cpuShares
+			}
+			cg.Apply(state.Pid)
+		}
+
+		if netName != "" {
+			netMgr := &network.NetworkManager{NetworkName: netName}
+			if portMap != "" {
+				netMgr.PortMap = portMap
+			}
+			netMgr.Connect(state.Pid)
+		}
+	}
+
+	containerInfo := &container.ContainerInfo{
+		ID:            containerID,
+		Name:          name,
 		Image:         imageName,
 		Cmd:           strings.Fields(cmdStr),
+		Status:        "running",
+		CreatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+		RootFS:        rootFSPath,
+		OverlayMerged: overlay.Merged,
+		OverlayUpper:  overlay.Upper,
+		OverlayWork:   overlay.Work,
 		RestartPolicy: restartPolicy,
 		Volumes:       volumes,
 	}
-
-	// 创建 cgroup 管理器
-	cg := &cgroup.CgroupManager{}
-	if config.Memory != "" {
-		cg.MemoryLimit = config.Memory
+	if state != nil {
+		containerInfo.Pid = state.Pid
 	}
-	if config.CpuShares != "" {
-		cg.CpuShares = config.CpuShares
+	if netName != "" {
+		containerInfo.NetworkName = netName
 	}
-
-	// 创建网络管理器
-	netMgr := &network.NetworkManager{}
-	if config.Network != "" {
-		netMgr.NetworkName = config.Network
-	}
-	if config.PortMap != "" {
-		netMgr.PortMap = config.PortMap
+	if portMap != "" {
+		containerInfo.PortMap = portMap
 	}
 
-	// 运行容器
-	err := container.Run(config, cg, netMgr)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
+	if err := container.SaveContainerInfo(containerInfo); err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
 	}
 
-	// 获取容器信息（Run 内部已保存）
-	containers, _ := container.ListContainers()
-	var containerInfo *container.ContainerInfo
-	for _, c := range containers {
-		if c.Image == imageName && (c.Status == "running") {
-			containerInfo = c
-			break
-		}
+	state2 := &ContainerState{
+		ID:            containerID,
+		ShimPID:       shimPID,
+		CreatedAt:     time.Now(),
+		RestartPolicy: restartPolicy,
 	}
-
-	if containerInfo != nil {
-		// 注册到 Daemon 管理
-		proc, _ := os.FindProcess(containerInfo.Pid)
-		state := &ContainerState{
-			ID:            containerInfo.ID,
-			Pid:           containerInfo.Pid,
-			Cmd:           proc,
-			CgroupMgr:     cg,
-			NetMgr:        netMgr,
-			CreatedAt:     time.Now(),
-			RestartPolicy: restartPolicy,
-		}
-		d.RegisterContainer(state)
-
-		// 后台模式下监控容器退出
-		if detach {
-			go d.WatchContainer(state)
-		}
+	if state != nil {
+		state2.Pid = state.Pid
 	}
+	d.RegisterContainer(state2)
+
+	go d.WatchContainer(containerID)
+
+	d.eventBus.Publish(Event{
+		Type:      "container_start",
+		Container: containerID,
+		Time:      time.Now(),
+		Message:   fmt.Sprintf("容器已启动 (shim PID: %d)", shimPID),
+	})
 
 	return Response{
 		Success: true,
@@ -147,14 +188,19 @@ func (d *Daemon) handleStop(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	err := container.Stop(containerID)
-	if err != nil {
+	if err := d.service.KillTask(containerID, syscall.SIGTERM); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("停止容器失败: %v", err)}
 	}
 
-	// 从 Daemon 注销
-	if state, ok := d.GetContainerState(containerID); ok {
-		d.UnregisterContainer(state.ID)
+	time.Sleep(2 * time.Second)
+
+	state, _ := d.service.GetTaskState(containerID)
+	if state != nil && (state.Status == "running" || state.Status == "created") {
+		d.service.KillTask(containerID, syscall.SIGKILL)
+	}
+
+	if state2, ok := d.GetContainerState(containerID); ok {
+		d.UnregisterContainer(state2.ID)
 	}
 
 	d.eventBus.Publish(Event{
@@ -174,9 +220,24 @@ func (d *Daemon) handleStart(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	err := container.Start(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
+	imageName := containerd.GetContainerImage(containerID)
+	cmd := containerd.GetContainerCmd(containerID)
+	restartPolicy := containerd.GetContainerRestartPolicy(containerID)
+
+	d.service.DeleteTask(containerID)
+
+	newReq := Request{
+		Type: "run",
+		Args: map[string]string{
+			"image":          imageName,
+			"cmd":            strings.Join(cmd, " "),
+			"restart_policy": restartPolicy,
+			"detach":         "true",
+		},
+	}
+	resp := d.handleRun(newReq)
+	if !resp.Success {
+		return resp
 	}
 
 	d.eventBus.Publish(Event{
@@ -196,14 +257,7 @@ func (d *Daemon) handlePause(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	cgroupName, err := container.GetContainerCgroupName(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("查找容器失败: %v", err)}
-	}
-
-	cg := &cgroup.CgroupManager{CgroupName: cgroupName}
-	err = container.Pause(containerID, cg)
-	if err != nil {
+	if err := d.service.PauseTask(containerID); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("暂停容器失败: %v", err)}
 	}
 
@@ -223,14 +277,7 @@ func (d *Daemon) handleUnpause(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	cgroupName, err := container.GetContainerCgroupName(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("查找容器失败: %v", err)}
-	}
-
-	cg := &cgroup.CgroupManager{CgroupName: cgroupName}
-	err = container.Unpause(containerID, cg)
-	if err != nil {
+	if err := d.service.ResumeTask(containerID); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("恢复容器失败: %v", err)}
 	}
 
@@ -250,10 +297,16 @@ func (d *Daemon) handleRm(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	err := container.Remove(containerID)
-	if err != nil {
+	state, _ := d.service.GetTaskState(containerID)
+	if state != nil && (state.Status == "running" || state.Status == "created") {
+		return Response{Success: false, Message: fmt.Sprintf("容器 %s 正在运行，请先停止容器", containerID)}
+	}
+
+	if err := d.service.DeleteTask(containerID); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("删除容器失败: %v", err)}
 	}
+
+	container.RemoveContainerInfo(containerID)
 
 	d.eventBus.Publish(Event{
 		Type:      "container_rm",
@@ -282,8 +335,7 @@ func (d *Daemon) handleExec(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID和命令"}
 	}
 
-	err := container.Exec(containerID, strings.Fields(cmdStr))
-	if err != nil {
+	if err := d.service.ExecTask(containerID, strings.Fields(cmdStr)); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("执行命令失败: %v", err)}
 	}
 

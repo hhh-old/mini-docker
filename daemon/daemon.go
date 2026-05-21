@@ -31,13 +31,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mini-docker/container"
+	"mini-docker/spec"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"mini-docker/containerd"
 )
 
 const (
@@ -53,12 +58,14 @@ type Daemon struct {
 	listener   net.Listener
 	eventBus   *EventBus
 	shutdown   chan struct{}
+	service    *containerd.Service
 }
 
 // ContainerState 运行中容器的运行时状态（仅 Daemon 持有）
 type ContainerState struct {
 	ID        string
 	Pid       int
+	ShimPID   int
 	Cmd       *os.Process
 	CgroupMgr interface {
 		Apply(pid int) error
@@ -83,10 +90,11 @@ func NewDaemon() *Daemon {
 		containers: make(map[string]*ContainerState),
 		eventBus:   NewEventBus(),
 		shutdown:   make(chan struct{}),
+		service:    containerd.NewService(),
 	}
 }
 
-// Start 启动 Daemon，监听 Unix Socket
+// 启动 Daemon，监听 Unix Socket
 func (d *Daemon) Start() error {
 	// 检查是否已有 Daemon 运行
 	if IsRunning() {
@@ -113,15 +121,15 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("写入 PID 文件失败: %w", err)
 	}
 
-	// 监听 Unix Socket
+	// 监听 Unix Socket,此处会创建SocketPath文件
 	l, err := net.Listen("unix", SocketPath)
 	if err != nil {
 		return fmt.Errorf("监听 Unix Socket 失败: %w", err)
 	}
 	d.listener = l
 
-	// 设置 Socket 文件权限（允许同组用户访问）
-	os.Chmod(SocketPath, 0660)
+	// 设置 Socket 文件权限（允许所有用户访问）
+	os.Chmod(SocketPath, 0666)
 
 	log.Printf("Daemon 启动成功，监听 %s (PID: %d)\n", SocketPath, os.Getpid())
 
@@ -133,9 +141,13 @@ func (d *Daemon) Start() error {
 
 	// 信号处理
 	sigCh := make(chan os.Signal, 1)
+	//注册需要监听的信号
+	//告诉 Go 运行时（Runtime）：当这个进程收到以下两种信号时，不要直接杀死进程，而是把信号“转发”到 sigCh 通道里：
+	//syscall.SIGINT：中断信号。通常是用户在终端按下 Ctrl + C 时触发。
+	//syscall.SIGTERM：终止信号。通常是系统关机、使用 kill 命令（默认不带 -9），或 systemd 停止服务时发送的优雅退出请求。
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		sig := <-sigCh
+		sig := <-sigCh // 阻塞等待，直到收到信号
 		log.Printf("收到信号 %v，开始优雅关闭...\n", sig)
 		d.Stop()
 		os.Exit(0)
@@ -162,12 +174,12 @@ func (d *Daemon) Stop() {
 func (d *Daemon) acceptLoop() {
 	for {
 		select {
-		case <-d.shutdown:
+		case <-d.shutdown: //检查通道是否关闭,如果通道调用了close(d.shutdown) （也就是在deamon进程关闭的时候Stop() 函数执行了），读取关闭的通道绝不阻塞，会立刻返回一个该类型的“零值”（这里是 struct{}{}）
 			return
 		default:
 		}
 
-		conn, err := d.listener.Accept()
+		conn, err := d.listener.Accept() //阻塞等待客户端连接
 		if err != nil {
 			select {
 			case <-d.shutdown:
@@ -210,39 +222,56 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 // routeRequest 路由请求到对应处理器
 func (d *Daemon) routeRequest(req Request) Response {
 	switch req.Type {
-	case "run":
+	// mini-docker run -d --name web -m 128m -c 512 -p 8080:80 -v /data:/app busybox sleep 3600
+	case "run": // 创建并运行容器（-d 后台模式走 daemon，前台模式直接调用 container 包）
 		return d.handleRun(req)
-	case "stop":
+	// mini-docker stop <containerID>
+	case "stop": // 停止运行中的容器（SIGTERM → 等待 → SIGKILL）
 		return d.handleStop(req)
-	case "start":
+	// mini-docker start <containerID>
+	case "start": // 启动已停止的容器（重新创建 shim + runtime）
 		return d.handleStart(req)
-	case "pause":
+	// mini-docker pause <containerID>
+	case "pause": // 暂停容器（通过 cgroup freezer 冻结进程）
 		return d.handlePause(req)
-	case "unpause":
+	// mini-docker unpause <containerID>
+	case "unpause": // 恢复已暂停的容器
 		return d.handleUnpause(req)
-	case "rm":
+	// mini-docker rm <containerID>
+	case "rm": // 删除已停止的容器（清理 shim、runtime、overlay 等资源）
 		return d.handleRm(req)
-	case "ps":
+	// mini-docker ps
+	case "ps": // 列出所有容器（从持久化的 ContainerInfo JSON 读取）
 		return d.handlePs(req)
-	case "exec":
+	// mini-docker exec <containerID> ls -la
+	case "exec": // 在运行中的容器内执行命令（通过 shim + nsenter 进入容器 namespace）
 		return d.handleExec(req)
-	case "logs":
+	// mini-docker logs <containerID>
+	case "logs": // 查看容器日志（读取 json-log 格式日志文件）
 		return d.handleLogs(req)
-	case "events":
+	// mini-docker events
+	case "events": // 实时监听容器事件流（阻塞式推送 start/stop/exit 等事件）
 		return d.handleEvents(req)
-	case "images":
+	// mini-docker images
+	case "images": // 列出本地镜像（从镜像数据库读取）
 		return d.handleImages(req)
-	case "pull":
+	// mini-docker pull busybox
+	case "pull": // 拉取镜像（从 Registry 下载或本地创建 rootfs）
 		return d.handlePull(req)
-	case "rmi":
+	// mini-docker rmi busybox
+	case "rmi": // 删除本地镜像（清理 rootfs 和镜像数据库记录）
 		return d.handleRmi(req)
-	case "network_create":
+	// mini-docker network create --name mynet --driver bridge --subnet 172.20.0.0/16
+	case "network_create": // 创建 bridge 网络（创建 Linux bridge + 初始化子网 IPAM）
 		return d.handleNetworkCreate(req)
-	case "network_list":
+	// mini-docker network list
+	case "network_list": // 列出所有已创建的网络
 		return d.handleNetworkList(req)
-	case "network_delete":
+	// mini-docker network delete <networkName>
+	case "network_delete": // 删除网络（断开所有容器 + 销毁 bridge + 清理 iptables）
 		return d.handleNetworkDelete(req)
-	case "ping":
+	// daemon 内部使用，客户端通过 Client.Ping() 调用
+	case "ping": // 心跳检测，客户端用来确认 daemon 是否存活
 		return Response{Success: true, Message: "pong"}
 	default:
 		return Response{Success: false, Message: fmt.Sprintf("未知请求类型: %s", req.Type)}
@@ -292,59 +321,69 @@ func (d *Daemon) GetContainerState(containerID string) (*ContainerState, bool) {
 }
 
 // WatchContainer 监控容器进程退出（在 goroutine 中调用）
-func (d *Daemon) WatchContainer(state *ContainerState) {
-	// 等待容器进程退出
-	_, err := state.Cmd.Wait()
+func (d *Daemon) WatchContainer(containerID string) {
+	state, ok := d.GetContainerState(containerID)
+	if !ok {
+		return
+	}
+
+	exitInfo, err := d.service.GetExitInfo(containerID)
+	if err != nil {
+		log.Printf("获取容器 %s 退出信息失败: %v\n", containerID[:12], err)
+		return
+	}
 
 	exitCode := 0
-	if err != nil {
-		exitCode = 1 // 非正常退出
+	if exitInfo != nil {
+		exitCode = exitInfo.ExitCode
 	}
 
 	d.eventBus.Publish(Event{
 		Type:      "container_exit",
-		Container: state.ID,
+		Container: containerID,
 		ExitCode:  exitCode,
 		Time:      time.Now(),
 	})
 
-	// 处理重启策略
 	if state.RestartPolicy != "no" {
 		if state.RestartPolicy == "always" ||
 			(state.RestartPolicy == "on-failure" && exitCode != 0) {
 			log.Printf("容器 %s 退出 (exit=%d)，根据重启策略 %s 准备重启\n",
-				state.ID[:12], exitCode, state.RestartPolicy)
-			d.handleRestart(state, exitCode)
+				containerID[:12], exitCode, state.RestartPolicy)
+			d.handleRestart(containerID, exitCode)
 			return
 		}
 	}
 
-	// 清理容器
-	d.cleanupExitedContainer(state.ID)
+	d.cleanupExitedContainer(containerID)
 }
 
 // handleRestart 处理容器重启
-func (d *Daemon) handleRestart(state *ContainerState, exitCode int) {
+func (d *Daemon) handleRestart(containerID string, exitCode int) {
 	d.mu.Lock()
-	delete(d.containers, state.ID)
+	delete(d.containers, containerID)
 	d.mu.Unlock()
 
-	// 更新容器状态为 restarting
-	updateContainerStatus(state.ID, "restarting")
+	imageName := containerd.GetContainerImage(containerID)
+	cmd := containerd.GetContainerCmd(containerID)
+	restartPolicy := containerd.GetContainerRestartPolicy(containerID)
 
-	// 重新创建容器（使用相同配置）
+	d.service.DeleteTask(containerID)
+
 	req := Request{
 		Type: "run",
 		Args: map[string]string{
-			"image":          getContainerImage(state.ID),
-			"restart_policy": state.RestartPolicy,
+			"image":          imageName,
+			"cmd":            strings.Join(cmd, " "),
+			"restart_policy": restartPolicy,
+			"detach":         "true",
 		},
 	}
 	resp := d.handleRun(req)
 	if resp.Success {
-		log.Printf("容器 %s 重启成功\n", state.ID[:12])
+		log.Printf("容器 %s 重启成功\n", containerID[:12])
 	} else {
-		log.Printf("容器 %s 重启失败: %s\n", state.ID[:12], resp.Message)
+		log.Printf("容器 %s 重启失败: %s\n", containerID[:12], resp.Message)
 	}
 }
 
@@ -353,16 +392,261 @@ func (d *Daemon) cleanupExitedContainer(containerID string) {
 	d.mu.Lock()
 	delete(d.containers, containerID)
 	d.mu.Unlock()
-
-	// 更新容器状态
-	updateContainerStatus(containerID, "exited")
 }
 
-// restoreContainers Daemon 重启后恢复容器管理
+// restoreContainers 的核心职责是在 Daemon 重启后，重新接管和恢复对已有容器的管理。
+// 在容器化架构（如 Docker / containerd）中，Daemon 进程（dockerd）的退出、崩溃或重启，不应该导致正在运行的后台容器（-d）一同挂掉（这一特性在 Docker 中被称为 Live Restore）。
+// 当 Daemon 重新启动时，它需要知道当前宿主机上还有哪些容器正在运行，并将它们重新纳入自己的监控体系中。
+//
+// 恢复流程（对齐 Docker 的 dockerd restore 逻辑）：
+//  1. 从 runtime state 文件扫描所有已知任务
+//  2. 验证 shim 进程是否存活（通过 socket 连通性检测）
+//  3. 验证容器进程是否存活（通过 signal 0 探测）
+//  4. 从持久化的 ContainerInfo JSON 重建内存状态
+//  5. 重新注册到 Daemon 的 containers map
+//  6. 重新启动 WatchContainer goroutine 监控容器退出
+//  7. 对于已死亡的容器，根据重启策略决定是否重启
 func (d *Daemon) restoreContainers() {
-	// 从 /var/run/mini-docker/ 读取已有容器信息
-	// 检查进程是否仍在运行，恢复监控
 	log.Println("恢复已有容器管理...")
+
+	tasks, err := d.service.ListTasks()
+	if err != nil {
+		log.Printf("列出已有任务失败: %v\n", err)
+		return
+	}
+
+	if len(tasks) == 0 {
+		log.Println("没有需要恢复的容器")
+		return
+	}
+
+	restored := 0
+	failed := 0
+	for _, task := range tasks {
+		shortID := task.ID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
+		if task.Status == "stopped" {
+			d.handleStoppedTask(task.ID, shortID)
+			continue
+		}
+
+		shimAlive := containerd.IsShimAlive(task.ID)
+		if !shimAlive {
+			log.Printf("容器 %s 的 shim 进程已离线，尝试降级恢复...\n", shortID)
+			if d.handleDeadShim(task.ID, shortID) {
+				restored++
+			} else {
+				failed++
+			}
+			continue
+		}
+
+		shimPID := containerd.ReadShimPID(task.ID)
+
+		info, err := d.loadContainerInfoForRestore(task.ID)
+		if err != nil {
+			log.Printf("容器 %s 的元数据加载失败: %v，跳过恢复\n", shortID, err)
+			failed++
+			continue
+		}
+
+		createdAt := time.Now()
+		if info.CreatedAt != "" {
+			if t, err := time.Parse("2006-01-02 15:04:05", info.CreatedAt); err == nil {
+				createdAt = t
+			}
+		}
+
+		state := &ContainerState{
+			ID:            task.ID,
+			Pid:           task.Pid,
+			ShimPID:       shimPID,
+			CreatedAt:     createdAt,
+			RestartPolicy: info.RestartPolicy,
+		}
+
+		d.RegisterContainer(state)
+		go d.WatchContainer(task.ID)
+
+		info.Status = "running"
+		info.Pid = task.Pid
+		container.SaveContainerInfo(info)
+
+		restored++
+		log.Printf("恢复容器 %s (PID=%d, shim=%d, 策略=%s)\n",
+			shortID, task.Pid, shimPID, info.RestartPolicy)
+	}
+
+	d.cleanupOrphanedInfos(tasks)
+
+	log.Printf("容器恢复完成: 共 %d 个任务, 成功恢复 %d 个, 失败 %d 个\n",
+		len(tasks), restored, failed)
+}
+
+// loadContainerInfoForRestore 从持久化存储加载容器元数据
+// 容器元数据存储在 /var/run/mini-docker/<shortID>.json
+func (d *Daemon) loadContainerInfoForRestore(containerID string) (*container.ContainerInfo, error) {
+	containers, err := container.ListContainers()
+	if err != nil {
+		return nil, fmt.Errorf("列出容器信息失败: %w", err)
+	}
+
+	for _, c := range containers {
+		if c.ID == containerID {
+			return c, nil
+		}
+	}
+
+	return nil, fmt.Errorf("容器 %s 的元数据不存在", containerID)
+}
+
+// handleStoppedTask 处理已停止的任务
+// 从 runtime state 中发现状态为 stopped 的任务，清理残留的 runtime 资源
+func (d *Daemon) handleStoppedTask(taskID string, shortID string) {
+	info, err := d.loadContainerInfoForRestore(taskID)
+	if err != nil {
+		d.service.DeleteTask(taskID)
+		return
+	}
+
+	if info.Status == "running" {
+		info.Status = "exited"
+		info.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+		container.SaveContainerInfo(info)
+		log.Printf("容器 %s 进程已退出，状态已更新为 exited\n", shortID)
+	}
+
+	if info.RestartPolicy == "always" {
+		log.Printf("容器 %s 重启策略为 always，准备重启...\n", shortID)
+		d.triggerRestart(taskID, info)
+	}
+}
+
+// handleDeadShim 处理 shim 进程已死亡的情况
+// shim 死亡意味着无法再与容器 runtime 通信，需要判断容器进程是否仍在运行
+// 返回值: true 表示成功恢复（进程仍存活并已注册），false 表示恢复失败
+func (d *Daemon) handleDeadShim(taskID string, shortID string) bool {
+	info, err := d.loadContainerInfoForRestore(taskID)
+	if err != nil {
+		d.service.DeleteTask(taskID)
+		return false
+	}
+
+	proc, err := os.FindProcess(info.Pid)
+	processAlive := err == nil && proc.Signal(syscall.Signal(0)) == nil
+
+	if processAlive {
+		log.Printf("容器 %s 进程 (PID=%d) 仍在运行但 shim 已丢失，降级恢复\n",
+			shortID, info.Pid)
+
+		createdAt := time.Now()
+		if info.CreatedAt != "" {
+			if t, err := time.Parse("2006-01-02 15:04:05", info.CreatedAt); err == nil {
+				createdAt = t
+			}
+		}
+
+		state := &ContainerState{
+			ID:            taskID,
+			Pid:           info.Pid,
+			ShimPID:       0,
+			CreatedAt:     createdAt,
+			RestartPolicy: info.RestartPolicy,
+		}
+
+		d.RegisterContainer(state)
+		go d.WatchContainer(taskID)
+
+		info.Status = "running"
+		container.SaveContainerInfo(info)
+		return true
+	}
+
+	log.Printf("容器 %s 进程和 shim 均已死亡，清理资源\n", shortID)
+	info.Status = "exited"
+	info.ExitCode = -1
+	info.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+	container.SaveContainerInfo(info)
+	d.service.DeleteTask(taskID)
+
+	if info.RestartPolicy == "always" || (info.RestartPolicy == "on-failure" && info.ExitCode != 0) {
+		log.Printf("容器 %s 根据重启策略 %s 准备重启\n", shortID, info.RestartPolicy)
+		d.triggerRestart(taskID, info)
+	}
+	return false
+}
+
+// triggerRestart 触发容器重启
+func (d *Daemon) triggerRestart(taskID string, info *container.ContainerInfo) {
+	d.service.DeleteTask(taskID)
+
+	cmdStr := ""
+	if len(info.Cmd) > 0 {
+		cmdStr = strings.Join(info.Cmd, " ")
+	}
+
+	req := Request{
+		Type: "run",
+		Args: map[string]string{
+			"image":          info.Image,
+			"cmd":            cmdStr,
+			"restart_policy": info.RestartPolicy,
+			"detach":         "true",
+			"name":           info.Name,
+		},
+	}
+	if info.NetworkName != "" {
+		req.Args["network"] = info.NetworkName
+	}
+	if info.PortMap != "" {
+		req.Args["port_map"] = info.PortMap
+	}
+
+	resp := d.handleRun(req)
+	if resp.Success {
+		log.Printf("容器 %s 重启成功\n", taskID[:minLen(taskID, 12)])
+	} else {
+		log.Printf("容器 %s 重启失败: %s\n", taskID[:minLen(taskID, 12)], resp.Message)
+	}
+}
+
+// cleanupOrphanedInfos 清理孤儿 ContainerInfo
+// 当 ContainerInfo JSON 文件存在但对应的 runtime state 已不存在时，
+// 说明容器的 runtime 资源已被清理但元数据残留，需要同步更新状态
+func (d *Daemon) cleanupOrphanedInfos(tasks []spec.State) {
+	taskSet := make(map[string]bool)
+	for _, t := range tasks {
+		taskSet[t.ID] = true
+	}
+
+	containers, err := container.ListContainers()
+	if err != nil {
+		return
+	}
+
+	for _, c := range containers {
+		if taskSet[c.ID] {
+			continue
+		}
+
+		if c.Status == "running" {
+			c.Status = "exited"
+			c.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+			container.SaveContainerInfo(c)
+			log.Printf("清理孤儿容器 %s: runtime 已不存在，状态更新为 exited\n",
+				c.ID[:minLen(c.ID, 12)])
+		}
+	}
+}
+
+func minLen(s string, n int) int {
+	if len(s) < n {
+		return len(s)
+	}
+	return n
 }
 
 // IsRunning 检查 Daemon 是否已在运行
@@ -406,16 +690,8 @@ func readPidFile() string {
 	return string(data)
 }
 
-// updateContainerStatus 更新容器元数据中的状态（辅助函数）
-func updateContainerStatus(containerID string, status string) {
-	// 加载容器信息，更新状态，保存
-	// 实际实现在 container 包中完成
-	_ = containerID
-	_ = status
-}
-
-// getContainerImage 获取容器的镜像名（辅助函数）
-func getContainerImage(containerID string) string {
-	_ = containerID
-	return ""
+// ExitInfo 容器退出信息（从 shim 读取）
+type ExitInfo struct {
+	ExitCode int    `json:"exit_code"`
+	ExitedAt string `json:"exited_at"`
 }

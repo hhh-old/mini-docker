@@ -113,6 +113,9 @@ func Create(name string) (*VolumeInfo, error) {
 // List 列出所有数据卷
 func List() ([]*VolumeInfo, error) {
 	if err := os.MkdirAll(volumeStorePath, 0755); err != nil {
+		if os.IsPermission(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -175,10 +178,11 @@ func Inspect(name string) (*VolumeInfo, error) {
 
 // ParseVolumeMount 解析 -v 参数
 // 支持格式：
-//   -v /host/path:/container/path         → bind mount
-//   -v /host/path:/container/path:ro       → bind mount (read-only)
-//   -v volume-name:/container/path         → named volume
-//   -v volume-name:/container/path:ro      → named volume (read-only)
+//
+//	-v /host/path:/container/path         → bind mount
+//	-v /host/path:/container/path:ro       → bind mount (read-only)
+//	-v volume-name:/container/path         → named volume
+//	-v volume-name:/container/path:ro      → named volume (read-only)
 func ParseVolumeMount(volumeSpec string) (*VolumeMount, error) {
 	parts := splitVolumeSpec(volumeSpec)
 	if len(parts) < 2 {

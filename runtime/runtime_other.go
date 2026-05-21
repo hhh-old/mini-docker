@@ -1,0 +1,33 @@
+//go:build !linux
+
+package runtime
+
+import (
+	"fmt"
+	"os"
+)
+
+func Create(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime create 仅支持 Linux")
+	os.Exit(1)
+}
+
+func Start(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime start 仅支持 Linux")
+	os.Exit(1)
+}
+
+func Kill(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime kill 仅支持 Linux")
+	os.Exit(1)
+}
+
+func Delete(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime delete 仅支持 Linux")
+	os.Exit(1)
+}
+
+func State(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime state 仅支持 Linux")
+	os.Exit(1)
+}

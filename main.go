@@ -11,6 +11,8 @@ import (
 	"mini-docker/container"
 	"mini-docker/daemon"
 	"mini-docker/network"
+	"mini-docker/runtime"
+	"mini-docker/shim"
 	"mini-docker/volume"
 )
 
@@ -61,6 +63,10 @@ func main() {
 		volumeCommand()
 	case "build":
 		buildCommand()
+	case "runtime":
+		runtimeCommand()
+	case "shim":
+		shim.Run(os.Args[2:])
 	case "help":
 		printUsage()
 	default:
@@ -91,6 +97,10 @@ func printUsage() {
 	fmt.Println("  mini-docker network  <子命令>               管理容器网络")
 	fmt.Println("  mini-docker volume   <子命令>               管理数据卷")
 	fmt.Println("  mini-docker build    -t <镜像名> <上下文>       构建镜像")
+	fmt.Println()
+	fmt.Println("内部命令（对齐 Docker 分层架构）:")
+	fmt.Println("  mini-docker runtime  <create|start|kill|delete|state>  OCI 运行时 (对标 runc)")
+	fmt.Println("  mini-docker shim     <id> <bundle> <config>           容器 shim 进程 (对标 containerd-shim)")
 	fmt.Println()
 	fmt.Println("run 选项:")
 	fmt.Println("  -it                           交互式模式（分配终端）")
@@ -758,4 +768,28 @@ func buildCommand() {
 	}
 
 	_ = result
+}
+
+func runtimeCommand() {
+	args := os.Args[2:]
+	if len(args) < 1 {
+		fmt.Println("用法: mini-docker runtime <create|start|kill|delete|state> [参数]")
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "create":
+		runtime.Create(args[1:])
+	case "start":
+		runtime.Start(args[1:])
+	case "kill":
+		runtime.Kill(args[1:])
+	case "delete":
+		runtime.Delete(args[1:])
+	case "state":
+		runtime.State(args[1:])
+	default:
+		fmt.Printf("未知 runtime 子命令: %s\n", args[0])
+		os.Exit(1)
+	}
 }

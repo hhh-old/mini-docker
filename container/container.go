@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"mini-docker/spec"
 	"mini-docker/volume"
 )
 
@@ -469,6 +470,11 @@ func ListContainers() ([]*ContainerInfo, error) {
 }
 
 func HandleInit() {
+	if findFlagIndex("--bundle") >= 0 {
+		HandleOCIInit()
+		return
+	}
+
 	args := os.Args[2:]
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "init: 参数不足\n")
@@ -488,6 +494,168 @@ func IsInitProcess() bool {
 	return len(os.Args) >= 2 && os.Args[1] == "init"
 }
 
+func HandleOCIInit() {
+	bundlePath := getFlagValue("--bundle")
+	fifoPath := getFlagValue("--fifo")
+
+	if bundlePath == "" || fifoPath == "" {
+		fmt.Fprintf(os.Stderr, "OCI init: 缺少 --bundle 或 --fifo 参数\n")
+		os.Exit(1)
+	}
+
+	ociSpec, err := spec.LoadSpec(bundlePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "OCI init: 加载 Spec 失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	overlay := extractOverlayFromAnnotations(ociSpec)
+
+	// FIFO 在 bundle 目录中（宿主机文件系统），必须在 pivot_root 之前打开
+	// pivot_root 后根目录切换，bundle 路径将不可访问
+	// 使用 O_RDWR 打开避免阻塞（O_RDONLY 会阻塞直到有 writer，导致死锁）
+	fifo, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "OCI init: 打开 FIFO 失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := SetupRootFS(ociSpec.Root.Path, overlay); err != nil {
+		fmt.Fprintf(os.Stderr, "OCI init: 设置 rootfs 失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	hostname := ociSpec.Hostname
+	if hostname == "" {
+		hostname = "mini-docker"
+	}
+	if err := setHostname(hostname); err != nil {
+		fmt.Fprintf(os.Stderr, "OCI init: 设置主机名失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	applyOCICapabilities(ociSpec.Process.Capabilities)
+
+	pipe := os.NewFile(3, "ready-pipe")
+	if pipe != nil {
+		pipe.Write([]byte("ready\n"))
+		pipe.Close()
+	}
+
+	buf := make([]byte, 16)
+	fifo.Read(buf)
+	fifo.Close()
+
+	args := ociSpec.Process.Args
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "OCI init: process.args 为空\n")
+		os.Exit(1)
+	}
+
+	env := ociSpec.Process.Env
+	if len(env) == 0 {
+		env = os.Environ()
+	}
+
+	execPath := args[0]
+	if !filepath.IsAbs(execPath) {
+		resolved, err := lookPathInEnv(execPath, env)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "OCI init: 找不到命令 %s: %v\n", execPath, err)
+			os.Exit(1)
+		}
+		execPath = resolved
+	}
+
+	if err := syscallExec(execPath, args, env); err != nil {
+		fmt.Fprintf(os.Stderr, "OCI init: exec 失败: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func lookPathInEnv(file string, env []string) (string, error) {
+	pathEnv := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathEnv = strings.TrimPrefix(e, "PATH=")
+			break
+		}
+	}
+	if pathEnv == "" {
+		return "", fmt.Errorf("PATH 环境变量未设置")
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		fullPath := filepath.Join(dir, file)
+		if err := isExecutable(fullPath); err == nil {
+			return fullPath, nil
+		}
+	}
+	return "", fmt.Errorf("在 PATH 中未找到 %s", file)
+}
+
+func isExecutable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("是目录")
+	}
+	if info.Mode()&0111 == 0 {
+		return fmt.Errorf("不可执行")
+	}
+	return nil
+}
+
+func extractOverlayFromAnnotations(s *spec.Spec) *OverlayDirs {
+	if s == nil || s.Annotations == nil {
+		return nil
+	}
+	merged := s.Annotations["mini-docker.overlay.merged"]
+	upper := s.Annotations["mini-docker.overlay.upper"]
+	work := s.Annotations["mini-docker.overlay.work"]
+	if merged == "" {
+		return nil
+	}
+	return &OverlayDirs{
+		Merged: merged,
+		Upper:  upper,
+		Work:   work,
+	}
+}
+
+func applyOCICapabilities(caps *spec.Capabilities) {
+	if caps == nil {
+		ApplyCapabilitiesFromEnv()
+		return
+	}
+	var capDrop []string
+	allCaps := []string{
+		"CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL",
+		"SETGID", "SETUID", "SETPCAP", "LINUX_IMMUTABLE", "NET_BIND_SERVICE",
+		"NET_BROADCAST", "NET_ADMIN", "NET_RAW", "IPC_LOCK", "IPC_OWNER",
+		"SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT",
+		"SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME",
+		"SYS_TTY_CONFIG", "MKNOD", "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL",
+		"SETFCAP",
+	}
+	keepSet := make(map[string]bool)
+	for _, c := range caps.Bounding {
+		keepSet[strings.TrimPrefix(c, "CAP_")] = true
+	}
+	for _, c := range allCaps {
+		if !keepSet[c] {
+			capDrop = append(capDrop, c)
+		}
+	}
+	if len(capDrop) > 0 {
+		ApplyCapabilities(nil, capDrop)
+	}
+}
+
 func GetContainerCgroupName(containerID string) (string, error) {
 	info, err := loadContainerInfo(containerID)
 	if err != nil {
@@ -497,6 +665,11 @@ func GetContainerCgroupName(containerID string) (string, error) {
 }
 
 func createOverlayDirs(containerID string) (*OverlayDirs, error) {
+	return CreateOverlayDirs(containerID)
+}
+
+// 宿主机上
+func CreateOverlayDirs(containerID string) (*OverlayDirs, error) {
 	shortID := containerID
 	if len(shortID) > 12 {
 		shortID = shortID[:12]
@@ -577,6 +750,10 @@ func getContainerInfoPath(containerID string) string {
 }
 
 func saveContainerInfo(info *ContainerInfo) error {
+	return SaveContainerInfo(info)
+}
+
+func SaveContainerInfo(info *ContainerInfo) error {
 	if err := os.MkdirAll(containerStoreDir, 0755); err != nil {
 		return err
 	}
@@ -587,6 +764,10 @@ func saveContainerInfo(info *ContainerInfo) error {
 	}
 
 	return os.WriteFile(getContainerInfoPath(info.ID), data, 0644)
+}
+
+func RemoveContainerInfo(containerID string) error {
+	return os.Remove(getContainerInfoPath(containerID))
 }
 
 func loadContainerInfo(containerID string) (*ContainerInfo, error) {
@@ -721,4 +902,21 @@ func releaseContainerIP(networkName string, ip string) {
 		return
 	}
 	_ = os.WriteFile(infoPath, updated, 0644)
+}
+
+func findFlagIndex(flag string) int {
+	for i, arg := range os.Args {
+		if arg == flag {
+			return i
+		}
+	}
+	return -1
+}
+
+func getFlagValue(flag string) string {
+	idx := findFlagIndex(flag)
+	if idx >= 0 && idx+1 < len(os.Args) {
+		return os.Args[idx+1]
+	}
+	return ""
 }
