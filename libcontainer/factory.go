@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"mini-docker/constants"
 )
 
 const (
 	// StateDir 容器状态存储目录（与 containerd service 的 runtimeDir 保持一致）
-	StateDir = "/var/lib/mini-docker/runtime"
+	StateDir = constants.RuntimeDir
 
 	// InitPipeFd init 进程的 ready 信号 pipe fd
 	InitPipeFd = 3

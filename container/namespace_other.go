@@ -4,7 +4,6 @@ package container
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 )
 
@@ -27,18 +26,6 @@ func NewNamespaceFlags() uintptr {
 	)
 }
 
-func GetNamespacePath(pid int, nsType string) string {
-	return fmt.Sprintf("/proc/%d/ns/%s", pid, nsType)
-}
-
-func ForkWithNamespaces(cmd *exec.Cmd, flags uintptr) (*os.Process, error) {
-	return nil, fmt.Errorf("namespace 仅在 Linux 上可用，请在 WSL2 或 Linux 环境中运行")
-}
-
-func SetNamespace(nsPath string) error {
-	return fmt.Errorf("setns 仅在 Linux 上可用，请在 WSL2 或 Linux 环境中运行")
-}
-
 func setCloneFlags(cmd *exec.Cmd, flags uintptr, tty bool) {
 }
 
@@ -48,10 +35,6 @@ func setHostname(name string) error {
 
 func sendSignal(pid int, sig int) error {
 	return fmt.Errorf("signal 仅在 Linux 上可用")
-}
-
-func checkProcessAlive(pid int) error {
-	return fmt.Errorf("process check 仅在 Linux 上可用")
 }
 
 func syscallExec(argv0 string, argv []string, envv []string) error {

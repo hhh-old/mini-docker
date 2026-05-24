@@ -86,6 +86,9 @@ type Container interface {
 
 	// Set 设置容器资源限制
 	Set(config configs.Resources) error
+
+	// SetStatus 更新容器运行时状态并持久化
+	SetStatus(status Status) error
 }
 
 // Process 启动进程的配置
@@ -113,6 +116,10 @@ type Process struct {
 
 	// Terminal 是否分配终端
 	Terminal bool
+
+	// ConsoleFile 终端设备文件（pty slave），由 runtime 传入
+	// 对齐 runc 的 --console-socket 机制：runtime 打开 pty slave 并传给 init 进程
+	ConsoleFile *os.File
 
 	// ExtraFiles 额外文件描述符
 	ExtraFiles []*os.File

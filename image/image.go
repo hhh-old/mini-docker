@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"mini-docker/constants"
 )
 
 /*
@@ -46,7 +48,7 @@ import (
 */
 
 const (
-	imageStorePath = "/var/lib/mini-docker/images"
+	imageStorePath = constants.ImageStoreDir
 )
 
 type ImageInfo struct {
@@ -95,11 +97,13 @@ func Pull(imageName string) error {
 
 	fmt.Printf("  创建 rootfs 目录结构...\n")
 	if err := createRootFSDirs(rootFSPath); err != nil {
+		os.RemoveAll(imagePath)
 		return fmt.Errorf("创建目录失败: %w", err)
 	}
 
 	fmt.Printf("  创建配置文件...\n")
 	if err := createEtcFiles(rootFSPath); err != nil {
+		os.RemoveAll(imagePath)
 		return fmt.Errorf("创建配置文件失败: %w", err)
 	}
 
@@ -197,7 +201,7 @@ func createDevNodes(rootFSPath string) error {
 	devDir := filepath.Join(rootFSPath, "dev")
 
 	nullPath := filepath.Join(devDir, "null")
-	if err := os.WriteFile(nullPath, nil, 0644); err != nil {
+	if err := createDevNull(nullPath); err != nil {
 		return err
 	}
 
@@ -250,10 +254,6 @@ func calculateRootFSSize(rootFSPath string) string {
 */
 
 func ListImages() ([]*ImageInfo, error) {
-	if err := os.MkdirAll(imageStorePath, 0755); err != nil {
-		return nil, err
-	}
-
 	entries, err := os.ReadDir(imageStorePath)
 	if err != nil {
 		if os.IsNotExist(err) {

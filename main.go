@@ -3,17 +3,22 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"mini-docker/builder"
-	"mini-docker/cgroup"
 	"mini-docker/container"
 	"mini-docker/daemon"
-	"mini-docker/network"
 	"mini-docker/runtime"
 	"mini-docker/shim"
+	"mini-docker/utils"
 	"mini-docker/volume"
+
+	"golang.org/x/term"
 )
 
 func main() {
@@ -100,7 +105,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("内部命令（对齐 Docker 分层架构）:")
 	fmt.Println("  mini-docker runtime  <create|start|kill|delete|state>  OCI 运行时 (对标 runc)")
-	fmt.Println("  mini-docker shim     <id> <bundle> <config>           容器 shim 进程 (对标 containerd-shim)")
+	fmt.Println("  mini-docker shim     <id> <bundle>                    容器 shim 进程 (对标 containerd-shim)")
 	fmt.Println()
 	fmt.Println("run 选项:")
 	fmt.Println("  -it                           交互式模式（分配终端）")
@@ -229,51 +234,15 @@ parseDone:
 		os.Exit(1)
 	}
 	reqArgs["cmd"] = strings.Join(args[i:], " ")
+	cmdJSON, _ := json.Marshal(args[i:])
+	reqArgs["cmd_json"] = string(cmdJSON)
 
-	// 交互模式（-it）：CLI 直接运行容器
-	// 原因：交互容器需要终端 I/O 直连，Daemon 进程没有终端
-	// 对齐 Docker：docker run -it 的 stdio 通过 Hijack 协议直连容器进程
 	if reqArgs["tty"] == "true" && reqArgs["detach"] != "true" {
-		config := container.RunConfig{
-			Tty:           true,
-			Memory:        reqArgs["memory"],
-			CpuShares:     reqArgs["cpu_shares"],
-			Network:       reqArgs["network"],
-			Name:          reqArgs["name"],
-			PortMap:       reqArgs["port_map"],
-			Image:         reqArgs["image"],
-			Cmd:           strings.Fields(reqArgs["cmd"]),
-			RestartPolicy: reqArgs["restart_policy"],
-			Volumes:       parseVolumeList(reqArgs["volumes"]),
-		}
-		if config.RestartPolicy == "" {
-			config.RestartPolicy = "no"
-		}
-
-		cg := &cgroup.CgroupManager{}
-		if config.Memory != "" {
-			cg.MemoryLimit = config.Memory
-		}
-		if config.CpuShares != "" {
-			cg.CpuShares = config.CpuShares
-		}
-
-		netMgr := &network.NetworkManager{}
-		if config.Network != "" {
-			netMgr.NetworkName = config.Network
-		}
-		if config.PortMap != "" {
-			netMgr.PortMap = config.PortMap
-		}
-
-		if err := container.Run(config, cg, netMgr); err != nil {
-			fmt.Printf("运行容器失败: %v\n", err)
-			os.Exit(1)
-		}
+		reqArgs["stream"] = "true"
+		runInteractive(reqArgs)
 		return
 	}
 
-	// 后台模式（-d）：通过 Daemon 运行
 	resp, err := sendRequest(daemon.Request{Type: "run", Args: reqArgs})
 	if err != nil {
 		fmt.Printf("错误: %v\n", err)
@@ -284,10 +253,101 @@ parseDone:
 		os.Exit(1)
 	}
 
-	// 显示容器信息
 	if resp.Data != nil {
 		data, _ := json.MarshalIndent(resp.Data, "", "  ")
 		fmt.Println(string(data))
+	}
+}
+
+// runInteractive 通过 Daemon 以流式 I/O 运行交互式容器
+// 对齐 Docker 的 docker run -it 架构：
+// CLI ←→ Unix Socket(流式) ←→ Daemon ←→ Shim(attach) ←→ pty ←→ 容器进程
+func runInteractive(reqArgs map[string]string) {
+	client := daemon.NewClient()
+	conn, resp, err := client.SendStream(daemon.Request{Type: "run", Args: reqArgs})
+	if err != nil {
+		fmt.Printf("错误: %v\n", err)
+		os.Exit(1)
+	}
+	if resp == nil {
+		fmt.Println("错误: 未收到响应")
+		os.Exit(1)
+	}
+	if !resp.Success {
+		fmt.Printf("%s\n", resp.Message)
+		os.Exit(1)
+	}
+	if !resp.Stream { //!resp.Stream（表明 Daemon 并没有成功开启流式通道）
+		if resp.Data != nil {
+			data, _ := json.MarshalIndent(resp.Data, "", "  ")
+			fmt.Println(string(data))
+		}
+		return
+	}
+
+	//宿主机终端切换为原始模式（Raw Mode）,为什么需要 Raw 模式（原始模式）？
+	//默认模式（Cooked/Canonical Mode）：平常我们在 Linux 终端打字时，终端驱动是有“缓存”的（必须要按回车键，程序才能收到输入）。同时，像 Ctrl+C、Ctrl+Z 这样的组合键会被宿主机的终端驱动拦截，转换为 SIGINT 或 SIGTSTP 信号，直接杀死或挂起你的 mini-docker CLI 本身，而这些信号根本无法传给容器内部。
+	//原始模式（Raw Mode）：调用 term.MakeRaw 后，宿主机的终端驱动将不再拦截任何控制字符，也不再进行行缓存 [1]。
+	//你按下的每一个键（包括 Tab、方向键、Ctrl+C、Ctrl+D），都会作为最原始的字节流（Byte Stream），立刻被宿主机终端捕获。
+	//终端的“本地回显（Echo）”也会被关闭，也就是说，你在屏幕上看到的字符不是宿主机打印的，而是这些字符传到容器内的 Shell、再由 Shell 传回给宿主机屏幕显示的（这就和真实的 SSH 远程连接一致）。
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err == nil {
+		//defer term.Restore 的保障作用：
+		//如果宿主机终端一直处于 Raw 模式，一旦 mini-docker 退出，宿主机的命令行窗口就会陷入"按回车不换行"、"打字不显示"或者无法退出等异常卡死状态（因为终端属性被污染了）。
+		//defer term.Restore 确保了无论 runInteractive 函数因为正常退出、异常报错还是程序 Panic 中断，都必定会将宿主机终端恢复为先前的正常状态（oldState）
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+	}
+
+	var containerID string
+	if resp.Data != nil {
+		data, _ := json.Marshal(resp.Data)
+		var info struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(data, &info) == nil && info.ID != "" {
+			containerID = info.ID
+		}
+	}
+
+	if containerID != "" {
+		go handleSIGWINCH(containerID)
+	}
+
+	//构建双向 I/O 拷贝管道
+	stdinDone := make(chan struct{})
+	stdoutDone := make(chan struct{})
+	//处定义了两个用于同步的 Go Channel（stdinDone、stdoutDone），并启动了两个后台协程（Goroutines）来实现全双工的实时拷贝：
+	//输入流拷贝协程（Stdout ──> Conn）：
+	//io.Copy(conn, os.Stdin)：这是一个死循环。它不断读取宿主机键盘输入（os.Stdin），一有数据就立刻写入到 Unix Socket 连接（conn）中，发送给 Daemon [1]。
+	//输出流拷贝协程（Conn ──> Stdout）：
+	//io.Copy(os.Stdout, conn)：这同样是一个死循环。它不断从 Unix Socket 连接（conn）中读取来自容器内部的屏幕输出，并将其写入到宿主机的控制台屏幕（os.Stdout）上 [1]。
+	//这两条管道并行工作，就实现了用户在键盘上敲一个字母，容器里立刻做出响应并渲染到宿主机屏幕上的效果。
+	go func() {
+		defer close(stdinDone)
+		_, _ = io.Copy(conn, os.Stdin)
+	}()
+	go func() {
+		defer close(stdoutDone)
+		_, _ = io.Copy(os.Stdout, conn)
+	}()
+
+	//阻塞等待退出：
+	//CLI 进程在这里会被挂起。
+	//什么时候 stdoutDone 会被关闭？ 当容器内的进程（如 /bin/sh）退出，或者容器因故死亡时，Daemon 端的 Shim 进程会关闭对应的 Socket 写入端。
+	//一旦连接断开，CLI 端的 io.Copy(os.Stdout, conn) 读到 EOF（输入结束标记），该协程结束，并触发 defer close(stdoutDone)。
+	//此时，<-stdoutDone 收到通道关闭的信号，解除阻塞，CLI 开始执行收尾工作。
+	<-stdoutDone
+
+	conn.Close() //主动调用 conn.Close() 彻底关闭客户端这一侧的连接
+	//释放 Stdin 协程并防止死锁：
+	//当 conn 被关闭后，仍在等待键盘输入的 io.Copy(conn, os.Stdin) 会因为连接关闭而发生写入错误，从而结束运行并触发 defer close(stdinDone)。
+	//为什么需要 select 和 time.After(1 * time.Second)？
+	//在某些极特殊情况下，宿主机的 os.Stdin（标准输入）可能正处于系统调用阻塞中（例如正卡在某个读取键盘输入的内核态调用中）。
+	//为了防止 CLI 进程因为输入流无法彻底释放而陷入永久死锁（卡死在等待 <-stdinDone 上），这里设计了一个 1 秒超时机制。
+	//如果在 1 秒内 stdinDone 成功关闭则皆大欢喜；如果超过 1 秒还没关闭，则强行超时退出。此时函数结束，外层的 term.Restore 被触发，CLI 进程正常销毁，终端重置，用户顺利返回到宿主机的 Shell 提示符下
+	select {
+	case <-stdinDone:
+	case <-time.After(1 * time.Second):
 	}
 }
 
@@ -306,12 +366,123 @@ func execCommand() {
 		os.Exit(1)
 	}
 
-	// exec 需要终端 I/O 直连容器进程，必须在 CLI 端直接运行
-	// 原因：nsenter 启动的进程需要继承 CLI 的终端，Daemon 进程没有终端
-	if err := container.Exec(args[0], args[1:]); err != nil {
-		fmt.Printf("执行命令失败: %v\n", err)
+	containerID := args[0]
+	cmdArgs := args[1:]
+
+	isTTY := isTerminal()
+
+	reqArgs := map[string]string{
+		"container_id": containerID,
+		"cmd":          strings.Join(cmdArgs, " "),
+		"tty":          fmt.Sprintf("%v", isTTY),
+	}
+	if cmdJSON, err := json.Marshal(cmdArgs); err == nil {
+		reqArgs["cmd_json"] = string(cmdJSON)
+	}
+
+	if isTTY {
+		client := daemon.NewClient()
+		conn, resp, err := client.SendStream(daemon.Request{Type: "exec", Args: reqArgs})
+		if err != nil {
+			fmt.Printf("错误: %v\n", err)
+			os.Exit(1)
+		}
+		if resp == nil || !resp.Success {
+			msg := "未知错误"
+			if resp != nil {
+				msg = resp.Message
+			}
+			fmt.Printf("%s\n", msg)
+			os.Exit(1)
+		}
+		if !resp.Stream {
+			return
+		}
+
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err == nil {
+			defer term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+
+		containerID := ""
+		if resp.Data != nil {
+			data, _ := json.Marshal(resp.Data)
+			var info struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(data, &info) == nil && info.ID != "" {
+				containerID = info.ID
+			}
+		}
+
+		if containerID != "" {
+			go handleSIGWINCH(containerID)
+		}
+
+		stdinDone := make(chan struct{})
+		stdoutDone := make(chan struct{})
+
+		go func() {
+			defer close(stdinDone)
+			_, _ = io.Copy(conn, os.Stdin)
+		}()
+		go func() {
+			defer close(stdoutDone)
+			_, _ = io.Copy(os.Stdout, conn)
+		}()
+
+		<-stdoutDone
+		conn.Close()
+		select {
+		case <-stdinDone:
+		case <-time.After(1 * time.Second):
+		}
+		return
+	}
+
+	resp, err := sendRequest(daemon.Request{Type: "exec", Args: reqArgs})
+	if err != nil {
+		fmt.Printf("错误: %v\n", err)
 		os.Exit(1)
 	}
+	if !resp.Success {
+		fmt.Printf("%s\n", resp.Message)
+		os.Exit(1)
+	}
+	if resp.Data != nil {
+		fmt.Printf("%v\n", resp.Data)
+	}
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func handleSIGWINCH(containerID string) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH)
+	for range sigCh {
+		sendResize(containerID)
+	}
+}
+
+func sendResize(containerID string) {
+	cols, rows, err := term.GetSize(int(os.Stdin.Fd()))
+	if err != nil {
+		return
+	}
+	sendRequest(daemon.Request{
+		Type: "resize",
+		Args: map[string]string{
+			"container_id": containerID,
+			"rows":         fmt.Sprintf("%d", rows),
+			"cols":         fmt.Sprintf("%d", cols),
+		},
+	})
 }
 
 func psCommand() {
@@ -341,7 +512,7 @@ func psCommand() {
 	fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n", "容器ID", "名称", "镜像", "状态", "创建时间")
 	for _, c := range containers {
 		fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n",
-			c.ID[:12], c.Name, c.Image, c.Status, c.CreatedAt)
+			utils.FormatShortID(c.ID), c.Name, c.Image, c.Status, c.CreatedAt)
 	}
 }
 

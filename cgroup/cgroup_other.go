@@ -7,7 +7,7 @@ import "fmt"
 type CgroupManager struct {
 	Pid         int
 	MemoryLimit string
-	CpuShares   string
+	CPUShares   string
 	CgroupName  string
 }
 
@@ -23,6 +23,6 @@ func (c *CgroupManager) Freeze() error {
 	return fmt.Errorf("cgroup 仅在 Linux 上可用")
 }
 
-func (c *CgroupManager) Unfreeze() error {
+func (c *CgroupManager) Thaw() error {
 	return fmt.Errorf("cgroup 仅在 Linux 上可用")
 }

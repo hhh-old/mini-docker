@@ -12,12 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"mini-docker/constants"
+	"mini-docker/utils"
 )
 
 const (
-	networkStorePath = "/var/lib/mini-docker/networks"
-	defaultSubnet    = "172.19.0.0/16"
-	defaultGateway   = "172.19.0.1"
+	networkStorePath = constants.NetworkStoreDir
+	defaultSubnet    = constants.DefaultSubnet
+	defaultGateway   = constants.DefaultGateway
 )
 
 type NetworkInfo struct {
@@ -54,11 +57,13 @@ func (n *NetworkManager) Create(name string) error {
 
 	cmd = exec.Command("ip", "addr", "add", gateway+"/16", "dev", bridgeName)
 	if err := cmd.Run(); err != nil {
+		cleanupBridge(bridgeName)
 		return fmt.Errorf("设置网桥 IP 失败: %w", err)
 	}
 
 	cmd = exec.Command("ip", "link", "set", bridgeName, "up")
 	if err := cmd.Run(); err != nil {
+		cleanupBridge(bridgeName)
 		return fmt.Errorf("启用网桥失败: %w", err)
 	}
 
@@ -110,7 +115,7 @@ func (n *NetworkManager) List() ([]*NetworkInfo, error) {
 }
 
 func (n *NetworkManager) Delete(name string) error {
-	info, err := loadNetworkInfo(name)
+	info, err := LoadNetworkInfo(name)
 	if err != nil {
 		return err
 	}
@@ -127,7 +132,7 @@ func (n *NetworkManager) Connect(pid int) error {
 		return nil
 	}
 
-	info, err := loadNetworkInfo(n.NetworkName)
+	info, err := LoadNetworkInfo(n.NetworkName)
 	if err != nil {
 		return fmt.Errorf("网络 %s 不存在", n.NetworkName)
 	}
@@ -145,45 +150,60 @@ func (n *NetworkManager) Connect(pid int) error {
 
 	cmd := exec.Command("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethContainer)
 	if err := cmd.Run(); err != nil {
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("创建 veth pair 失败: %w", err)
 	}
 
 	cmd = exec.Command("ip", "link", "set", vethContainer, "netns", fmt.Sprintf("%d", pid))
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("将 veth 移入容器 namespace 失败: %w", err)
 	}
 
 	cmd = exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n",
 		"ip", "addr", "add", containerIP+"/16", "dev", vethContainer)
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("设置容器 IP 失败: %w", err)
 	}
 
 	cmd = exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n",
 		"ip", "link", "set", vethContainer, "up")
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("启用容器 veth 失败: %w", err)
 	}
 
 	cmd = exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n",
 		"ip", "link", "set", "lo", "up")
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("启用容器 lo 失败: %w", err)
 	}
 
 	cmd = exec.Command("ip", "link", "set", vethHost, "master", info.Bridge)
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("将 veth 连接到网桥失败: %w", err)
 	}
 
 	cmd = exec.Command("ip", "link", "set", vethHost, "up")
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("启用宿主机 veth 失败: %w", err)
 	}
 
 	cmd = exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n",
 		"ip", "route", "add", "default", "via", info.Gateway)
 	if err := cmd.Run(); err != nil {
+		cleanupVeth(vethHost)
+		releaseIP(n.NetworkName, containerIP)
 		return fmt.Errorf("设置容器默认路由失败: %w", err)
 	}
 
@@ -212,11 +232,15 @@ func (n *NetworkManager) Disconnect() error {
 	_ = cmd.Run()
 
 	if n.PortMap != "" && n.ContainerIP != "" {
-		cleanupPortMapping(n.PortMap, n.ContainerIP)
+		utils.CleanupPortMapping(n.PortMap, n.ContainerIP)
 	}
 
 	if n.NetworkName != "" && n.ContainerIP != "" {
 		releaseIP(n.NetworkName, n.ContainerIP)
+		info, err := LoadNetworkInfo(n.NetworkName)
+		if err == nil && len(info.Allocated) == 0 {
+			CleanupMasquerade(info.Subnet, info.Bridge)
+		}
 	}
 
 	return nil
@@ -266,30 +290,6 @@ func setupPortMapping(portMap string, containerIP string, bridgeName string) err
 	return nil
 }
 
-func cleanupPortMapping(portMap string, containerIP string) {
-	parts := strings.Split(portMap, ":")
-	if len(parts) != 2 {
-		return
-	}
-	hostPort := parts[0]
-	containerPort := parts[1]
-
-	cmd := exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
-		"-p", "tcp", "--dport", hostPort,
-		"-j", "DNAT", "--to-destination", containerIP+":"+containerPort)
-	_ = cmd.Run()
-
-	cmd = exec.Command("iptables", "-t", "nat", "-D", "OUTPUT",
-		"-p", "tcp", "--dport", hostPort,
-		"-j", "DNAT", "--to-destination", containerIP+":"+containerPort)
-	_ = cmd.Run()
-
-	cmd = exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING",
-		"-p", "tcp", "-d", containerIP, "--dport", containerPort,
-		"-j", "MASQUERADE")
-	_ = cmd.Run()
-}
-
 func allocateIP(info *NetworkInfo) (string, error) {
 	ipamMutex.Lock()
 	defer ipamMutex.Unlock()
@@ -305,7 +305,8 @@ func allocateIP(info *NetworkInfo) (string, error) {
 		allocated[ip] = true
 	}
 
-	ip := ipNet.IP
+	ip := make(net.IP, len(ipNet.IP))
+	copy(ip, ipNet.IP)
 	for i := 0; i < 65534; i++ {
 		incIP(ip)
 		if !ipNet.Contains(ip) {
@@ -314,7 +315,10 @@ func allocateIP(info *NetworkInfo) (string, error) {
 		ipStr := ip.String()
 		if !allocated[ipStr] {
 			info.Allocated = append(info.Allocated, ipStr)
-			_ = saveNetworkInfo(info)
+			if err := saveNetworkInfo(info); err != nil {
+				info.Allocated = info.Allocated[:len(info.Allocated)-1]
+				return "", fmt.Errorf("保存网络信息失败: %w", err)
+			}
 			return ipStr, nil
 		}
 	}
@@ -326,7 +330,7 @@ func releaseIP(networkName string, ip string) {
 	ipamMutex.Lock()
 	defer ipamMutex.Unlock()
 
-	info, err := loadNetworkInfo(networkName)
+	info, err := LoadNetworkInfo(networkName)
 	if err != nil {
 		return
 	}
@@ -340,6 +344,11 @@ func releaseIP(networkName string, ip string) {
 	}
 }
 
+// ReleaseIP 释放 IP 地址（公开版本）
+func ReleaseIP(networkName string, ip string) {
+	releaseIP(networkName, ip)
+}
+
 func incIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -347,6 +356,22 @@ func incIP(ip net.IP) {
 			break
 		}
 	}
+}
+
+func cleanupBridge(bridgeName string) {
+	cmd := exec.Command("ip", "link", "delete", bridgeName, "type", "bridge")
+	_ = cmd.Run()
+}
+
+func cleanupVeth(vethHost string) {
+	cmd := exec.Command("ip", "link", "delete", vethHost)
+	_ = cmd.Run()
+}
+
+func CleanupMasquerade(subnet string, bridgeName string) {
+	cmd := exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING",
+		"-s", subnet, "!", "-o", bridgeName, "-j", "MASQUERADE")
+	_ = cmd.Run()
 }
 
 func enableIPForward() error {
@@ -366,7 +391,7 @@ func saveNetworkInfo(info *NetworkInfo) error {
 	return os.WriteFile(filepath.Join(networkStorePath, info.Name+".json"), data, 0644)
 }
 
-func loadNetworkInfo(name string) (*NetworkInfo, error) {
+func LoadNetworkInfo(name string) (*NetworkInfo, error) {
 	infoPath := filepath.Join(networkStorePath, name+".json")
 	data, err := os.ReadFile(infoPath)
 	if err != nil {

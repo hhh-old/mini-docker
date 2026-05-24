@@ -5,21 +5,17 @@ package container
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"mini-docker/constants"
+	"mini-docker/types"
 
 	"golang.org/x/sys/unix"
 )
 
-type OverlayDirs struct {
-	Merged string
-	Upper  string
-	Work   string
-}
-
 // 此时已经创建了namespace，整个函数逻辑在隔离的namespace中执行而不是在宿主机执行
-func SetupRootFS(rootFSPath string, overlay *OverlayDirs) error {
+func SetupRootFS(rootFSPath string, overlay *types.OverlayDirs) error {
 	//Linux 的挂载事件默认是会在父子空间传播的。这一句告诉内核：“把当前根目录及其所有子挂载点设为私有”。这样一来，容器内部执行的任何 mount 或 umount 操作，都不会影响到宿主机
 	//切断mount namespace和宿主机的联系
 
@@ -74,8 +70,15 @@ func SetupRootFS(rootFSPath string, overlay *OverlayDirs) error {
 	if err := os.MkdirAll(pivotDir, 0755); err != nil {
 		return fmt.Errorf("创建 pivot_root 目录失败: %w", err)
 	}
-	//把隔离的namespace的根目录切换到overlay.Merged上面去
+
+	if err := mountVolumesIntoRootfs(targetPath); err != nil {
+		fmt.Printf("  警告: 挂载卷失败: %v\n", err)
+	}
+
 	if err := pivotRoot(targetPath, pivotDir); err != nil {
+		if overlay != nil && overlay.Merged != "" {
+			unix.Unmount(overlay.Merged, unix.MNT_DETACH)
+		}
 		return fmt.Errorf("pivot_root 失败: %w", err)
 	}
 
@@ -85,12 +88,6 @@ func SetupRootFS(rootFSPath string, overlay *OverlayDirs) error {
 
 	if err := mountTmp(); err != nil {
 		return fmt.Errorf("挂载 tmpfs 失败: %w", err)
-	}
-
-	// 挂载 Volume（对齐 Docker 的 -v 参数）
-	// 在 pivot_root 之后，容器内的路径已经是新根，可以直接 bind mount
-	if err := mountVolumes(); err != nil {
-		fmt.Printf("  警告: 挂载卷失败: %v\n", err)
 	}
 
 	return nil
@@ -130,7 +127,7 @@ func mountTmp() error {
 	if err := os.MkdirAll("/tmp", 0755); err != nil {
 		return err
 	}
-	return unix.Mount("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "size=64m")
+	return unix.Mount("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, constants.DefaultTmpfsSize)
 }
 
 // mountVolumes 挂载 Volume（bind mount）
@@ -140,7 +137,7 @@ func mountTmp() error {
 //
 // Docker 的 Volume 本质就是 bind mount，容器退出后 Volume 数据不丢失。
 // 而容器的 OverlayFS upper 层会被删除，所以非 Volume 的修改会丢失。
-func mountVolumes() error {
+func mountVolumesIntoRootfs(rootfsPath string) error {
 	volumesStr := os.Getenv("MINI_DOCKER_VOLUMES")
 	if volumesStr == "" {
 		return nil
@@ -158,76 +155,29 @@ func mountVolumes() error {
 		containerPath := parts[1]
 		readOnly := len(parts) >= 3 && parts[2] == "ro"
 
-		// 确保容器内目标目录存在
-		if err := os.MkdirAll(containerPath, 0755); err != nil {
+		destInRootfs := filepath.Join(rootfsPath, containerPath)
+		if err := os.MkdirAll(destInRootfs, 0755); err != nil {
 			fmt.Printf("  警告: 创建容器挂载点 %s 失败: %v\n", containerPath, err)
 			continue
 		}
 
-		// 执行 bind mount
 		flags := unix.MS_BIND | unix.MS_REC
 		if readOnly {
 			flags |= unix.MS_RDONLY
 		}
 
-		if err := unix.Mount(hostPath, containerPath, "bind", uintptr(flags), ""); err != nil {
+		if err := unix.Mount(hostPath, destInRootfs, "bind", uintptr(flags), ""); err != nil {
 			fmt.Printf("  警告: bind mount %s -> %s 失败: %v\n", hostPath, containerPath, err)
 			continue
 		}
 
-		// 只读挂载需要重新 mount 一次设置 MS_RDONLY
 		if readOnly {
-			if err := unix.Mount(hostPath, containerPath, "bind", uintptr(flags|unix.MS_REMOUNT), ""); err != nil {
+			if err := unix.Mount(hostPath, destInRootfs, "bind", uintptr(flags|unix.MS_REMOUNT), ""); err != nil {
 				fmt.Printf("  警告: 设置只读挂载 %s 失败: %v\n", containerPath, err)
 			}
 		}
 
 		fmt.Printf("  卷已挂载: %s -> %s\n", hostPath, containerPath)
-	}
-
-	return nil
-}
-
-func MountOverlayFS(lowerDirs []string, upperDir string, workDir string, mergedDir string) error {
-	if err := os.MkdirAll(mergedDir, 0755); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return err
-	}
-
-	lowerStr := ""
-	for i, dir := range lowerDirs {
-		if i > 0 {
-			lowerStr += ":"
-		}
-		lowerStr += dir
-	}
-
-	options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerStr, upperDir, workDir)
-	return unix.Mount("overlay", mergedDir, "overlay", 0, options)
-}
-
-func CopyMinimalRootFS(destPath string) error {
-	dirs := []string{
-		"bin", "sbin", "usr", "lib", "lib64",
-		"etc", "proc", "sys", "dev", "tmp",
-		"root", "var", "run",
-	}
-
-	for _, dir := range dirs {
-		fullPath := filepath.Join(destPath, dir)
-		if err := os.MkdirAll(fullPath, 0755); err != nil {
-			return fmt.Errorf("创建目录失败 %s: %w", fullPath, err)
-		}
-	}
-
-	cmd := exec.Command("cp", "-r", "/bin/busybox", filepath.Join(destPath, "bin", "busybox"))
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("提示: 复制 busybox 失败（可能未安装），跳过: %v\n", err)
 	}
 
 	return nil

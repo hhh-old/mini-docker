@@ -4,11 +4,12 @@ package image
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"mini-docker/utils"
 )
 
 /*
@@ -85,7 +86,7 @@ func setupBusybox(rootFSPath string) error {
 	}
 
 	destBusybox := filepath.Join(binDir, "busybox")
-	if err := copyFile(busyboxPath, destBusybox); err != nil {
+	if err := utils.CopyFile(busyboxPath, destBusybox); err != nil {
 		return fmt.Errorf("复制 busybox 失败: %w", err)
 	}
 	if err := os.Chmod(destBusybox, 0755); err != nil {
@@ -290,7 +291,7 @@ func copyLibToRootFS(libPath string, rootFSPath string) {
 
 	realDestDir := filepath.Join(rootFSPath, filepath.Dir(realPath))
 	os.MkdirAll(realDestDir, 0755)
-	copyFile(realPath, filepath.Join(rootFSPath, realPath))
+	utils.CopyFile(realPath, filepath.Join(rootFSPath, realPath))
 
 	if realPath != libPath {
 		linkDir := filepath.Join(rootFSPath, filepath.Dir(libPath))
@@ -428,24 +429,3 @@ func countApplets(binDir string) int {
 
 =======================================================================
 */
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	info, err := srcFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	_, err = io.Copy(dstFile, srcFile)
-	return err
-}

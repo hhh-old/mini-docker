@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package cgroups 提供 cgroup 资源限制管理，对标 runc/libcontainer/cgroups
 package cgroups
 

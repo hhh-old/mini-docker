@@ -49,6 +49,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"mini-docker/constants"
+	"mini-docker/utils"
 )
 
 // BuildConfig 构建配置
@@ -273,7 +276,7 @@ type buildContext struct {
 
 func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 	ctx.imageName = inst.Arguments[0]
-	ctx.rootfsPath = filepath.Join("/var/lib/mini-docker/images", ctx.imageName, "rootfs")
+	ctx.rootfsPath = filepath.Join(constants.ImageStoreDir, ctx.imageName, "rootfs")
 
 	// 检查基础镜像是否存在
 	if _, err := os.Stat(ctx.rootfsPath); os.IsNotExist(err) {
@@ -335,12 +338,12 @@ func (ctx *buildContext) handleCopy(inst DockerfileInstruction) error {
 			if info.IsDir() {
 				os.MkdirAll(dstPath, info.Mode())
 			} else {
-				copyFile(path, dstPath)
+				utils.CopyFile(path, dstPath)
 			}
 			return nil
 		})
 	} else {
-		copyFile(src, targetPath)
+		utils.CopyFile(src, targetPath)
 	}
 
 	ctx.layers = append(ctx.layers, fmt.Sprintf("copy-%d", len(ctx.layers)))
@@ -390,21 +393,4 @@ func parseImageTag(tag string) (string, string) {
 		return parts[0], "latest"
 	}
 	return parts[0], parts[1]
-}
-
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	_, err = dstFile.ReadFrom(srcFile)
-	return err
 }

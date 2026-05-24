@@ -48,10 +48,12 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"mini-docker/constants"
 )
 
 const (
-	volumeStorePath = "/var/lib/mini-docker/volumes"
+	volumeStorePath = constants.VolumeStoreDir
 )
 
 // VolumeInfo 数据卷元数据
@@ -238,8 +240,13 @@ func ResolveMountPath(mount *VolumeMount) (string, error) {
 			MountPath: dataPath,
 			CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
 		}
-		data, _ := json.MarshalIndent(info, "", "  ")
-		os.WriteFile(metadataPath, data, 0644)
+		data, err := json.MarshalIndent(info, "", "  ")
+		if err != nil {
+			return dataPath, nil
+		}
+		if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+			return dataPath, nil
+		}
 	}
 
 	return dataPath, nil

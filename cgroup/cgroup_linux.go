@@ -7,7 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
+
+	"mini-docker/utils"
 )
 
 const (
@@ -18,7 +19,7 @@ const (
 type CgroupManager struct {
 	Pid         int
 	MemoryLimit string
-	CpuShares   string
+	CPUShares   string
 	CgroupName  string
 	Cpus        string // --cpus 参数（如 1.5 表示 1.5 核）
 	PidsLimit   string // --pids-limit 参数
@@ -43,15 +44,31 @@ func (c *CgroupManager) Apply(pid int) error {
 
 // applyV1 cgroup v1 应用资源限制
 func (c *CgroupManager) applyV1(pid int) error {
+	memoryCgroupPath := filepath.Join(cgroupRoot, "memory", c.CgroupName)
+	if err := os.MkdirAll(memoryCgroupPath, 0755); err != nil {
+		return fmt.Errorf("创建 memory cgroup 目录失败: %w", err)
+	}
+
+	cpuCgroupPath := filepath.Join(cgroupRoot, "cpu", c.CgroupName)
+	if err := os.MkdirAll(cpuCgroupPath, 0755); err != nil {
+		return fmt.Errorf("创建 cpu cgroup 目录失败: %w", err)
+	}
+
 	if err := c.setMemoryLimit(); err != nil {
+		os.RemoveAll(memoryCgroupPath)
+		os.RemoveAll(cpuCgroupPath)
 		return fmt.Errorf("设置内存限制失败: %w", err)
 	}
 
-	if err := c.setCpuShares(); err != nil {
+	if err := c.setCPUShares(); err != nil {
+		os.RemoveAll(memoryCgroupPath)
+		os.RemoveAll(cpuCgroupPath)
 		return fmt.Errorf("设置 CPU 限制失败: %w", err)
 	}
 
 	if err := c.addProcess(pid); err != nil {
+		os.RemoveAll(memoryCgroupPath)
+		os.RemoveAll(cpuCgroupPath)
 		return fmt.Errorf("将进程加入 cgroup 失败: %w", err)
 	}
 
@@ -65,32 +82,30 @@ func (c *CgroupManager) applyV2(pid int) error {
 		return fmt.Errorf("创建 cgroup 目录失败: %w", err)
 	}
 
-	// 设置内存限制
 	if c.MemoryLimit != "" {
-		memoryBytes, err := parseMemory(c.MemoryLimit)
+		memoryBytes, err := utils.ParseMemory(c.MemoryLimit)
 		if err != nil {
+			os.RemoveAll(cgroupPath)
 			return err
 		}
 		maxFile := filepath.Join(cgroupPath, "memory.max")
 		if err := os.WriteFile(maxFile, []byte(strconv.FormatInt(memoryBytes, 10)), 0644); err != nil {
+			os.RemoveAll(cgroupPath)
 			return fmt.Errorf("写入 memory.max 失败: %w", err)
 		}
 	}
 
-	// 设置 CPU 限制
 	if c.Cpus != "" {
 		if err := c.setCpusV2(cgroupPath); err != nil {
 			fmt.Printf("  警告: 设置 CPU 限制失败: %v\n", err)
 		}
-	} else if c.CpuShares != "" {
-		// cgroup v2 中 cpu.shares 被替换为 cpu.weight
+	} else if c.CPUShares != "" {
 		weightFile := filepath.Join(cgroupPath, "cpu.weight")
-		if err := os.WriteFile(weightFile, []byte(c.CpuShares), 0644); err != nil {
+		if err := os.WriteFile(weightFile, []byte(c.CPUShares), 0644); err != nil {
 			fmt.Printf("  警告: 写入 cpu.weight 失败: %v\n", err)
 		}
 	}
 
-	// 设置 PIDs 限制
 	if c.PidsLimit != "" {
 		pidsFile := filepath.Join(cgroupPath, "pids.max")
 		if err := os.WriteFile(pidsFile, []byte(c.PidsLimit), 0644); err != nil {
@@ -98,18 +113,16 @@ func (c *CgroupManager) applyV2(pid int) error {
 		}
 	}
 
-	// 设置 IO 权重
 	if c.BlkioWeight != "" {
-		// cgroup v2: io.bfq.weight
 		weightFile := filepath.Join(cgroupPath, "io.bfq.weight")
 		if err := os.WriteFile(weightFile, []byte(c.BlkioWeight), 0644); err != nil {
 			fmt.Printf("  警告: 写入 io.bfq.weight 失败: %v\n", err)
 		}
 	}
 
-	// 将进程加入 cgroup
 	procsFile := filepath.Join(cgroupPath, "cgroup.procs")
 	if err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		os.RemoveAll(cgroupPath)
 		return fmt.Errorf("写入 cgroup.procs 失败: %w", err)
 	}
 
@@ -121,7 +134,7 @@ func (c *CgroupManager) setMemoryLimit() error {
 		return nil
 	}
 
-	memoryBytes, err := parseMemory(c.MemoryLimit)
+	memoryBytes, err := utils.ParseMemory(c.MemoryLimit)
 	if err != nil {
 		return err
 	}
@@ -139,8 +152,8 @@ func (c *CgroupManager) setMemoryLimit() error {
 	return nil
 }
 
-func (c *CgroupManager) setCpuShares() error {
-	if c.CpuShares == "" {
+func (c *CgroupManager) setCPUShares() error {
+	if c.CPUShares == "" {
 		return nil
 	}
 
@@ -150,7 +163,7 @@ func (c *CgroupManager) setCpuShares() error {
 	}
 
 	sharesFile := filepath.Join(cpuCgroupPath, "cpu.shares")
-	if err := os.WriteFile(sharesFile, []byte(c.CpuShares), 0644); err != nil {
+	if err := os.WriteFile(sharesFile, []byte(c.CPUShares), 0644); err != nil {
 		return fmt.Errorf("写入 CPU 份额失败: %w", err)
 	}
 
@@ -177,6 +190,9 @@ func (c *CgroupManager) addProcess(pid int) error {
 }
 
 func (c *CgroupManager) Destroy() error {
+	if !c.isCgroupV2 {
+		c.isCgroupV2 = isCgroupV2()
+	}
 	if c.isCgroupV2 {
 		return c.destroyV2()
 	}
@@ -184,7 +200,7 @@ func (c *CgroupManager) Destroy() error {
 }
 
 func (c *CgroupManager) destroyV1() error {
-	subsystems := []string{"memory", "cpu"}
+	subsystems := []string{"memory", "cpu", "freezer"}
 
 	for _, subsys := range subsystems {
 		cgroupPath := filepath.Join(cgroupRoot, subsys, c.CgroupName)
@@ -209,6 +225,9 @@ func (c *CgroupManager) destroyV2() error {
 }
 
 func (c *CgroupManager) Freeze() error {
+	if !c.isCgroupV2 {
+		c.isCgroupV2 = isCgroupV2()
+	}
 	if c.isCgroupV2 {
 		return c.freezeV2()
 	}
@@ -240,7 +259,10 @@ func (c *CgroupManager) freezeV2() error {
 	return os.WriteFile(freezeFile, []byte("1"), 0644)
 }
 
-func (c *CgroupManager) Unfreeze() error {
+func (c *CgroupManager) Thaw() error {
+	if !c.isCgroupV2 {
+		c.isCgroupV2 = isCgroupV2()
+	}
 	if c.isCgroupV2 {
 		return c.unfreezeV2()
 	}
@@ -263,30 +285,6 @@ func (c *CgroupManager) addProcessToSubsystem(pid int, subsys string) error {
 	cgroupPath := filepath.Join(cgroupRoot, subsys, c.CgroupName)
 	procsFile := filepath.Join(cgroupPath, "cgroup.procs")
 	return os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644)
-}
-
-func parseMemory(memoryStr string) (int64, error) {
-	memoryStr = strings.TrimSpace(memoryStr)
-	multiplier := int64(1)
-
-	switch {
-	case strings.HasSuffix(memoryStr, "g"):
-		multiplier = 1024 * 1024 * 1024
-		memoryStr = strings.TrimSuffix(memoryStr, "g")
-	case strings.HasSuffix(memoryStr, "m"):
-		multiplier = 1024 * 1024
-		memoryStr = strings.TrimSuffix(memoryStr, "m")
-	case strings.HasSuffix(memoryStr, "k"):
-		multiplier = 1024
-		memoryStr = strings.TrimSuffix(memoryStr, "k")
-	}
-
-	value, err := strconv.ParseInt(memoryStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("无效的内存限制格式: %s", memoryStr)
-	}
-
-	return value * multiplier, nil
 }
 
 // isCgroupV2 检测系统是否使用 cgroup v2

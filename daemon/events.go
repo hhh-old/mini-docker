@@ -22,8 +22,6 @@ package daemon
 */
 
 import (
-	"encoding/json"
-	"net"
 	"sync"
 	"time"
 )
@@ -56,7 +54,6 @@ func NewEventBus() *EventBus {
 
 // Run 启动事件总线（当前实现中归档是同步的，此处保留扩展空间）
 func (eb *EventBus) Run() {
-	// 未来可在此处理异步事件分发
 }
 
 // Publish 发布事件
@@ -112,37 +109,4 @@ func (eb *EventBus) GetArchive() []Event {
 	result := make([]Event, len(eb.archive))
 	copy(result, eb.archive)
 	return result
-}
-
-// StreamEvents 将事件流式推送到连接（用于 mini-docker events 命令）
-func (eb *EventBus) StreamEvents(conn net.Conn, stopCh <-chan struct{}) {
-	ch := eb.Subscribe()
-	defer eb.Unsubscribe(ch)
-
-	// 先发送归档事件
-	archive := eb.GetArchive()
-	for _, event := range archive {
-		data, _ := json.Marshal(event)
-		data = append(data, '\n')
-		select {
-		case <-stopCh:
-			return
-		default:
-			conn.Write(data)
-		}
-	}
-
-	// 然后实时推送新事件
-	for {
-		select {
-		case event := <-ch:
-			data, _ := json.Marshal(event)
-			data = append(data, '\n')
-			if _, err := conn.Write(data); err != nil {
-				return
-			}
-		case <-stopCh:
-			return
-		}
-	}
 }

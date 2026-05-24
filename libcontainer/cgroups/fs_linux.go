@@ -92,12 +92,22 @@ func (m *managerV1) Apply(pid int) error {
 		m.paths["pids"] = pidsPath
 	}
 
+	// Freezer cgroup
+	freezerPath := getCgroupPath("freezer", name)
+	if err := mkdirAll(freezerPath); err != nil {
+		return fmt.Errorf("创建 freezer cgroup 失败: %w", err)
+	}
+	if err := WriteFile(freezerPath, "cgroup.procs", pidStr); err != nil {
+		return fmt.Errorf("添加进程到 freezer cgroup 失败: %w", err)
+	}
+	m.paths["freezer"] = freezerPath
+
 	return nil
 }
 
 func (m *managerV1) Destroy() error {
 	for _, path := range m.paths {
-		os.RemoveAll(path)
+		unix.Rmdir(path)
 	}
 	return nil
 }
@@ -204,35 +214,4 @@ func readUint64(path string) (uint64, error) {
 		return 0, err
 	}
 	return strconv.ParseUint(data, 10, 64)
-}
-
-// calculateSwap 根据配置计算 swap 限制
-func calculateSwap(config *configs.Resources) (string, error) {
-	if config.Memory == nil || config.Memory.Swap == nil {
-		return "", nil
-	}
-	swap := *config.Memory.Swap
-	return strconv.FormatInt(swap, 10), nil
-}
-
-// CheckProcessInCgroup 检查进程是否在指定 cgroup 中
-func CheckProcessInCgroup(pid int, cgroupPath string) bool {
-	pidStr := strconv.Itoa(pid)
-	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
-	content, err := readFile(procsPath)
-	if err != nil {
-		return false
-	}
-	return strings.Contains(content, pidStr)
-}
-
-// SendSignal 向进程发送信号
-func SendSignal(pid int, sig unix.Signal) error {
-	return unix.Kill(pid, sig)
-}
-
-// StatFile 文件状态
-type StatFile struct {
-	Name string
-	Size int64
 }

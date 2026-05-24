@@ -22,8 +22,10 @@ import (
 	"syscall"
 	"time"
 
+	"mini-docker/constants"
 	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/configs"
+	"mini-docker/spec"
 
 	"golang.org/x/sys/unix"
 )
@@ -31,16 +33,24 @@ import (
 // Create 对标 runc create：创建容器环境（namespace + rootfs），但不启动用户进程
 func Create(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime create <id> --bundle <path>\n")
+		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime create <id> --bundle <path> [--console <path>]\n")
 		os.Exit(1)
 	}
 
 	containerID := args[0]
 	bundlePath := ""
+	consolePath := "" //PTY 设备路径,TTY模式下shim创建的从设备
+	stdoutFd := -1    //
+	stderrFd := -1
 	for i := 1; i < len(args)-1; i++ {
 		if args[i] == "--bundle" {
 			bundlePath = args[i+1]
-			break
+		} else if args[i] == "--console" {
+			consolePath = args[i+1]
+		} else if args[i] == "--stdout-fd" {
+			stdoutFd, _ = strconv.Atoi(args[i+1]) //strconv.Atoi 是 Go 语言标准库 strconv 包中的一个常用函数，它的作用是将字符串（String）转换成整型（Integer）。
+		} else if args[i] == "--stderr-fd" {
+			stderrFd, _ = strconv.Atoi(args[i+1])
 		}
 	}
 	if bundlePath == "" {
@@ -48,25 +58,21 @@ func Create(args []string) {
 		os.Exit(1)
 	}
 
-	// 加载 OCI Spec
-	ociSpec, err := loadOCISpec(bundlePath)
+	ociSpec, err := spec.LoadSpec(bundlePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 加载 OCI Spec 失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 转换为 libcontainer 配置
 	config := convertToConfig(ociSpec, bundlePath)
 	config.BundlePath = bundlePath
 
-	// 创建容器
 	container, err := libcontainer.New(containerID, config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 创建容器失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 启动容器（阻塞在 FIFO 等待 start 信号）
 	process := &libcontainer.Process{
 		Args:     []string{"/bin/sh"},
 		Terminal: ociSpec.Process != nil && ociSpec.Process.Terminal,
@@ -76,11 +82,44 @@ func Create(args []string) {
 		process.Args = ociSpec.Process.Args
 	}
 
+	// 设置容器进程的 I/O（stdin/stdout/stderr）
+	// TTY 模式和非 TTY 模式的 I/O 处理完全不同：
+	//   - TTY 模式（前台交互）：通过 PTY 双向通信，stdin/stdout/stderr 都连接到同一个 PTY slave
+	//   - 非 TTY 模式（后台执行）：通过管道单向捕获输出，stdin 为 nil（无需用户输入）
+	if consolePath != "" {
+		// tty模式：stdin/stdout/stderr 都绑定到 PTY slave
+		consoleFile, err := os.OpenFile(consolePath, os.O_RDWR, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: 打开 console %s 失败: %v\n", consolePath, err)
+			os.Exit(1)
+		}
+		process.Stdin = consoleFile
+		process.Stdout = consoleFile
+		process.Stderr = consoleFile
+		process.ConsoleFile = consoleFile
+	} else {
+		// 非tty模式：将外部传进来的"整型文件描述符（FD）"（例如整数 3 和 4），
+		// 包装成 Go 语言标准的文件对象（*os.File），以便直接作为容器内进程的标准输出（Stdout）和标准错误（Stderr）
+		// 非tty模式，shim进程没有传递给runtime create进程Stdin，
+		// 因为后台运行的容器不需要用户交互，只需要捕获输出（日志），所以只需要另外两个Std
+		if stdoutFd >= 0 {
+			process.Stdout = os.NewFile(uintptr(stdoutFd), "stdout")
+		}
+		if stderrFd >= 0 {
+			process.Stderr = os.NewFile(uintptr(stderrFd), "stderr")
+		}
+	}
+
+	//创建容器
 	if err := container.Start(process); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 启动容器失败: %v\n", err)
 		os.Exit(1)
 	}
 
+	if process.ConsoleFile != nil {
+		process.ConsoleFile.Close()
+	}
+	//runtime create 进程创建完容器进程以后，自身进程就结束了
 	fmt.Println(container.Pid())
 	os.Exit(0)
 }
@@ -118,9 +157,17 @@ func Start(args []string) {
 		fmt.Fprintf(os.Stderr, "错误: 打开 FIFO 失败: %v\n", err)
 		os.Exit(1)
 	}
-	f.Write([]byte("start\n"))
+	if _, err := f.Write([]byte("start\n")); err != nil {
+		f.Close()
+		fmt.Fprintf(os.Stderr, "错误: 写入 FIFO 失败: %v\n", err)
+		os.Exit(1)
+	}
 	f.Close()
 	os.Remove(fifoPath)
+
+	if err := container.SetStatus(libcontainer.StatusRunning); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 更新容器状态失败: %v\n", err)
+	}
 
 	os.Exit(0)
 }
@@ -170,8 +217,10 @@ func Delete(args []string) {
 
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
-		// 容器可能已经不存在，尝试清理状态文件
-		os.RemoveAll(fmt.Sprintf("/var/lib/mini-docker/runtime/%s", containerID))
+		stateDir := filepath.Join(constants.RuntimeDir, containerID)
+		if _, statErr := os.Stat(stateDir); statErr == nil {
+			os.RemoveAll(stateDir)
+		}
 		os.Exit(0)
 	}
 
@@ -214,77 +263,59 @@ func State(args []string) {
 	os.Exit(0)
 }
 
-// loadOCISpec 加载 OCI Spec
-func loadOCISpec(bundlePath string) (*ociSpec, error) {
-	configPath := bundlePath + "/config.json"
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, err
-	}
-
-	var spec ociSpec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		return nil, err
-	}
-
-	return &spec, nil
-}
-
 // convertToConfig 将 OCI Spec 转换为 libcontainer 配置
-func convertToConfig(spec *ociSpec, bundlePath string) *configs.Config {
+func convertToConfig(s *spec.Spec, bundlePath string) *configs.Config {
 	config := &configs.Config{
-		Hostname: spec.Hostname,
+		Hostname: s.Hostname,
 	}
 
-	if spec.Root != nil {
-		rootfs := spec.Root.Path
+	if s.Root != nil {
+		rootfs := s.Root.Path
 		if !filepath.IsAbs(rootfs) {
 			rootfs = filepath.Join(bundlePath, rootfs)
 		}
 		config.Rootfs = filepath.Clean(rootfs)
-		config.ReadonlyRootfs = spec.Root.Readonly
+		config.ReadonlyRootfs = s.Root.Readonly
 	}
 
-	if spec.Process != nil {
-		config.Args = spec.Process.Args
-		config.Env = spec.Process.Env
-		config.Cwd = spec.Process.Cwd
-		if spec.Process.Terminal {
-			// 标记需要终端
+	if s.Process != nil {
+		config.Args = s.Process.Args
+		config.Env = s.Process.Env
+		config.Cwd = s.Process.Cwd
+		if s.Process.Terminal {
 		}
 	}
 
-	if spec.Linux != nil {
-		for _, ns := range spec.Linux.Namespaces {
+	if s.Linux != nil {
+		for _, ns := range s.Linux.Namespaces {
 			config.Namespaces = append(config.Namespaces, configs.Namespace{
 				Type: ns.Type,
 				Path: ns.Path,
 			})
 		}
 
-		if spec.Linux.Resources != nil {
+		if s.Linux.Resources != nil {
 			config.Cgroups = &configs.Resources{}
-			if spec.Linux.Resources.Memory != nil {
+			if s.Linux.Resources.Memory != nil {
 				config.Cgroups.Memory = &configs.Memory{
-					Limit: spec.Linux.Resources.Memory.Limit,
+					Limit: s.Linux.Resources.Memory.Limit,
 				}
 			}
-			if spec.Linux.Resources.CPU != nil {
+			if s.Linux.Resources.CPU != nil {
 				config.Cgroups.CPU = &configs.CPU{
-					Shares: spec.Linux.Resources.CPU.Shares,
-					Cpus:   spec.Linux.Resources.CPU.Cpus,
+					Shares: s.Linux.Resources.CPU.Shares,
+					Cpus:   s.Linux.Resources.CPU.Cpus,
 				}
 			}
-			if spec.Linux.Resources.Pids != nil {
+			if s.Linux.Resources.Pids != nil {
 				config.Cgroups.Pids = &configs.Pids{
-					Limit: spec.Linux.Resources.Pids.Limit,
+					Limit: s.Linux.Resources.Pids.Limit,
 				}
 			}
 		}
 	}
 
-	// 转换挂载点
-	for _, m := range spec.Mounts {
+	for _, m := range s.Mounts {
 		config.Mounts = append(config.Mounts, &configs.Mount{
 			Destination: m.Destination,
 			Type:        m.Type,
@@ -296,49 +327,8 @@ func convertToConfig(spec *ociSpec, bundlePath string) *configs.Config {
 	return config
 }
 
-type ociSpec struct {
-	OCIVersion string `json:"ociVersion"`
-	Hostname   string `json:"hostname"`
-	Root       *struct {
-		Path     string `json:"path"`
-		Readonly bool   `json:"readonly"`
-	} `json:"root"`
-	Process *struct {
-		Terminal bool     `json:"terminal"`
-		Args     []string `json:"args"`
-		Env      []string `json:"env"`
-		Cwd      string   `json:"cwd"`
-	} `json:"process"`
-	Mounts []struct {
-		Destination string   `json:"destination"`
-		Type        string   `json:"type"`
-		Source      string   `json:"source"`
-		Options     []string `json:"options"`
-	} `json:"mounts"`
-	Linux *struct {
-		Namespaces []struct {
-			Type string `json:"type"`
-			Path string `json:"path"`
-		} `json:"namespaces"`
-		Resources *struct {
-			Memory *struct {
-				Limit *int64 `json:"limit"`
-			} `json:"memory"`
-			CPU *struct {
-				Shares *int64  `json:"shares"`
-				Quota  *int64  `json:"quota"`
-				Period *int64  `json:"period"`
-				Cpus   *string `json:"cpus"`
-			} `json:"cpu"`
-			Pids *struct {
-				Limit *int64 `json:"limit"`
-			} `json:"pids"`
-		} `json:"resources"`
-	} `json:"linux"`
-}
-
 func waitForExit(pid int, timeoutMs int) {
-	deadline := timeoutMs / 100
+	deadline := timeoutMs / 10
 	for i := 0; i < deadline; i++ {
 		if err := unix.Kill(pid, 0); err != nil {
 			return

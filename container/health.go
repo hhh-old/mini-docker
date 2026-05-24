@@ -28,6 +28,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"mini-docker/utils"
 )
 
 // HealthStatus 健康状态
@@ -48,6 +50,15 @@ type HealthConfig struct {
 	Retries  int           // 连续失败次数后标记为 unhealthy（默认 3）
 }
 
+// DefaultHealthConfig 返回默认的健康检查配置
+func DefaultHealthConfig() *HealthConfig {
+	return &HealthConfig{
+		Interval: 30 * time.Second,
+		Timeout:  3 * time.Second,
+		Retries:  3,
+	}
+}
+
 // HealthResult 健康检查结果
 type HealthResult struct {
 	Status    HealthStatus `json:"status"`
@@ -59,26 +70,48 @@ type HealthResult struct {
 
 // ParseHealthConfig 从容器信息中解析健康检查配置
 func ParseHealthConfig(info *ContainerInfo) *HealthConfig {
-	// 从环境变量或配置中读取（简化实现）
-	// 实际 Docker 中从镜像配置或 run 参数获取
-	return nil
+	config := DefaultHealthConfig()
+	if info == nil {
+		return config
+	}
+	if info.HealthCmd != "" {
+		config.Cmd = info.HealthCmd
+	}
+	if info.HealthInterval != "" {
+		if d, err := time.ParseDuration(info.HealthInterval); err == nil {
+			config.Interval = d
+		}
+	}
+	if info.HealthTimeout != "" {
+		if d, err := time.ParseDuration(info.HealthTimeout); err == nil {
+			config.Timeout = d
+		}
+	}
+	if info.HealthRetries > 0 {
+		config.Retries = info.HealthRetries
+	}
+	return config
 }
 
 // RunHealthCheck 执行一次健康检查
 func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
-	result := &HealthResult{
-		LastCheck: time.Now().Format("2006-01-02 15:04:05"),
+	prevResult, _ := LoadHealthResult(info.ID)
+	failCount := 0
+	if prevResult != nil {
+		failCount = prevResult.FailCount
 	}
 
-	// 构建在容器内执行检查命令
-	// 通过 nsenter 进入容器的 namespace 执行
+	result := &HealthResult{
+		LastCheck: utils.NowFormatted(),
+		FailCount: failCount,
+	}
+
 	cmd := exec.Command("nsenter",
 		"-t", fmt.Sprintf("%d", info.Pid),
 		"-m", "-p", "-n",
 		"/bin/sh", "-c", config.Cmd,
 	)
 
-	// 设置超时
 	if config.Timeout > 0 {
 		timer := time.AfterFunc(config.Timeout, func() {
 			if cmd.Process != nil {
@@ -99,7 +132,6 @@ func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
 		result.FailCount = 0
 	}
 
-	// 判断健康状态
 	if result.FailCount >= config.Retries {
 		result.Status = HealthUnhealthy
 	} else if result.ExitCode == 0 {
@@ -113,10 +145,7 @@ func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
 
 // SaveHealthResult 保存健康检查结果
 func SaveHealthResult(containerID string, result *HealthResult) error {
-	shortID := containerID
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
-	}
+	shortID := utils.FormatShortID(containerID)
 
 	healthDir := filepath.Join(containerDataDir, shortID)
 	if err := os.MkdirAll(healthDir, 0755); err != nil {
@@ -133,10 +162,7 @@ func SaveHealthResult(containerID string, result *HealthResult) error {
 
 // LoadHealthResult 加载健康检查结果
 func LoadHealthResult(containerID string) (*HealthResult, error) {
-	shortID := containerID
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
-	}
+	shortID := utils.FormatShortID(containerID)
 
 	data, err := os.ReadFile(filepath.Join(containerDataDir, shortID, "health.json"))
 	if err != nil {

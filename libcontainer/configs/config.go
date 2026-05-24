@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package configs 定义容器的配置结构，对标 runc/libcontainer/configs
 package configs
 

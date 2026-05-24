@@ -4,11 +4,12 @@ package cgroups
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 
 	"mini-docker/libcontainer/configs"
+
+	"golang.org/x/sys/unix"
 )
 
 // managerV2 cgroup v2 管理器实现
@@ -105,7 +106,7 @@ func (m *managerV2) Destroy() error {
 	if m.path == "" {
 		return nil
 	}
-	return os.RemoveAll(m.path)
+	return unix.Rmdir(m.path)
 }
 
 func (m *managerV2) GetPaths() map[string]string {

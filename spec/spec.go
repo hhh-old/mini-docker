@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
+
+	"mini-docker/utils"
+	"mini-docker/volume"
 )
 
 // Spec 对应 OCI runtime-spec 的 config.json
@@ -24,9 +26,9 @@ type Spec struct {
 type Process struct {
 	Terminal     bool          `json:"terminal"`
 	User         User          `json:"user"`
-	Args         []string      `json:"args"`
+	Args         []string      `json:"args"` //要执行的命令及其参数，index为0的是命令
 	Env          []string      `json:"env"`
-	Cwd          string        `json:"cwd"`
+	Cwd          string        `json:"cwd"` //Cwd 是 Current Working Directory （当前工作目录）的缩写
 	Capabilities *Capabilities `json:"capabilities,omitempty"`
 }
 
@@ -159,7 +161,7 @@ func LoadState(stateDir string) (*State, error) {
 type RunConfig struct {
 	Tty           bool
 	Memory        string
-	CpuShares     string
+	CPUShares     string
 	Image         string
 	ImageRootFS   string
 	Cmd           []string
@@ -217,27 +219,33 @@ func DefaultSpec(config *RunConfig) *Spec {
 	}
 
 	if config.Memory != "" {
-		memBytes := parseMemory(config.Memory)
-		s.Linux.Resources.Memory = &Memory{Limit: &memBytes}
+		memBytes, err := utils.ParseMemory(config.Memory)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "警告: 解析内存限制失败: %v，将不设置内存限制\n", err)
+		} else {
+			s.Linux.Resources.Memory = &Memory{Limit: &memBytes}
+		}
 	}
-	if config.CpuShares != "" {
-		shares := parseCpuShares(config.CpuShares)
+	if config.CPUShares != "" {
+		shares := int64(parseCPUShares(config.CPUShares))
 		s.Linux.Resources.CPU = &CPU{Shares: &shares}
 	}
 
 	for _, volSpec := range config.Volumes {
-		parts := strings.SplitN(volSpec, ":", 3)
-		if len(parts) < 2 {
+		mount, err := volume.ParseVolumeMount(volSpec)
+		if err != nil {
 			continue
 		}
-		hostPath := parts[0]
-		containerPath := parts[1]
+		hostPath, err := volume.ResolveMountPath(mount)
+		if err != nil {
+			continue
+		}
 		opts := []string{"rbind"}
-		if len(parts) >= 3 && parts[2] == "ro" {
+		if mount.ReadOnly {
 			opts = append(opts, "ro")
 		}
 		s.Mounts = append(s.Mounts, Mount{
-			Destination: containerPath,
+			Destination: mount.Destination,
 			Type:        "bind",
 			Source:      hostPath,
 			Options:     opts,
@@ -266,31 +274,16 @@ func defaultCapNames() []string {
 	}
 }
 
-func parseMemory(s string) int64 {
-	s = strings.TrimSpace(s)
-	multiplier := int64(1)
-	switch {
-	case strings.HasSuffix(s, "g"):
-		multiplier = 1024 * 1024 * 1024
-		s = strings.TrimSuffix(s, "g")
-	case strings.HasSuffix(s, "m"):
-		multiplier = 1024 * 1024
-		s = strings.TrimSuffix(s, "m")
-	case strings.HasSuffix(s, "k"):
-		multiplier = 1024
-		s = strings.TrimSuffix(s, "k")
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v * multiplier
-}
-
-func parseCpuShares(s string) int64 {
-	v, err := strconv.ParseInt(s, 10, 64)
+func parseCPUShares(s string) uint64 {
+	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
 		return 1024
+	}
+	if v < 2 {
+		return 2
+	}
+	if v > 262144 {
+		return 262144
 	}
 	return v
 }
@@ -298,55 +291,11 @@ func parseCpuShares(s string) int64 {
 // ExtractCloneFlags 从 OCI Spec 的 namespaces 提取 clone flags
 func ExtractCloneFlags(namespaces []Namespace) uintptr {
 	var flags uintptr
-	nsMap := map[string]uintptr{
-		"pid":     0x20000000, // CLONE_NEWPID
-		"network": 0x40000000, // CLONE_NEWNET
-		"ipc":     0x08000000, // CLONE_NEWIPC
-		"uts":     0x04000000, // CLONE_NEWUTS
-		"mount":   0x00020000, // CLONE_NEWNS
-		"user":    0x10000000, // CLONE_NEWUSER
-		"cgroup":  0x02000000, // CLONE_NEWCGROUP
-	}
+	nsMap := getNamespaceFlags()
 	for _, ns := range namespaces {
 		if f, ok := nsMap[ns.Type]; ok {
 			flags |= f
 		}
 	}
 	return flags
-}
-
-// CapNameToValue 将 Capability 名称映射为系统值
-var CapNameToValue = map[string]int{
-	"CAP_CHOWN":            0,
-	"CAP_DAC_OVERRIDE":     1,
-	"CAP_DAC_READ_SEARCH":  2,
-	"CAP_FOWNER":           3,
-	"CAP_FSETID":           4,
-	"CAP_KILL":             5,
-	"CAP_SETGID":           6,
-	"CAP_SETUID":           7,
-	"CAP_SETPCAP":          8,
-	"CAP_LINUX_IMMUTABLE":  9,
-	"CAP_NET_BIND_SERVICE": 10,
-	"CAP_NET_BROADCAST":    11,
-	"CAP_NET_ADMIN":        12,
-	"CAP_NET_RAW":          13,
-	"CAP_IPC_LOCK":         14,
-	"CAP_IPC_OWNER":        15,
-	"CAP_SYS_MODULE":       16,
-	"CAP_SYS_RAWIO":        17,
-	"CAP_SYS_CHROOT":       18,
-	"CAP_SYS_PTRACE":       19,
-	"CAP_SYS_PACCT":        20,
-	"CAP_SYS_ADMIN":        21,
-	"CAP_SYS_BOOT":         22,
-	"CAP_SYS_NICE":         23,
-	"CAP_SYS_RESOURCE":     24,
-	"CAP_SYS_TIME":         25,
-	"CAP_SYS_TTY_CONFIG":   26,
-	"CAP_MKNOD":            27,
-	"CAP_LEASE":            28,
-	"CAP_AUDIT_WRITE":      29,
-	"CAP_AUDIT_CONTROL":    30,
-	"CAP_SETFCAP":          31,
 }

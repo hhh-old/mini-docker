@@ -63,134 +63,11 @@ package container
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 
-	"golang.org/x/sys/unix"
+	"mini-docker/libcontainer/configs"
+	"mini-docker/utils"
 )
-
-// Docker 默认授予容器的 14 个 Capability
-var DefaultCapabilities = []int{
-	unix.CAP_CHOWN,
-	unix.CAP_DAC_OVERRIDE,
-	unix.CAP_FSETID,
-	unix.CAP_FOWNER,
-	unix.CAP_MKNOD,
-	unix.CAP_NET_RAW,
-	unix.CAP_SETGID,
-	unix.CAP_SETUID,
-	unix.CAP_SETFCAP,
-	unix.CAP_SETPCAP,
-	unix.CAP_NET_BIND_SERVICE,
-	unix.CAP_SYS_CHROOT,
-	unix.CAP_KILL,
-	unix.CAP_AUDIT_WRITE,
-}
-
-// 所有已知的 Capability（用于 --cap-drop ALL）
-var AllKnownCapabilities = []int{
-	unix.CAP_CHOWN,
-	unix.CAP_DAC_OVERRIDE,
-	unix.CAP_DAC_READ_SEARCH,
-	unix.CAP_FOWNER,
-	unix.CAP_FSETID,
-	unix.CAP_KILL,
-	unix.CAP_SETGID,
-	unix.CAP_SETUID,
-	unix.CAP_SETPCAP,
-	unix.CAP_LINUX_IMMUTABLE,
-	unix.CAP_NET_BIND_SERVICE,
-	unix.CAP_NET_BROADCAST,
-	unix.CAP_NET_ADMIN,
-	unix.CAP_NET_RAW,
-	unix.CAP_IPC_LOCK,
-	unix.CAP_IPC_OWNER,
-	unix.CAP_SYS_MODULE,
-	unix.CAP_SYS_RAWIO,
-	unix.CAP_SYS_CHROOT,
-	unix.CAP_SYS_PTRACE,
-	unix.CAP_SYS_PACCT,
-	unix.CAP_SYS_ADMIN,
-	unix.CAP_SYS_BOOT,
-	unix.CAP_SYS_NICE,
-	unix.CAP_SYS_RESOURCE,
-	unix.CAP_SYS_TIME,
-	unix.CAP_SYS_TTY_CONFIG,
-	unix.CAP_MKNOD,
-	unix.CAP_LEASE,
-	unix.CAP_AUDIT_WRITE,
-	unix.CAP_AUDIT_CONTROL,
-	unix.CAP_SETFCAP,
-	unix.CAP_MAC_OVERRIDE,
-	unix.CAP_MAC_ADMIN,
-	unix.CAP_SYSLOG,
-	unix.CAP_WAKE_ALARM,
-	unix.CAP_BLOCK_SUSPEND,
-	unix.CAP_AUDIT_READ,
-}
-
-// CapNameToValue 将 Capability 名称映射为数值
-var CapNameToValue = map[string]int{
-	"CHOWN":            unix.CAP_CHOWN,
-	"DAC_OVERRIDE":     unix.CAP_DAC_OVERRIDE,
-	"DAC_READ_SEARCH":  unix.CAP_DAC_READ_SEARCH,
-	"FOWNER":           unix.CAP_FOWNER,
-	"FSETID":           unix.CAP_FSETID,
-	"KILL":             unix.CAP_KILL,
-	"SETGID":           unix.CAP_SETGID,
-	"SETUID":           unix.CAP_SETUID,
-	"SETPCAP":          unix.CAP_SETPCAP,
-	"NET_BIND_SERVICE": unix.CAP_NET_BIND_SERVICE,
-	"NET_BROADCAST":    unix.CAP_NET_BROADCAST,
-	"NET_ADMIN":        unix.CAP_NET_ADMIN,
-	"NET_RAW":          unix.CAP_NET_RAW,
-	"IPC_LOCK":         unix.CAP_IPC_LOCK,
-	"IPC_OWNER":        unix.CAP_IPC_OWNER,
-	"SYS_MODULE":       unix.CAP_SYS_MODULE,
-	"SYS_RAWIO":        unix.CAP_SYS_RAWIO,
-	"SYS_CHROOT":       unix.CAP_SYS_CHROOT,
-	"SYS_PTRACE":       unix.CAP_SYS_PTRACE,
-	"SYS_PACCT":        unix.CAP_SYS_PACCT,
-	"SYS_ADMIN":        unix.CAP_SYS_ADMIN,
-	"SYS_BOOT":         unix.CAP_SYS_BOOT,
-	"SYS_NICE":         unix.CAP_SYS_NICE,
-	"SYS_RESOURCE":     unix.CAP_SYS_RESOURCE,
-	"SYS_TIME":         unix.CAP_SYS_TIME,
-	"SYS_TTY_CONFIG":   unix.CAP_SYS_TTY_CONFIG,
-	"MKNOD":            unix.CAP_MKNOD,
-	"LEASE":            unix.CAP_LEASE,
-	"AUDIT_WRITE":      unix.CAP_AUDIT_WRITE,
-	"AUDIT_CONTROL":    unix.CAP_AUDIT_CONTROL,
-	"SETFCAP":          unix.CAP_SETFCAP,
-	"MAC_OVERRIDE":     unix.CAP_MAC_OVERRIDE,
-	"MAC_ADMIN":        unix.CAP_MAC_ADMIN,
-	"SYSLOG":           unix.CAP_SYSLOG,
-	"WAKE_ALARM":       unix.CAP_WAKE_ALARM,
-	"BLOCK_SUSPEND":    unix.CAP_BLOCK_SUSPEND,
-	"AUDIT_READ":       unix.CAP_AUDIT_READ,
-}
-
-// CapValueToName 将 Capability 数值映射为名称
-var CapValueToName map[int]string
-
-func init() {
-	CapValueToName = make(map[int]string)
-	for name, val := range CapNameToValue {
-		CapValueToName[val] = name
-	}
-}
-
-// ResolveCapName 解析 Capability 名称（支持带/不带 CAP_ 前缀）
-func ResolveCapName(name string) (int, error) {
-	// 去掉 CAP_ 前缀
-	name = strings.TrimPrefix(strings.ToUpper(name), "CAP_")
-
-	if val, ok := CapNameToValue[name]; ok {
-		return val, nil
-	}
-	return 0, fmt.Errorf("未知的 Capability: %s", name)
-}
 
 // ApplyCapabilities 在容器 init 进程中应用 Capability 限制
 // capAdd: 额外添加的 Capability 名称列表
@@ -203,83 +80,56 @@ func ResolveCapName(name string) (int, error) {
 // 4. 计算需要 drop 的能力 = 全集 - 最终保留的集合
 // 5. 对每个需要 drop 的能力调用 prctl(PR_CAPBSET_DROP)
 func ApplyCapabilities(capAdd []string, capDrop []string) error {
-	// 从默认集合开始
 	keepSet := make(map[int]bool)
-	for _, cap := range DefaultCapabilities {
-		keepSet[cap] = true
+	for _, name := range configs.DefaultCapabilities {
+		name = strings.TrimPrefix(name, "CAP_")
+		if val, ok := configs.CapNameToValue[name]; ok {
+			keepSet[val] = true
+		}
 	}
 
-	// 处理 capDrop
 	for _, name := range capDrop {
 		if strings.ToUpper(name) == "ALL" {
-			// --cap-drop ALL：清空所有能力
 			keepSet = make(map[int]bool)
 			continue
 		}
-		cap, err := ResolveCapName(name)
+		cap, err := configs.ResolveCapName(name)
 		if err != nil {
-			fmt.Printf("  警告: %v，跳过\\n", err)
+			fmt.Printf("  警告: %v，跳过\n", err)
 			continue
 		}
 		delete(keepSet, cap)
 	}
 
-	// 处理 capAdd
 	for _, name := range capAdd {
-		cap, err := ResolveCapName(name)
+		cap, err := configs.ResolveCapName(name)
 		if err != nil {
-			fmt.Printf("  警告: %v，跳过\\n", err)
+			fmt.Printf("  警告: %v，跳过\n", err)
 			continue
 		}
 		keepSet[cap] = true
 	}
 
-	// 计算需要 drop 的能力
 	var toDrop []int
-	for _, cap := range AllKnownCapabilities {
-		if !keepSet[cap] {
-			toDrop = append(toDrop, cap)
+	for _, capName := range configs.AllKnownCapabilities {
+		capName = strings.TrimPrefix(capName, "CAP_")
+		val, ok := configs.CapNameToValue[capName]
+		if !ok {
+			continue
+		}
+		if !keepSet[val] {
+			toDrop = append(toDrop, val)
 		}
 	}
 
-	// 执行 drop
 	for _, cap := range toDrop {
-		if err := dropCapability(cap); err != nil {
-			// 某些 Capability 可能不受当前内核支持，仅警告
-			fmt.Printf("  提示: drop CAP_%s 失败（可能不受支持）: %v\\n",
-				CapValueToName[cap], err)
+		if err := utils.DropCapability(cap); err != nil {
+			fmt.Printf("  提示: drop CAP_%s 失败（可能不受支持）: %v\n",
+				configs.CapValueToName[cap], err)
 		}
 	}
 
 	return nil
-}
-
-// dropCapability 从当前进程的能力边界集中移除一个能力
-// 底层调用: prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)
-func dropCapability(cap int) error {
-	_, _, errno := syscall.Syscall6(
-		unix.SYS_PRCTL,
-		unix.PR_CAPBSET_DROP,
-		uintptr(cap),
-		0, 0, 0, 0,
-	)
-	if errno != 0 {
-		return fmt.Errorf("prctl(PR_CAPBSET_DROP, %d) 失败: %v", cap, errno)
-	}
-	return nil
-}
-
-// SetCapabilitiesForCmd 在 fork 子进程前设置 Capability（通过 SysProcAttr）
-// 注意：由于 Go 的 exec.Cmd 不直接支持设置 Capability，
-// 我们需要在 init 进程内（fork 之后）调用 ApplyCapabilities。
-// 这个函数用于在环境变量中传递 capAdd/capDrop 信息给 init 进程。
-func SetCapabilitiesEnv(cmd *exec.Cmd, capAdd []string, capDrop []string) {
-	if len(capAdd) > 0 {
-		cmd.Env = append(cmd.Env, "MINI_DOCKER_CAP_ADD="+strings.Join(capAdd, ","))
-	}
-	if len(capDrop) > 0 {
-		cmd.Env = append(cmd.Env, "MINI_DOCKER_CAP_DROP="+strings.Join(capDrop, ","))
-	}
 }
 
 // ApplyCapabilitiesFromEnv 从环境变量读取并应用 Capability 设置
@@ -289,7 +139,6 @@ func ApplyCapabilitiesFromEnv() {
 	capDropStr := os.Getenv("MINI_DOCKER_CAP_DROP")
 
 	if capAddStr == "" && capDropStr == "" {
-		// 没有指定，使用默认 Capability
 		return
 	}
 
@@ -304,6 +153,6 @@ func ApplyCapabilitiesFromEnv() {
 	}
 
 	if err := ApplyCapabilities(capAdd, capDrop); err != nil {
-		fmt.Printf("  警告: 设置 Capability 失败: %v\\n", err)
+		fmt.Printf("  警告: 设置 Capability 失败: %v\n", err)
 	}
 }

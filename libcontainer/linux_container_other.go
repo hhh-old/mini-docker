@@ -40,6 +40,4 @@ func (c *linuxContainer) Signal(sig int) error               { return fmt.Errorf
 func (c *linuxContainer) Exec(process *Process) error        { return fmt.Errorf("不支持") }
 func (c *linuxContainer) Stats() (*Stats, error)             { return nil, fmt.Errorf("不支持") }
 func (c *linuxContainer) Set(config configs.Resources) error { return fmt.Errorf("不支持") }
-
-func IsInitProcess() bool { return false }
-func HandleInit() error   { return fmt.Errorf("不支持") }
+func (c *linuxContainer) SetStatus(status Status) error      { return fmt.Errorf("不支持") }

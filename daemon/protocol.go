@@ -3,47 +3,55 @@ package daemon
 /*
 =======================================================================
   通信协议 —— CLI 与 Daemon 之间的请求/响应格式
-=======================================================================
 
-  通信流程：
+  对齐 Docker 的 C/S 架构：
+
+  普通请求（ps/stop/images 等）：
   ┌──────────┐                    ┌──────────┐
   │ CLI      │  ──── Request ───→ │ Daemon   │
   │          │  ←── Response ──── │          │
   └──────────┘                    └──────────┘
 
+  流式请求（run -it / attach）：
+  ┌──────────┐                    ┌──────────┐
+  │ CLI      │  ──── Request ───→ │ Daemon   │
+  │          │  ←── Response ──── │          │
+  │          │  ←──── I/O ──────→│          │  双向流式转发
+  └──────────┘                    └──────────┘
+
   所有通信使用 JSON 编码，通过 Unix Socket 传输。
-
-  Request 结构：
-  {
-    "type": "run",           ← 请求类型
-    "args": {                ← 请求参数
-      "image": "myos",
-      "cmd": "/bin/sh",
-      "tty": "true",
-      "memory": "100m",
-      ...
-    }
-  }
-
-  Response 结构：
-  {
-    "success": true,         ← 是否成功
-    "message": "...",        ← 人类可读的消息
-    "data": { ... }          ← 附加数据（如容器列表）
-  }
+  流式模式下，初始 JSON 握手后切换为原始字节流。
 
 =======================================================================
 */
 
-// Request CLI 发送给 Daemon 的请求
+import "encoding/json"
+
 type Request struct {
-	Type string            `json:"type"` // 请求类型: run, stop, ps, exec, ...
-	Args map[string]string `json:"args"` // 请求参数
+	Type string            `json:"type"`
+	Args map[string]string `json:"args"`
 }
 
-// Response Daemon 返回给 CLI 的响应
 type Response struct {
-	Success bool        `json:"success"` // 是否成功
-	Message string      `json:"message"` // 人类可读的消息
-	Data    interface{} `json:"data"`    // 附加数据
+	Success     bool          `json:"success"`
+	Message     string        `json:"message"`
+	Data        interface{}   `json:"data"`
+	Stream      bool          `json:"stream,omitempty"`
+	StreamReady chan struct{} `json:"-"`
 }
+
+func EncodeResponse(resp Response) ([]byte, error) {
+	return json.Marshal(resp)
+}
+
+func DecodeResponse(data []byte) (*Response, error) {
+	var resp Response
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+const (
+	StreamMarker = "\n<<STREAM>>\n"
+)

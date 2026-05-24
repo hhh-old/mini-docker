@@ -42,13 +42,9 @@ package image
 */
 
 import (
-	"crypto/sha256"
-	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 const (
@@ -77,224 +73,7 @@ type ImageDBEntry struct {
 	RootFS    string   `json:"rootfs"`     // rootfs 路径（向后兼容）
 }
 
-// CreateLayer 创建新的镜像层
-func CreateLayer(parentID string, diffPath string) (*LayerInfo, error) {
-	// 计算层 ID（基于内容哈希）
-	layerID, err := computeLayerID(diffPath)
-	if err != nil {
-		return nil, fmt.Errorf("计算层 ID 失败: %w", err)
-	}
-
-	layerDir := filepath.Join(overlay2StorePath, layerID)
-	layerDiffDir := filepath.Join(layerDir, "diff")
-
-	// 检查是否已存在（层共享：相同内容 = 相同层）
-	if _, err := os.Stat(layerDir); err == nil {
-		existing, err := loadLayerInfo(layerID)
-		if err == nil {
-			return existing, nil // 层已存在，直接复用
-		}
-	}
-
-	// 创建层目录
-	if err := os.MkdirAll(layerDiffDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建层目录失败: %w", err)
-	}
-
-	// 复制 diff 内容到层目录
-	if diffPath != "" && diffPath != layerDiffDir {
-		if err := copyDir(diffPath, layerDiffDir); err != nil {
-			return nil, fmt.Errorf("复制层内容失败: %w", err)
-		}
-	}
-
-	// 计算链 ID
-	chainID := layerID
-	if parentID != "" {
-		parentLayer, err := loadLayerInfo(parentID)
-		if err == nil && parentLayer.ChainID != "" {
-			// ChainID = SHA256(parentChainID + " " + layerID)
-			chainID = computeChainID(parentLayer.ChainID, layerID)
-		}
-	}
-
-	// 计算层大小
-	size := calculateDirSize(layerDiffDir)
-
-	info := &LayerInfo{
-		ID:        layerID,
-		Parent:    parentID,
-		DiffPath:  layerDiffDir,
-		Size:      size,
-		ChainID:   chainID,
-		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
-	}
-
-	// 保存层元数据
-	if err := saveLayerInfo(info); err != nil {
-		return nil, fmt.Errorf("保存层元数据失败: %w", err)
-	}
-
-	// 写入 lower 文件（记录父层）
-	if parentID != "" {
-		lowerFile := filepath.Join(layerDir, "lower")
-		os.WriteFile(lowerFile, []byte(parentID), 0644)
-	}
-
-	return info, nil
-}
-
-// GetLayerDiffPath 获取层的 diff 目录路径
-func GetLayerDiffPath(layerID string) (string, error) {
-	diffPath := filepath.Join(overlay2StorePath, layerID, "diff")
-	if _, err := os.Stat(diffPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("层 %s 不存在", layerID)
-	}
-	return diffPath, nil
-}
-
-// BuildLowerDir 构建 OverlayFS 的 lowerdir 参数
-// Docker 的方式：从底层到顶层，用 : 分隔
-func BuildLowerDir(layerIDs []string) string {
-	var dirs []string
-	for _, id := range layerIDs {
-		dirs = append(dirs, filepath.Join(overlay2StorePath, id, "diff"))
-	}
-	// OverlayFS 要求 lowerdir 从顶层到底层排列
-	// 反转顺序：最新的层在最前面
-	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
-		dirs[i], dirs[j] = dirs[j], dirs[i]
-	}
-	lowerDir := ""
-	for i, dir := range dirs {
-		if i > 0 {
-			lowerDir += ":"
-		}
-		lowerDir += dir
-	}
-	return lowerDir
-}
-
-// SaveImageToDB 保存镜像到镜像数据库
-func SaveImageToDB(entry *ImageDBEntry) error {
-	if err := os.MkdirAll(imagedbPath, 0755); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(entry, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	// 以镜像名+标签为文件名
-	dbPath := filepath.Join(imagedbPath, entry.Name+":"+entry.Tag+".json")
-	return os.WriteFile(dbPath, data, 0644)
-}
-
-// LoadImageFromDB 从镜像数据库加载镜像
-func LoadImageFromDB(name, tag string) (*ImageDBEntry, error) {
-	if tag == "" {
-		tag = "latest"
-	}
-
-	dbPath := filepath.Join(imagedbPath, name+":"+tag+".json")
-	data, err := os.ReadFile(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("镜像 %s:%s 不存在于数据库", name, tag)
-	}
-
-	var entry ImageDBEntry
-	if err := json.Unmarshal(data, &entry); err != nil {
-		return nil, fmt.Errorf("解析镜像元数据失败: %w", err)
-	}
-
-	return &entry, nil
-}
-
-// ListLayerDB 列出所有镜像层
-func ListLayerDB() ([]*LayerInfo, error) {
-	if err := os.MkdirAll(overlay2StorePath, 0755); err != nil {
-		return nil, err
-	}
-
-	entries, err := os.ReadDir(overlay2StorePath)
-	if err != nil {
-		return nil, err
-	}
-
-	var layers []*LayerInfo
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		info, err := loadLayerInfo(entry.Name())
-		if err != nil {
-			continue
-		}
-		layers = append(layers, info)
-	}
-
-	return layers, nil
-}
-
 // ---- 内部辅助函数 ----
-
-func computeLayerID(diffPath string) (string, error) {
-	if diffPath == "" {
-		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))), nil
-	}
-
-	h := sha256.New()
-	err := filepath.Walk(diffPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		// 将文件路径和大小加入哈希
-		relPath, _ := filepath.Rel(diffPath, path)
-		h.Write([]byte(relPath))
-		h.Write([]byte(fmt.Sprintf("%d", info.Size())))
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil))[:64], nil
-}
-
-func computeChainID(parentChainID string, layerID string) string {
-	h := sha256.New()
-	h.Write([]byte(parentChainID + " " + layerID))
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func saveLayerInfo(info *LayerInfo) error {
-	if err := os.MkdirAll(filepath.Join(overlay2StorePath, info.ID), 0755); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filepath.Join(overlay2StorePath, info.ID, "metadata.json"), data, 0644)
-}
-
-func loadLayerInfo(layerID string) (*LayerInfo, error) {
-	data, err := os.ReadFile(filepath.Join(overlay2StorePath, layerID, "metadata.json"))
-	if err != nil {
-		return nil, err
-	}
-
-	var info LayerInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, err
-	}
-
-	return &info, nil
-}
 
 func calculateDirSize(dirPath string) int64 {
 	var size int64
@@ -323,7 +102,6 @@ func copyDir(src string, dst string) error {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
 
-		// 复制文件
 		srcFile, err := os.Open(path)
 		if err != nil {
 			return nil

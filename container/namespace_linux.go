@@ -3,7 +3,6 @@
 package container
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -37,62 +36,6 @@ func NewNamespaceFlags() uintptr {
 	)
 }
 
-// NewUserNamespaceFlags 创建包含 User Namespace 的标志位组合
-// User Namespace 允许容器内 root 映射为宿主机普通用户（rootless 容器）
-//
-// Docker 的 User Namespace 映射：
-// ┌──────────────┬──────────────┐
-// │ 容器内 UID   │ 宿主机 UID   │
-// ├──────────────┼──────────────┤
-// │ 0 (root)     │ 100000       │
-// │ 1            │ 100001       │
-// │ ...          │ ...          │
-// │ 65534        │ 165534       │
-// └──────────────┴──────────────┘
-//
-// 这样即使容器内进程自认为是 root，实际上在宿主机只是普通用户，
-// 无法破坏宿主机文件系统。
-func NewUserNamespaceFlags() uintptr {
-	return uintptr(
-		unix.CLONE_NEWUTS |
-			unix.CLONE_NEWIPC |
-			unix.CLONE_NEWPID |
-			unix.CLONE_NEWNS |
-			unix.CLONE_NEWNET |
-			unix.CLONE_NEWUSER,
-	)
-}
-
-func GetNamespacePath(pid int, nsType string) string {
-	return fmt.Sprintf("/proc/%d/ns/%s", pid, nsType)
-}
-
-func ForkWithNamespaces(cmd *exec.Cmd, flags uintptr) (*os.Process, error) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: flags,
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动子进程失败: %w", err)
-	}
-
-	return cmd.Process, nil
-}
-
-func SetNamespace(nsPath string) error {
-	fd, err := unix.Open(nsPath, unix.O_RDONLY, 0)
-	if err != nil {
-		return fmt.Errorf("打开 namespace 文件失败 %s: %w", nsPath, err)
-	}
-	defer unix.Close(fd)
-
-	if err := unix.Setns(fd, 0); err != nil {
-		return fmt.Errorf("setns 失败: %w", err)
-	}
-
-	return nil
-}
-
 func setCloneFlags(cmd *exec.Cmd, flags uintptr, tty bool) {
 	//通过 Cloneflags 在 fork 时创建新的命名空间
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -123,14 +66,6 @@ func setHostname(name string) error {
 
 func sendSignal(pid int, sig int) error {
 	return unix.Kill(pid, syscall.Signal(sig))
-}
-
-func checkProcessAlive(pid int) error {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return process.Signal(syscall.Signal(0))
 }
 
 func syscallExec(argv0 string, argv []string, envv []string) error {

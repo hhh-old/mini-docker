@@ -11,7 +11,10 @@ import (
 	"strings"
 	"syscall"
 
+	"mini-docker/container"
 	"mini-docker/libcontainer/configs"
+	"mini-docker/types"
+	"mini-docker/utils"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,7 +27,8 @@ func InitProcess(bundlePath string, fifoPath string) error {
 	defer runtime.UnlockOSThread()
 
 	// 1. 在 pivot_root 之前打开 FIFO（因为 pivot_root 会改变根目录，FIFO 路径将不可访问）
-	fifo, err := os.OpenFile(fifoPath, os.O_RDONLY, 0)
+	// 使用 O_RDWR 打开避免阻塞（O_RDONLY 会阻塞直到有 writer，导致死锁）
+	fifo, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("打开 FIFO 失败 (必须在 pivot_root 前): %w", err)
 	}
@@ -76,7 +80,10 @@ func InitProcess(bundlePath string, fifoPath string) error {
 	// 7. 发送 ready 信号给父进程（runtime create）
 	pipe := os.NewFile(InitPipeFd, "ready-pipe")
 	if pipe != nil {
-		pipe.Write([]byte("ready\n"))
+		if _, err := pipe.Write([]byte("ready\n")); err != nil {
+			pipe.Close()
+			return fmt.Errorf("发送 ready 信号失败: %w", err)
+		}
 		pipe.Close()
 	}
 
@@ -114,159 +121,49 @@ func InitProcess(bundlePath string, fifoPath string) error {
 
 // setupRootfs 设置容器根文件系统（对标 libcontainer/rootfs_linux.go）
 func setupRootfs(config *configs.Config) error {
-	// 1. 将当前根目录设为私有（切断与宿主机的 mount 传播）
-	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
-		return fmt.Errorf("重挂载 / 为 private 失败: %w", err)
-	}
+	overlayMerged := os.Getenv("MINI_DOCKER_OVERLAY_MERGED")
+	overlayUpper := os.Getenv("MINI_DOCKER_OVERLAY_UPPER")
+	overlayWork := os.Getenv("MINI_DOCKER_OVERLAY_WORK")
 
-	// 2. 检测是否有 overlay 配置（从注解中获取）
-	overlayMerged := ""
-	overlayUpper := ""
-	overlayWork := ""
-
-	// 尝试从环境变量读取 overlay 配置（兼容旧模式）
-	if overlayMerged == "" {
-		overlayMerged = os.Getenv("MINI_DOCKER_OVERLAY_MERGED")
-		overlayUpper = os.Getenv("MINI_DOCKER_OVERLAY_UPPER")
-		overlayWork = os.Getenv("MINI_DOCKER_OVERLAY_WORK")
-	}
-
-	// 3. 挂载 rootfs
-	var targetPath string
+	var overlay *types.OverlayDirs
 	if overlayMerged != "" {
-		options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
-			config.Rootfs, overlayUpper, overlayWork)
-		if err := unix.Mount("overlay", overlayMerged, "overlay", 0, options); err != nil {
-			// 回退到 bind mount
-			if err := unix.Mount(config.Rootfs, config.Rootfs, "bind", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-				return fmt.Errorf("绑定挂载 rootfs 失败: %w", err)
-			}
-			targetPath = config.Rootfs
-		} else {
-			targetPath = overlayMerged
+		overlay = &types.OverlayDirs{
+			Merged: overlayMerged,
+			Upper:  overlayUpper,
+			Work:   overlayWork,
 		}
-	} else {
-		if err := unix.Mount(config.Rootfs, config.Rootfs, "bind", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-			return fmt.Errorf("绑定挂载 rootfs 失败: %w", err)
-		}
-		targetPath = config.Rootfs
 	}
 
-	// 4. pivot_root（切换根目录）
-	pivotDir := filepath.Join(targetPath, ".pivot_root")
-	if err := os.MkdirAll(pivotDir, 0755); err != nil {
-		return fmt.Errorf("创建 pivot_root 目录失败: %w", err)
-	}
-	if err := pivotRoot(targetPath, pivotDir); err != nil {
-		return fmt.Errorf("pivot_root 失败: %w", err)
+	if err := container.SetupRootFS(config.Rootfs, overlay); err != nil {
+		return fmt.Errorf("设置 rootfs 失败: %w", err)
 	}
 
-	// 5. 挂载 /proc
-	if err := mountProc(); err != nil {
-		return fmt.Errorf("挂载 /proc 失败: %w", err)
-	}
-
-	// 6. 挂载 /tmp
-	if err := mountTmp(); err != nil {
-		return fmt.Errorf("挂载 /tmp 失败: %w", err)
-	}
-
-	// 7. 挂载额外的挂载点（Volume 等）
 	for _, m := range config.Mounts {
 		if err := mountExtra(m); err != nil {
 			fmt.Printf("警告: 挂载 %s 失败: %v\n", m.Destination, err)
 		}
 	}
 
-	// 8. 挂载 Volume（从环境变量读取，兼容旧模式）
-	mountVolumesFromEnv()
-
 	return nil
 }
 
-// pivotRoot 切换根目录
-func pivotRoot(newRoot string, putOld string) error {
-	if err := unix.PivotRoot(newRoot, putOld); err != nil {
-		return fmt.Errorf("pivot_root 系统调用失败: %w", err)
-	}
-
-	if err := unix.Chdir("/"); err != nil {
-		return fmt.Errorf("chdir / 失败: %w", err)
-	}
-
-	putOldDir := filepath.Join("/", filepath.Base(putOld))
-	if err := unix.Unmount(putOldDir, unix.MNT_DETACH); err != nil {
-		return fmt.Errorf("卸载旧根失败: %w", err)
-	}
-
-	return os.RemoveAll(putOldDir)
-}
-
-// mountProc 挂载 /proc
-func mountProc() error {
-	if err := os.MkdirAll("/proc", 0755); err != nil {
-		return err
-	}
-	return unix.Mount("proc", "/proc", "proc", 0, "")
-}
-
-// mountTmp 挂载 /tmp
-func mountTmp() error {
-	if err := os.MkdirAll("/tmp", 0755); err != nil {
-		return err
-	}
-	return unix.Mount("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "size=64m")
-}
-
-// mountExtra 挂载额外的挂载点
 func mountExtra(m *configs.Mount) error {
 	if err := os.MkdirAll(m.Destination, 0755); err != nil {
 		return err
 	}
 
 	flags := m.Flags
-	if flags == 0 {
-		flags = unix.MS_BIND | unix.MS_REC
-	}
+	data := ""
 
-	return unix.Mount(m.Source, m.Destination, m.Type, flags, "")
-}
-
-// mountVolumesFromEnv 从环境变量挂载 Volume
-func mountVolumesFromEnv() {
-	volumesStr := os.Getenv("MINI_DOCKER_VOLUMES")
-	if volumesStr == "" {
-		return
-	}
-
-	volumeSpecs := strings.Split(volumesStr, ",")
-	for _, spec := range volumeSpecs {
-		parts := strings.Split(spec, ":")
-		if len(parts) < 2 {
-			continue
-		}
-
-		hostPath := parts[0]
-		containerPath := parts[1]
-		readOnly := len(parts) >= 3 && parts[2] == "ro"
-
-		if err := os.MkdirAll(containerPath, 0755); err != nil {
-			continue
-		}
-
-		flags := unix.MS_BIND | unix.MS_REC
-		if readOnly {
-			flags |= unix.MS_RDONLY
-		}
-
-		if err := unix.Mount(hostPath, containerPath, "bind", uintptr(flags), ""); err != nil {
-			continue
-		}
-
-		if readOnly {
-			unix.Mount(hostPath, containerPath, "bind", uintptr(flags|unix.MS_REMOUNT), "")
+	if m.Type != "" && m.Type != "bind" {
+		data = strings.Join(m.Options, ",")
+	} else {
+		if flags == 0 {
+			flags = unix.MS_BIND | unix.MS_REC
 		}
 	}
+
+	return unix.Mount(m.Source, m.Destination, m.Type, uintptr(flags), data)
 }
 
 // applyCapabilities 应用 Capability 限制
@@ -292,24 +189,12 @@ func applyCapabilities(caps *configs.Capabilities) error {
 			continue
 		}
 		if !keepSet[val] {
-			dropCapability(val)
+			if err := utils.DropCapability(val); err != nil {
+				return fmt.Errorf("丢弃 capability %s 失败: %w", capName, err)
+			}
 		}
 	}
 
-	return nil
-}
-
-// dropCapability 从能力边界集中移除一个能力
-func dropCapability(cap int) error {
-	_, _, errno := syscall.Syscall6(
-		unix.SYS_PRCTL,
-		unix.PR_CAPBSET_DROP,
-		uintptr(cap),
-		0, 0, 0, 0,
-	)
-	if errno != 0 {
-		return fmt.Errorf("prctl(PR_CAPBSET_DROP, %d) 失败: %v", cap, errno)
-	}
 	return nil
 }
 
@@ -325,31 +210,4 @@ func readonlyPath(path string) {
 	if err := unix.Mount(path, path, "bind", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
 		// 忽略错误，路径可能不存在
 	}
-}
-
-// IsInitProcess 检测是否是 init 进程
-func IsInitProcess() bool {
-	return len(os.Args) >= 2 && os.Args[1] == "init"
-}
-
-// HandleInit 处理 init 进程
-func HandleInit() error {
-	// 解析参数
-	bundlePath := ""
-	fifoPath := ""
-
-	for i := 2; i < len(os.Args)-1; i++ {
-		switch os.Args[i] {
-		case "--bundle":
-			bundlePath = os.Args[i+1]
-		case "--fifo":
-			fifoPath = os.Args[i+1]
-		}
-	}
-
-	if bundlePath == "" || fifoPath == "" {
-		return fmt.Errorf("init: 缺少 --bundle 或 --fifo 参数")
-	}
-
-	return InitProcess(bundlePath, fifoPath)
 }

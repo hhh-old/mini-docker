@@ -47,3 +47,13 @@ func (n *NetworkManager) GetVethHost() string {
 func (n *NetworkManager) GetContainerIP() string {
 	return ""
 }
+
+func ReleaseIP(networkName string, ip string) {
+}
+
+func LoadNetworkInfo(name string) (*NetworkInfo, error) {
+	return nil, fmt.Errorf("网络管理仅在 Linux 上可用")
+}
+
+func CleanupMasquerade(subnet string, bridgeName string) {
+}
