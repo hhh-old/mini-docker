@@ -42,15 +42,35 @@ func Create(args []string) {
 	consolePath := "" //PTY 设备路径,TTY模式下shim创建的从设备
 	stdoutFd := -1    //
 	stderrFd := -1
-	for i := 1; i < len(args)-1; i++ {
+	for i := 1; i < len(args); i++ {
 		if args[i] == "--bundle" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "错误: --bundle 需要指定路径\n")
+				os.Exit(1)
+			}
 			bundlePath = args[i+1]
+			i++
 		} else if args[i] == "--console" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "错误: --console 需要指定路径\n")
+				os.Exit(1)
+			}
 			consolePath = args[i+1]
+			i++
 		} else if args[i] == "--stdout-fd" {
-			stdoutFd, _ = strconv.Atoi(args[i+1]) //strconv.Atoi 是 Go 语言标准库 strconv 包中的一个常用函数，它的作用是将字符串（String）转换成整型（Integer）。
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "错误: --stdout-fd 需要指定值\n")
+				os.Exit(1)
+			}
+			stdoutFd, _ = strconv.Atoi(args[i+1])
+			i++
 		} else if args[i] == "--stderr-fd" {
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "错误: --stderr-fd 需要指定值\n")
+				os.Exit(1)
+			}
 			stderrFd, _ = strconv.Atoi(args[i+1])
+			i++
 		}
 	}
 	if bundlePath == "" {
@@ -102,11 +122,19 @@ func Create(args []string) {
 		// 包装成 Go 语言标准的文件对象（*os.File），以便直接作为容器内进程的标准输出（Stdout）和标准错误（Stderr）
 		// 非tty模式，shim进程没有传递给runtime create进程Stdin，
 		// 因为后台运行的容器不需要用户交互，只需要捕获输出（日志），所以只需要另外两个Std
-		if stdoutFd >= 0 {
-			process.Stdout = os.NewFile(uintptr(stdoutFd), "stdout")
-		}
-		if stderrFd >= 0 {
-			process.Stderr = os.NewFile(uintptr(stderrFd), "stderr")
+		// 当 stdoutFd 和 stderrFd 相同时（非 TTY 模式直接写日志文件），
+		// 只创建一个 os.File 对象共享使用，避免同一 fd 被双重关闭
+		if stdoutFd >= 0 && stderrFd >= 0 && stdoutFd == stderrFd {
+			file := os.NewFile(uintptr(stdoutFd), "stdout")
+			process.Stdout = file
+			process.Stderr = file
+		} else {
+			if stdoutFd >= 0 {
+				process.Stdout = os.NewFile(uintptr(stdoutFd), "stdout")
+			}
+			if stderrFd >= 0 {
+				process.Stderr = os.NewFile(uintptr(stderrFd), "stderr")
+			}
 		}
 	}
 
@@ -254,7 +282,7 @@ func State(args []string) {
 		Pid    int    `json:"pid"`
 	}{
 		ID:     container.ID(),
-		Status: status.String(),
+		Status: string(status),
 		Pid:    container.Pid(),
 	}
 
@@ -282,8 +310,6 @@ func convertToConfig(s *spec.Spec, bundlePath string) *configs.Config {
 		config.Args = s.Process.Args
 		config.Env = s.Process.Env
 		config.Cwd = s.Process.Cwd
-		if s.Process.Terminal {
-		}
 	}
 
 	if s.Linux != nil {

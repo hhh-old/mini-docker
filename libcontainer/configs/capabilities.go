@@ -124,19 +124,3 @@ func ResolveCapName(name string) (int, error) {
 	}
 	return 0, fmt.Errorf("未知的 Capability: %s", name)
 }
-
-// NewDefaultCapabilities 创建默认的 Capability 配置
-func NewDefaultCapabilities() *Capabilities {
-	return &Capabilities{
-		Bounding:    copyStringSlice(DefaultCapabilities),
-		Effective:   copyStringSlice(DefaultCapabilities),
-		Inheritable: copyStringSlice(DefaultCapabilities),
-		Permitted:   copyStringSlice(DefaultCapabilities),
-	}
-}
-
-func copyStringSlice(src []string) []string {
-	dst := make([]string, len(src))
-	copy(dst, src)
-	return dst
-}

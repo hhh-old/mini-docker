@@ -18,33 +18,14 @@ import (
 )
 
 // Status 容器状态
-type Status int
+type Status = string
 
 const (
-	// StatusCreated 容器已创建但未启动
-	StatusCreated Status = iota
-	// StatusRunning 容器正在运行
-	StatusRunning
-	// StatusPaused 容器已暂停
-	StatusPaused
-	// StatusStopped 容器已停止
-	StatusStopped
+	StatusCreated Status = "created"
+	StatusRunning Status = "running"
+	StatusPaused  Status = "paused"
+	StatusStopped Status = "stopped"
 )
-
-func (s Status) String() string {
-	switch s {
-	case StatusCreated:
-		return "created"
-	case StatusRunning:
-		return "running"
-	case StatusPaused:
-		return "paused"
-	case StatusStopped:
-		return "stopped"
-	default:
-		return "unknown"
-	}
-}
 
 // Container 容器接口（对标 libcontainer/container.go）
 type Container interface {
@@ -151,11 +132,6 @@ func New(id string, config *configs.Config) (Container, error) {
 // Load 加载已有容器
 func Load(id string) (Container, error) {
 	return loadLinuxContainer(id)
-}
-
-// List 列出所有容器
-func List() ([]Container, error) {
-	return listLinuxContainers()
 }
 
 // State 容器状态信息（用于序列化）

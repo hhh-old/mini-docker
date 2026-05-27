@@ -32,14 +32,13 @@ import (
 	"fmt"
 	"log"
 	"mini-docker/container"
+	"mini-docker/libcontainer"
+	"mini-docker/libcontainer/cgroups"
 	"mini-docker/network"
-	"mini-docker/spec"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -67,28 +66,17 @@ type Daemon struct {
 }
 
 // ContainerState 运行中容器的运行时状态（仅 Daemon 持有）
+// 嵌入 *ContainerInfo 消除重复字段，业务元数据通过 Info 直接访问，
+// 纯内存状态（NetMgr、CgroupMgr 等接口实例）保留在此结构体中，因为它们无法序列化
 type ContainerState struct {
-	mu        sync.Mutex
-	ID        string
-	Pid       int
-	ShimPID   int
-	Cmd       *os.Process
-	CgroupMgr interface {
-		Apply(pid int) error
-		Destroy() error
-		Freeze() error
-		Thaw() error
-	}
-	NetMgr interface {
-		Connect(pid int) error
-		Disconnect() error
-		GetVethHost() string
-		GetContainerIP() string
-	}
-	CreatedAt     time.Time
-	RestartPolicy string // "no", "always", "on-failure"
-	RestartCount  int
-	UserStopped   bool
+	mu           sync.Mutex
+	Info         *container.ContainerInfo // 嵌入容器业务元数据，避免字段重复和数据同步问题
+	ShimPID      int                      // shim 进程 PID（Info 中也有，但此处保留运行时实时值以支持 takeover 恢复）
+	Cmd          *os.Process              // 活的进程对象，无法序列化
+	NetMgr       network.Manager          // 网络管理接口，无法序列化
+	CgroupMgr    cgroups.Manager          // cgroup 管理接口，无法序列化
+	RestartCount int                      // 重启计数，纯运行时状态
+	UserStopped  bool                     // 用户主动停止标记，纯运行时状态
 }
 
 // NewDaemon 创建 Daemon 实例
@@ -193,6 +181,7 @@ func (d *Daemon) acceptLoop() {
 				return
 			default:
 				log.Printf("接受连接失败: %v\n", err)
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 		}
@@ -262,6 +251,16 @@ func (d *Daemon) routeRequest(req Request, conn net.Conn) Response {
 		return d.handleNetworkList(req)
 	case "network_delete":
 		return d.handleNetworkDelete(req)
+	case "volume_create":
+		return d.handleVolumeCreate(req)
+	case "volume_list":
+		return d.handleVolumeList(req)
+	case "volume_rm":
+		return d.handleVolumeRm(req)
+	case "volume_inspect":
+		return d.handleVolumeInspect(req)
+	case "build":
+		return d.handleBuild(req)
 	case "ping":
 		return Response{Success: true, Message: "pong"}
 	default:
@@ -276,17 +275,24 @@ func (d *Daemon) sendResponse(conn net.Conn, resp Response) {
 		log.Printf("序列化响应失败: %v\n", err)
 		return
 	}
-	conn.Write(data)
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			log.Printf("写入响应失败: %v\n", err)
+			return
+		}
+		data = data[n:]
+	}
 }
 
 // RegisterContainer 注册运行中的容器到 Daemon
 func (d *Daemon) RegisterContainer(state *ContainerState) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.containers[state.ID] = state
+	d.containers[state.Info.ID] = state
 	d.eventBus.Publish(Event{
-		Type:      "container_start",
-		Container: state.ID,
+		Type:      "container_create",
+		Container: state.Info.ID,
 		Time:      time.Now(),
 	})
 }
@@ -306,7 +312,12 @@ func (d *Daemon) GetContainerState(containerID string) (*ContainerState, bool) {
 	return s, ok
 }
 
-// WatchContainer 监控容器进程退出（在 goroutine 中调用）
+// WatchContainer 是 Daemon 的 容器生命周期监控器 ，它在独立的 goroutine 中运行，负责：
+// |  1. 监听容器退出
+// │  2. 收集退出信息
+// │  3. 发布退出事件
+// │  4. 更新容器状态
+// │  5. 根据重启策略决定是否重启
 // 轮询 shim 直到容器退出，然后处理重启策略或清理资源
 func (d *Daemon) WatchContainer(containerID string) {
 	state, ok := d.GetContainerState(containerID)
@@ -314,7 +325,7 @@ func (d *Daemon) WatchContainer(containerID string) {
 		return
 	}
 
-	// 轮询等待容器退出
+	// 轮询等待容器退出,获取容器状态码
 	var exitCode int
 	for {
 		select {
@@ -322,36 +333,31 @@ func (d *Daemon) WatchContainer(containerID string) {
 			return
 		default:
 		}
-
+		// 尝试从 shim 获取退出信息
 		exitInfo, err := d.service.GetExitInfo(containerID)
 		if err == nil {
 			if exitInfo != nil {
-				exitCode = exitInfo.ExitCode
+				exitCode = exitInfo.ExitCode //获得退出码
 			}
 			break
 		}
-
+		// 如果 shim 不在线，等待容器进程退出
 		if !containerd.IsShimAlive(containerID) {
-			if state.Pid > 0 && utils.CheckProcessAlive(state.Pid) == nil {
-				log.Printf("容器 %s 的 shim 已离线，直接等待进程退出\n", utils.FormatShortID(containerID))
-				for utils.CheckProcessAlive(state.Pid) == nil {
+			if state.Info.Pid > 0 && utils.CheckProcessAlive(state.Info.Pid) {
+				log.Printf("容器 %s 的 shim 已离线，直接等待进程退出\n", containerID)
+				for utils.CheckProcessAlive(state.Info.Pid) {
 					select {
 					case <-d.shutdown:
 						return
 					case <-time.After(2 * time.Second):
 					}
 				}
-				if info, err := containerd.ReadExitInfo(containerID); err == nil && info != nil {
-					exitCode = info.ExitCode
-				} else {
-					exitCode = -1
-				}
+			}
+			//此时容器进程已经退出了
+			if info, err := containerd.ReadExitInfo(containerID); err == nil && info != nil {
+				exitCode = info.ExitCode
 			} else {
-				if info, err := containerd.ReadExitInfo(containerID); err == nil && info != nil {
-					exitCode = info.ExitCode
-				} else {
-					exitCode = -1
-				}
+				exitCode = -1
 			}
 			break
 		}
@@ -369,124 +375,171 @@ func (d *Daemon) WatchContainer(containerID string) {
 		ExitCode:  exitCode,
 		Time:      time.Now(),
 	})
-
-	if info, err := container.LoadContainerInfoByID(containerID); err == nil {
-		info.Status = constants.StatusExited
-		info.ExitCode = exitCode
-		info.Pid = 0
-		info.FinishedAt = utils.NowFormatted()
-		container.SaveContainerInfo(info)
-	}
-
-	if state.RestartPolicy != "no" {
+	//更新容器状态（通过嵌入的 Info 直接修改，避免从磁盘重新加载）
+	state.Info.Status = libcontainer.StatusStopped
+	state.Info.ExitCode = exitCode
+	state.Info.Pid = 0
+	state.Info.FinishedAt = utils.NowFormatted()
+	container.SaveContainerInfo(state.Info)
+	//根据重启策略决定是否重启
+	if state.Info.RestartPolicy != "no" {
 		state.mu.Lock()
 		userStopped := state.UserStopped
 		state.mu.Unlock()
 		if !userStopped {
-			if state.RestartPolicy == "always" ||
-				(state.RestartPolicy == "on-failure" && exitCode != 0) {
+			if state.Info.RestartPolicy == "always" ||
+				(state.Info.RestartPolicy == "on-failure" && exitCode != 0) {
 				log.Printf("容器 %s 退出 (exit=%d)，根据重启策略 %s 准备重启\n",
-					utils.FormatShortID(containerID), exitCode, state.RestartPolicy)
+					containerID, exitCode, state.Info.RestartPolicy)
 				d.handleRestart(containerID, exitCode)
 				return
 			}
 		}
 	}
 
+	if _, ok := d.GetContainerState(containerID); !ok {
+		return
+	}
+	//清理退出的容器
 	d.cleanupExitedContainer(containerID)
 }
 
-// handleRestart 处理容器重启
+func buildContainerState(info *container.ContainerInfo, shimPID int) *ContainerState {
+	state := &ContainerState{
+		Info:    info,
+		ShimPID: shimPID,
+	}
+
+	if info.Network != "" {
+		state.NetMgr = network.NewManagerFromInfo(info.Network, info.PortMap, info.ContainerIP, info.VethHost)
+	}
+
+	return state
+}
+
+// handleRestart 处理容器重启（对齐 Docker: 保留容器ID + 指数退避 + 次数限制）
 func (d *Daemon) handleRestart(containerID string, exitCode int) {
+	info, err := container.LoadContainerInfoByID(containerID)
+	if err != nil {
+		log.Printf("容器 %s 重启失败: 无法加载容器信息\n", containerID)
+		d.cleanupExitedContainer(containerID)
+		return
+	}
+
+	state, ok := d.GetContainerState(containerID)
+	restartCount := 0
+	if ok {
+		state.mu.Lock()
+		restartCount = state.RestartCount + 1
+		state.RestartCount = restartCount
+		state.mu.Unlock()
+	}
+
+	if info.RestartPolicy == "on-failure" {
+		maxRetries := info.MaxRestartRetries
+		if maxRetries <= 0 {
+			maxRetries = constants.DefaultMaxRetries
+		}
+		if restartCount > maxRetries {
+			log.Printf("容器 %s 已达到 on-failure 最大重启次数 (%d)，停止重启\n",
+				containerID, maxRetries)
+			d.cleanupExitedContainer(containerID)
+			return
+		}
+	}
+
+	backoff := time.Duration(restartCount) * constants.RestartBackoffBase
+	if backoff > constants.RestartBackoffMax {
+		backoff = constants.RestartBackoffMax
+	}
+	log.Printf("容器 %s 将在 %v 后重启 (第 %d 次)\n",
+		containerID, backoff, restartCount)
+
+	select {
+	case <-time.After(backoff):
+	case <-d.shutdown:
+		return
+	}
+
 	d.mu.Lock()
 	delete(d.containers, containerID)
 	d.mu.Unlock()
 
-	imageName := containerd.GetContainerImage(containerID)
-	cmd := containerd.GetContainerCmd(containerID)
-	restartPolicy := containerd.GetContainerRestartPolicy(containerID)
+	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 
-	info, err := container.LoadContainerInfoByID(containerID)
+	backupInfo := *info
 
-	// 清理旧容器资源
-	d.service.DeleteTask(containerID)
-	if err == nil && info != nil {
-		container.CleanupContainerNetwork(info)
-		container.CleanupOverlay(info)
-		container.CleanupCgroup(info.CgroupName)
-		container.RemoveContainerInfo(containerID)
-	}
+	req := buildRunRequest(info)
 
-	cmdJSON, _ := json.Marshal(cmd)
-	req := Request{
-		Type: "run",
-		Args: map[string]string{
-			"image":          imageName,
-			"cmd":            strings.Join(cmd, " "),
-			"cmd_json":       string(cmdJSON),
-			"restart_policy": restartPolicy,
-			"detach":         "true",
-		},
-	}
-
-	if err == nil && info != nil {
-		if info.Name != "" {
-			req.Args["name"] = info.Name
-		}
-		if info.NetworkName != "" {
-			req.Args["network"] = info.NetworkName
-		}
-		if info.PortMap != "" {
-			req.Args["port_map"] = info.PortMap
-		}
-		if len(info.Volumes) > 0 {
-			req.Args["volumes"] = strings.Join(info.Volumes, "|")
-		}
-		if info.MemoryLimit != "" {
-			req.Args["memory"] = info.MemoryLimit
-		}
-		if info.CPUShares != "" {
-			req.Args["cpu_shares"] = info.CPUShares
-		}
-		if info.HealthCmd != "" {
-			req.Args["health_cmd"] = info.HealthCmd
-		}
-		if info.HealthInterval != "" {
-			req.Args["health_interval"] = info.HealthInterval
-		}
-		if info.HealthTimeout != "" {
-			req.Args["health_timeout"] = info.HealthTimeout
-		}
-		if info.HealthRetries > 0 {
-			req.Args["health_retries"] = fmt.Sprintf("%d", info.HealthRetries)
-		}
-	}
-
-	resp := d.handleRun(req, nil)
+	resp := d.runWithID(req, nil, containerID)
 	if resp.Success {
-		log.Printf("容器 %s 重启成功\n", utils.FormatShortID(containerID))
+		if newState, ok := d.GetContainerState(containerID); ok {
+			newState.mu.Lock()
+			newState.RestartCount = restartCount
+			newState.mu.Unlock()
+		}
+		log.Printf("容器 %s 重启成功 (第 %d 次)\n", containerID, restartCount)
 	} else {
-		log.Printf("容器 %s 重启失败: %s\n", utils.FormatShortID(containerID), resp.Message)
+		log.Printf("容器 %s 重启失败: %s\n", containerID, resp.Message)
+		backupInfo.Status = libcontainer.StatusStopped
+		container.SaveContainerInfo(&backupInfo)
 	}
 }
 
 // cleanupExitedContainer 清理已退出的容器
+// 仅清理运行时资源（网络、cgroup、shim），保留 OverlayFS 和 ContainerInfo 以支持 docker start
 func (d *Daemon) cleanupExitedContainer(containerID string) {
 	d.mu.Lock()
-	state, ok := d.containers[containerID]
+	state, _ := d.containers[containerID]
 	delete(d.containers, containerID)
 	d.mu.Unlock()
 
-	if ok && state != nil {
-		if state.NetMgr != nil {
-			_ = state.NetMgr.Disconnect()
-		}
-		if state.CgroupMgr != nil {
-			_ = state.CgroupMgr.Destroy()
-		}
+	d.cleanupContainerResources(containerID, state, CleanupOptions{ShutdownShim: true})
+}
+
+// runHealthCheckLoop 周期执行健康检查（对齐 Docker: Daemon 周期执行 HEALTHCHECK）
+func (d *Daemon) runHealthCheckLoop(containerID string) {
+	info, err := container.LoadContainerInfoByID(containerID)
+	if err != nil || info.HealthCmd == "" {
+		return
 	}
 
-	d.service.ShutdownShim(containerID)
+	config := container.ParseHealthConfig(info)
+
+	initialDelay := 5 * time.Second
+	select {
+	case <-time.After(initialDelay):
+	case <-d.shutdown:
+		return
+	}
+
+	ticker := time.NewTicker(config.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.shutdown:
+			return
+		case <-ticker.C:
+		}
+
+		currentInfo, err := container.LoadContainerInfoByID(containerID)
+		if err != nil || (currentInfo.Status != libcontainer.StatusRunning && currentInfo.Status != libcontainer.StatusPaused) {
+			return
+		}
+
+		result := container.RunHealthCheck(currentInfo, config)
+		container.SaveHealthResult(containerID, result)
+
+		if result.Status == container.HealthUnhealthy {
+			d.eventBus.Publish(Event{
+				Type:      "container_unhealthy",
+				Container: containerID,
+				Time:      time.Now(),
+				Message:   fmt.Sprintf("健康检查失败: %s", result.Output),
+			})
+		}
+	}
 }
 
 // restoreContainers 的核心职责是在 Daemon 重启后，重新接管和恢复对已有容器的管理。
@@ -518,20 +571,15 @@ func (d *Daemon) restoreContainers() {
 	restored := 0
 	failed := 0
 	for _, task := range tasks {
-		shortID := task.ID
-		if len(shortID) > 12 {
-			shortID = utils.FormatShortID(shortID)
-		}
-
-		if task.Status == "stopped" {
-			d.handleStoppedTask(task.ID, shortID)
+		if task.Status == libcontainer.StatusStopped {
+			d.handleStoppedTask(task.ID)
 			continue
 		}
 
 		shimAlive := containerd.IsShimAlive(task.ID)
 		if !shimAlive {
-			log.Printf("容器 %s 的 shim 进程已离线，尝试降级恢复...\n", shortID)
-			if d.handleDeadShim(task.ID, shortID) {
+			log.Printf("容器 %s 的 shim 进程已离线，尝试降级恢复...\n", task.ID)
+			if d.handleDeadShim(task.ID) {
 				restored++
 			} else {
 				failed++
@@ -541,45 +589,25 @@ func (d *Daemon) restoreContainers() {
 
 		shimPID := containerd.ReadShimPID(task.ID)
 
-		info, err := d.loadContainerInfoForRestore(task.ID)
+		info, err := container.LoadContainerInfoByID(task.ID)
 		if err != nil {
-			log.Printf("容器 %s 的元数据加载失败: %v，跳过恢复\n", shortID, err)
+			log.Printf("容器 %s 的元数据加载失败: %v，跳过恢复\n", task.ID, err)
 			failed++
 			continue
 		}
 
-		createdAt := time.Now()
-		if info.CreatedAt != "" {
-			if t, err := time.Parse("2006-01-02 15:04:05", info.CreatedAt); err == nil {
-				createdAt = t
-			}
-		}
-
-		state := &ContainerState{
-			ID:            task.ID,
-			Pid:           task.Pid,
-			ShimPID:       shimPID,
-			CreatedAt:     createdAt,
-			RestartPolicy: info.RestartPolicy,
-		}
-
-		if info.CgroupName != "" {
-			state.CgroupMgr = &cgroupRestorer{cgroupName: info.CgroupName}
-		}
-		if info.NetworkName != "" {
-			state.NetMgr = &networkRestorer{networkName: info.NetworkName, portMap: info.PortMap, containerIP: info.ContainerIP, vethHost: info.VethHost}
-		}
+		state := buildContainerState(info, shimPID)
 
 		d.RegisterContainer(state)
 		go d.WatchContainer(task.ID)
 
-		info.Status = "running"
+		info.Status = libcontainer.StatusRunning
 		info.Pid = task.Pid
 		container.SaveContainerInfo(info)
 
 		restored++
 		log.Printf("恢复容器 %s (PID=%d, shim=%d, 策略=%s)\n",
-			shortID, task.Pid, shimPID, info.RestartPolicy)
+			task.ID, task.Pid, shimPID, info.RestartPolicy)
 	}
 
 	d.cleanupOrphanedInfos(tasks)
@@ -588,42 +616,30 @@ func (d *Daemon) restoreContainers() {
 		len(tasks), restored, failed)
 }
 
-// loadContainerInfoForRestore 从持久化存储加载容器元数据
-// 容器元数据存储在 /var/run/mini-docker/<shortID>.json
-func (d *Daemon) loadContainerInfoForRestore(containerID string) (*container.ContainerInfo, error) {
-	containers, err := container.ListContainers()
-	if err != nil {
-		return nil, fmt.Errorf("列出容器信息失败: %w", err)
-	}
-
-	for _, c := range containers {
-		if c.ID == containerID {
-			return c, nil
-		}
-	}
-
-	return nil, fmt.Errorf("容器 %s 的元数据不存在", containerID)
-}
-
 // handleStoppedTask 处理已停止的任务
 // 从 runtime state 中发现状态为 stopped 的任务，清理残留的 runtime 资源
-func (d *Daemon) handleStoppedTask(taskID string, shortID string) {
-	info, err := d.loadContainerInfoForRestore(taskID)
+func (d *Daemon) handleStoppedTask(taskID string) {
+	info, err := container.LoadContainerInfoByID(taskID)
 	if err != nil {
 		d.service.DeleteTask(taskID)
 		return
 	}
 
-	if info.Status == "running" {
-		info.Status = "exited"
-		info.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+	if info.Status == libcontainer.StatusRunning {
+		exitCode := info.ExitCode
+		if exitInfo, err := containerd.ReadExitInfo(taskID); err == nil && exitInfo != nil {
+			exitCode = exitInfo.ExitCode
+		}
+		info.Status = libcontainer.StatusStopped
+		info.ExitCode = exitCode
+		info.FinishedAt = time.Now().Format(constants.TimeFormat)
 		container.SaveContainerInfo(info)
-		log.Printf("容器 %s 进程已退出，状态已更新为 exited\n", shortID)
+		log.Printf("容器 %s 进程已退出，状态已更新为 stopped\n", taskID)
 	}
 
 	if info.RestartPolicy == "always" ||
 		(info.RestartPolicy == "on-failure" && info.ExitCode != 0) {
-		log.Printf("容器 %s 重启策略为 %s，准备重启...\n", shortID, info.RestartPolicy)
+		log.Printf("容器 %s 重启策略为 %s，准备重启...\n", taskID, info.RestartPolicy)
 		d.triggerRestart(taskID, info)
 	}
 }
@@ -631,8 +647,8 @@ func (d *Daemon) handleStoppedTask(taskID string, shortID string) {
 // handleDeadShim 处理 shim 进程已死亡的情况
 // shim 死亡意味着无法再与容器 runtime 通信，需要判断容器进程是否仍在运行
 // 返回值: true 表示成功恢复（进程仍存活并已注册），false 表示恢复失败
-func (d *Daemon) handleDeadShim(taskID string, shortID string) bool {
-	info, err := d.loadContainerInfoForRestore(taskID)
+func (d *Daemon) handleDeadShim(taskID string) bool {
+	info, err := container.LoadContainerInfoByID(taskID)
 	if err != nil {
 		d.service.DeleteTask(taskID)
 		return false
@@ -642,113 +658,77 @@ func (d *Daemon) handleDeadShim(taskID string, shortID string) bool {
 	processAlive := err == nil && proc.Signal(syscall.Signal(0)) == nil
 
 	if processAlive {
-		log.Printf("容器 %s 进程 (PID=%d) 仍在运行但 shim 已丢失，降级恢复\n",
-			shortID, info.Pid)
-
-		createdAt := time.Now()
-		if info.CreatedAt != "" {
-			if t, err := time.Parse("2006-01-02 15:04:05", info.CreatedAt); err == nil {
-				createdAt = t
+		if !info.Tty {
+			// 非 TTY 容器：shim 崩溃后容器仍可存活（日志文件 fd 不受 shim 影响）
+			// 重启 shim 以 takeover 模式接管容器，恢复 Wait4 监控和控制 socket 服务
+			log.Printf("容器 %s 进程 (PID=%d) 仍在运行，非 TTY 模式，重启 shim 接管\n",
+				taskID, info.Pid)
+			shimPID, restartErr := d.service.RestartShim(taskID, info.Pid)
+			if restartErr != nil {
+				log.Printf("容器 %s 重启 shim 失败: %v，降级恢复\n", taskID, restartErr)
+				// 降级恢复：无 shim 监控，仅注册容器状态
+				state := buildContainerState(info, 0)
+				d.RegisterContainer(state)
+				go d.WatchContainer(taskID)
+				info.Status = libcontainer.StatusRunning
+				container.SaveContainerInfo(info)
+				return true
 			}
+			state := buildContainerState(info, shimPID)
+			d.RegisterContainer(state)
+			go d.WatchContainer(taskID)
+			info.ShimPID = shimPID
+			info.Status = libcontainer.StatusRunning
+			container.SaveContainerInfo(info)
+			return true
 		}
+		// TTY 容器：shim 崩溃后 PTY Master 已关闭，容器可能即将收到 SIGHUP 退出
+		// 降级恢复，等待容器自然退出后由 WatchContainer 捕获
+		log.Printf("容器 %s 进程 (PID=%d) 仍在运行但 shim 已丢失，TTY 模式降级恢复\n",
+			taskID, info.Pid)
 
-		state := &ContainerState{
-			ID:            taskID,
-			Pid:           info.Pid,
-			ShimPID:       0,
-			CreatedAt:     createdAt,
-			RestartPolicy: info.RestartPolicy,
-		}
-
-		if info.CgroupName != "" {
-			state.CgroupMgr = &cgroupRestorer{cgroupName: info.CgroupName}
-		}
-		if info.NetworkName != "" {
-			state.NetMgr = &networkRestorer{networkName: info.NetworkName, portMap: info.PortMap, containerIP: info.ContainerIP, vethHost: info.VethHost}
-		}
+		state := buildContainerState(info, 0)
 
 		d.RegisterContainer(state)
 		go d.WatchContainer(taskID)
 
-		info.Status = "running"
+		info.Status = libcontainer.StatusRunning
 		container.SaveContainerInfo(info)
 		return true
 	}
 
-	log.Printf("容器 %s 进程和 shim 均已死亡，清理资源\n", shortID)
-	info.Status = "exited"
+	log.Printf("容器 %s 进程和 shim 均已死亡，清理资源\n", taskID)
+	info.Status = libcontainer.StatusStopped
 	info.ExitCode = -1
-	info.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+	info.FinishedAt = time.Now().Format(constants.TimeFormat)
 	container.SaveContainerInfo(info)
 	d.service.DeleteTask(taskID)
 
-	if info.RestartPolicy == "always" || (info.RestartPolicy == "on-failure" && info.ExitCode != 0) {
-		log.Printf("容器 %s 根据重启策略 %s 准备重启\n", shortID, info.RestartPolicy)
+	if info.RestartPolicy == "always" {
+		log.Printf("容器 %s 根据重启策略 %s 准备重启\n", taskID, info.RestartPolicy)
 		d.triggerRestart(taskID, info)
 	}
 	return false
 }
 
-// triggerRestart 触发容器重启
+// triggerRestart 触发容器重启（Daemon 恢复场景，保留容器ID）
 func (d *Daemon) triggerRestart(taskID string, info *container.ContainerInfo) {
-	d.service.DeleteTask(taskID)
+	d.cleanupContainerResources(taskID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 
-	container.CleanupContainerNetwork(info)
-	container.CleanupOverlay(info)
-	container.CleanupCgroup(info.CgroupName)
-	container.RemoveContainerInfo(taskID)
+	req := buildRunRequest(info)
 
-	cmdStr := ""
-	if len(info.Cmd) > 0 {
-		cmdStr = strings.Join(info.Cmd, " ")
-	}
-	cmdJSON, _ := json.Marshal(info.Cmd)
-
-	req := Request{
-		Type: "run",
-		Args: map[string]string{
-			"image":           info.Image,
-			"cmd":             cmdStr,
-			"cmd_json":        string(cmdJSON),
-			"restart_policy":  info.RestartPolicy,
-			"detach":          "true",
-			"name":            info.Name,
-			"health_cmd":      info.HealthCmd,
-			"health_interval": info.HealthInterval,
-			"health_timeout":  info.HealthTimeout,
-		},
-	}
-	if info.HealthRetries > 0 {
-		req.Args["health_retries"] = fmt.Sprintf("%d", info.HealthRetries)
-	}
-	if info.NetworkName != "" {
-		req.Args["network"] = info.NetworkName
-	}
-	if info.PortMap != "" {
-		req.Args["port_map"] = info.PortMap
-	}
-	if len(info.Volumes) > 0 {
-		req.Args["volumes"] = strings.Join(info.Volumes, "|")
-	}
-	if info.MemoryLimit != "" {
-		req.Args["memory"] = info.MemoryLimit
-	}
-	if info.CPUShares != "" {
-		req.Args["cpu_shares"] = info.CPUShares
-	}
-
-	resp := d.handleRun(req, nil)
+	resp := d.runWithID(req, nil, taskID)
 	if resp.Success {
-		log.Printf("容器 %s 重启成功\n", utils.FormatShortID(taskID))
+		log.Printf("容器 %s 重启成功\n", taskID)
 	} else {
-		log.Printf("容器 %s 重启失败: %s\n", utils.FormatShortID(taskID), resp.Message)
+		log.Printf("容器 %s 重启失败: %s\n", taskID, resp.Message)
 	}
 }
 
 // cleanupOrphanedInfos 清理孤儿 ContainerInfo
 // 当 ContainerInfo JSON 文件存在但对应的 runtime state 已不存在时，
 // 说明容器的 runtime 资源已被清理但元数据残留，需要同步更新状态
-func (d *Daemon) cleanupOrphanedInfos(tasks []spec.State) {
+func (d *Daemon) cleanupOrphanedInfos(tasks []*libcontainer.ContainerState) {
 	taskSet := make(map[string]bool)
 	for _, t := range tasks {
 		taskSet[t.ID] = true
@@ -764,12 +744,12 @@ func (d *Daemon) cleanupOrphanedInfos(tasks []spec.State) {
 			continue
 		}
 
-		if c.Status == "running" {
-			c.Status = "exited"
-			c.FinishedAt = time.Now().Format("2006-01-02 15:04:05")
+		if c.Status == libcontainer.StatusRunning {
+			c.Status = libcontainer.StatusStopped
+			c.FinishedAt = time.Now().Format(constants.TimeFormat)
 			container.SaveContainerInfo(c)
-			log.Printf("清理孤儿容器 %s: runtime 已不存在，状态更新为 exited\n",
-				utils.FormatShortID(c.ID))
+			log.Printf("清理孤儿容器 %s: runtime 已不存在，状态更新为 stopped\n",
+				c.ID)
 		}
 	}
 }
@@ -815,38 +795,56 @@ func readPidFile() string {
 	return string(data)
 }
 
-type cgroupRestorer struct {
-	cgroupName string
+// CleanupOptions 控制容器清理的范围（对齐 Docker: 不同操作需要不同粒度的清理）
+//
+// 清理顺序（对齐 Docker dockerd 的清理流程）:
+//  1. DeleteTask / ShutdownShim — 停止 shim 和 runtime
+//  2. 网络清理 — 删除 veth、释放 IP、清理 iptables 规则
+//  3. Cgroup 清理 — 删除 cgroup 目录
+//  4. Overlay 清理 — 卸载并删除 OverlayFS 目录
+//  5. 删除 ContainerInfo JSON — 移除持久化元数据
+type CleanupOptions struct {
+	DeleteTask     bool // 停止 shim 进程并删除 runtime/shim 目录
+	ShutdownShim   bool // 仅关闭 shim（比 DeleteTask 更轻量，用于自然退出的容器）
+	CleanupOverlay bool // 清理 OverlayFS（卸载 + 删除目录）
+	RemoveInfo     bool // 删除 ContainerInfo JSON 文件
 }
 
-func (c *cgroupRestorer) Apply(pid int) error { return nil }
-func (c *cgroupRestorer) Destroy() error {
-	container.CleanupCgroup(c.cgroupName)
-	return nil
-}
-func (c *cgroupRestorer) Freeze() error { return nil }
-func (c *cgroupRestorer) Thaw() error   { return nil }
+// cleanupContainerResources 统一的容器资源清理方法
+// 嵌入 *ContainerInfo 后，state.Info 直接包含所有元数据，
+// 不再需要"先试运行时状态，不行再试 ContainerInfo"的双路径降级逻辑
+func (d *Daemon) cleanupContainerResources(containerID string, state *ContainerState, opts CleanupOptions) {
+	// 获取 Info 引用：state 非空时用 Info，否则从磁盘加载
+	var info *container.ContainerInfo
+	if state != nil && state.Info != nil {
+		info = state.Info
+	} else {
+		info, _ = container.LoadContainerInfoByID(containerID)
+	}
 
-type networkRestorer struct {
-	networkName string
-	portMap     string
-	containerIP string
-	vethHost    string
-}
+	if opts.DeleteTask {
+		d.service.DeleteTask(containerID)
+	} else if opts.ShutdownShim {
+		d.service.ShutdownShim(containerID)
+	}
 
-func (n *networkRestorer) Connect(pid int) error { return nil }
-func (n *networkRestorer) Disconnect() error {
-	if n.vethHost != "" {
-		cmd := exec.Command("ip", "link", "delete", n.vethHost)
-		_ = cmd.Run()
+	// 网络清理：优先使用运行时接口（NetMgr 是活的接口实例），否则从 Info 重建
+	if state != nil && state.NetMgr != nil {
+		_ = state.NetMgr.Disconnect()
+	} else if info != nil {
+		container.CleanupContainerNetwork(info)
 	}
-	if n.portMap != "" && n.containerIP != "" {
-		utils.CleanupPortMapping(n.portMap, n.containerIP)
+
+	// Cgroup 清理：从 Info 获取 cgroupName
+	if info != nil && info.CgroupName != "" {
+		container.CleanupCgroup(info.CgroupName)
 	}
-	if n.networkName != "" && n.containerIP != "" {
-		network.ReleaseIP(n.networkName, n.containerIP)
+
+	if opts.CleanupOverlay && info != nil {
+		container.CleanupOverlay(info)
 	}
-	return nil
+
+	if opts.RemoveInfo {
+		container.RemoveContainerInfo(containerID)
+	}
 }
-func (n *networkRestorer) GetVethHost() string    { return n.vethHost }
-func (n *networkRestorer) GetContainerIP() string { return n.containerIP }

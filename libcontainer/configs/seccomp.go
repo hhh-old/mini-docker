@@ -61,17 +61,3 @@ const (
 	OpLessEqual    Operator = 5
 	OpMaskedEqual  Operator = 6
 )
-
-// DefaultProfile 创建 Docker 默认的 Seccomp Profile
-func DefaultProfile() *Seccomp {
-	return &Seccomp{
-		DefaultAction: ActionAllow,
-		Architectures: []string{"SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"},
-		Syscalls: []*SyscallRule{
-			{
-				Names:  []string{"reboot"},
-				Action: ActionErrno,
-			},
-		},
-	}
-}

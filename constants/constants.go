@@ -51,18 +51,15 @@ const (
 const (
 	// DefaultBufferSize 是默认缓冲区大小 (64KB)
 	DefaultBufferSize = 65536
-
-	// LargeBufferSize 是大缓冲区大小 (1MB)
-	LargeBufferSize = 1024 * 1024
-
-	// SmallBufferSize 是小缓冲区大小 (32KB)
-	SmallBufferSize = 32 * 1024
 )
 
 // 超时时间常量
 const (
 	// DefaultConnectTimeout 是默认连接超时时间
 	DefaultConnectTimeout = 30 * time.Second
+
+	// LongOperationTimeout 是长操作超时时间（pull/build 等）
+	LongOperationTimeout = 10 * time.Minute
 
 	// ShimConnectTimeout 是 shim 连接超时时间
 	ShimConnectTimeout = 5 * time.Second
@@ -79,32 +76,31 @@ const (
 
 // 容器相关常量
 const (
-	ShortIDLength = 12
-
 	DefaultTmpfsSize = "size=64m"
-
-	SIGTERMExitCode = 143
 
 	CgroupPrefix        = "mini-docker-"
 	CgroupRootPath      = "/sys/fs/cgroup"
 	GracefulStopTimeout = 2 * time.Second
 )
 
-// 容器状态常量
+// 重启策略常量
 const (
-	StatusRunning    = "running"
-	StatusStopped    = "stopped"
-	StatusExited     = "exited"
-	StatusCreated    = "created"
-	StatusPaused     = "paused"
-	StatusRestarting = "restarting"
+	DefaultMaxRetries  = 5
+	RestartBackoffBase = 100 * time.Millisecond
+	RestartBackoffMax  = 60 * time.Second
+)
+
+// 日志相关常量
+const (
+	// MaxContainerLogSize 容器日志文件最大大小 (10MB)
+	MaxContainerLogSize = 10 * 1024 * 1024
 )
 
 // 网络相关常量
 const (
 	// DefaultSubnet 是默认子网
-	DefaultSubnet = "172.19.0.0/16"
+	DefaultSubnet = "172.33.0.0/16"
 
 	// DefaultGateway 是默认网关
-	DefaultGateway = "172.19.0.1"
+	DefaultGateway = "172.33.0.1"
 )

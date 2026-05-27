@@ -68,7 +68,7 @@ package container
      ↓
   2. main.go 解析参数，构造 RunConfig
      ↓
-  3. container.Run() 被调用:
+  3. Daemon handler.runWithID() 被调用:
      a. 准备 RootFS 路径
      b. fork 子进程，设置 Cloneflags（创建新 Namespace）
         → 对应 namespace_linux.go: setCloneFlags()
@@ -96,17 +96,17 @@ package container
 
   Docker 命令            →  mini-docker 实现           →  底层技术
   ─────────────────────────────────────────────────────────────────
-  docker run             →  container.Run()            →  clone + namespace
-  docker exec            →  container.Exec()           →  setns
-  docker stop            →  container.Stop()           →  kill(SIGTERM/SIGKILL)
-  docker rm              →  container.Remove()         →  清理 cgroup + 文件
-  docker ps              →  container.ListContainers() →  读取 JSON 元数据
-  docker pull            →  image.Pull()               →  创建 rootfs 目录
+  docker run             →  handler.runWithID()         →  shim → runtime create/start
+  docker exec            →  handler.handleExec()        →  shim(nsenter) → setns
+  docker stop            →  handler.handleStop()        →  shim(KillTask) → unix.Kill
+  docker rm              →  handler.handleRm()          →  清理 网络/overlay/cgroup/shim
+  docker ps              →  container.ListContainers()   →  读取 JSON 元数据
+  docker pull            →  image.Pull()                →  创建 rootfs 目录
   docker images          →  image.ListImages()          →  读取 JSON 元数据
-  docker network create  →  network.Create()           →  ip link add bridge
-  -m 100m                →  cgroup.setMemoryLimit()    →  memory.limit_in_bytes
-  --cpu-shares 512       →  cgroup.setCpuShares()      →  cpu.shares
-  docker pause           →  cgroup.Freeze()            →  freezer.state=FROZEN
+  docker network create  →  network.Create()            →  ip link add bridge
+  -m 100m                →  cgroup.setMemoryLimit()      →  memory.limit_in_bytes
+  --cpu-shares 512       →  cgroup.setCpuShares()        →  cpu.shares
+  docker pause           →  handler.handlePause()        →  shim → libcontainer.Pause → cgroup.Freeze
 
 =======================================================================
 */

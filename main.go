@@ -1,21 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"mini-docker/builder"
+	"mini-docker/constants"
 	"mini-docker/container"
 	"mini-docker/daemon"
+	"mini-docker/image"
+	"mini-docker/network"
 	"mini-docker/runtime"
 	"mini-docker/shim"
-	"mini-docker/utils"
 	"mini-docker/volume"
 
 	"golang.org/x/term"
@@ -142,6 +145,28 @@ func sendRequest(req daemon.Request) (*daemon.Response, error) {
 	return client.Send(req)
 }
 
+// execSimpleCmd 发送请求并处理通用的错误/失败响应模式
+// action: 操作名称（如"启动容器"、"停止容器"），用于格式化失败消息
+// onSuccess: 请求成功后的回调，传入响应对象；可为 nil 表示只打印成功消息
+// successMsg: 当 onSuccess 为 nil 时使用的成功消息模板（可用 %s 占位符）
+// extraArgs: successMsg 的额外参数
+func execSimpleCmd(req daemon.Request, action string, onSuccess func(*daemon.Response), successMsg string, extraArgs ...interface{}) {
+	resp, err := sendRequest(req)
+	if err != nil {
+		fmt.Printf("错误: %v\n", err)
+		os.Exit(1)
+	}
+	if !resp.Success {
+		fmt.Printf("%s失败: %s\n", action, resp.Message)
+		os.Exit(1)
+	}
+	if onSuccess != nil {
+		onSuccess(resp)
+	} else if successMsg != "" {
+		fmt.Printf(successMsg+"\n", extraArgs...)
+	}
+}
+
 func runCommand() {
 	args := os.Args[2:]
 	if len(args) < 2 {
@@ -155,6 +180,7 @@ func runCommand() {
 	}
 
 	i := 0
+parseLoop:
 	for i < len(args) {
 		switch args[i] {
 		case "-it":
@@ -200,10 +226,16 @@ func runCommand() {
 			i += 2
 		case "--restart":
 			if i+1 >= len(args) {
-				fmt.Println("错误: --restart 需要指定策略 (no|always|on-failure)")
+				fmt.Println("错误: --restart 需要指定策略 (no|always|on-failure[:max])")
 				os.Exit(1)
 			}
-			reqArgs["restart_policy"] = args[i+1]
+			policy := args[i+1]
+			if idx := strings.LastIndex(policy, ":"); idx != -1 {
+				reqArgs["restart_policy"] = policy[:idx]
+				reqArgs["max_restart_retries"] = policy[idx+1:]
+			} else {
+				reqArgs["restart_policy"] = policy
+			}
 			i += 2
 		case "-v":
 			if i+1 >= len(args) {
@@ -218,11 +250,10 @@ func runCommand() {
 			}
 			i += 2
 		default:
-			goto parseDone
+			break parseLoop
 		}
 	}
 
-parseDone:
 	if i >= len(args) {
 		fmt.Println("错误: 需要指定镜像名称")
 		os.Exit(1)
@@ -287,9 +318,9 @@ func runInteractive(reqArgs map[string]string) {
 
 	//宿主机终端切换为原始模式（Raw Mode）,为什么需要 Raw 模式（原始模式）？
 	//默认模式（Cooked/Canonical Mode）：平常我们在 Linux 终端打字时，终端驱动是有“缓存”的（必须要按回车键，程序才能收到输入）。同时，像 Ctrl+C、Ctrl+Z 这样的组合键会被宿主机的终端驱动拦截，转换为 SIGINT 或 SIGTSTP 信号，直接杀死或挂起你的 mini-docker CLI 本身，而这些信号根本无法传给容器内部。
-	//原始模式（Raw Mode）：调用 term.MakeRaw 后，宿主机的终端驱动将不再拦截任何控制字符，也不再进行行缓存 [1]。
+	//原始模式（Raw Mode）：调用 term.MakeRaw 后，宿主机的终端驱动将不再拦截任何控制字符，也不再进行行缓存。
 	//你按下的每一个键（包括 Tab、方向键、Ctrl+C、Ctrl+D），都会作为最原始的字节流（Byte Stream），立刻被宿主机终端捕获。
-	//终端的“本地回显（Echo）”也会被关闭，也就是说，你在屏幕上看到的字符不是宿主机打印的，而是这些字符传到容器内的 Shell、再由 Shell 传回给宿主机屏幕显示的（这就和真实的 SSH 远程连接一致）。
+	//Raw 模式下，你按的每一个键（包括 Ctrl+C、方向键、Tab）都作为 原始字节流 立刻被 os.Stdin 读到，不会被终端驱动拦截或缓存。
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err == nil {
 		//defer term.Restore 的保障作用：
@@ -310,7 +341,9 @@ func runInteractive(reqArgs map[string]string) {
 	}
 
 	if containerID != "" {
-		go handleSIGWINCH(containerID)
+		ctx, cancel := context.WithCancel(context.Background())
+		go handleSIGWINCH(ctx, containerID)
+		defer cancel()
 	}
 
 	//构建双向 I/O 拷贝管道
@@ -349,14 +382,6 @@ func runInteractive(reqArgs map[string]string) {
 	case <-stdinDone:
 	case <-time.After(1 * time.Second):
 	}
-}
-
-// parseVolumeList 解析 volume 参数列表（"|" 分隔）
-func parseVolumeList(volsStr string) []string {
-	if volsStr == "" {
-		return nil
-	}
-	return strings.Split(volsStr, "|")
 }
 
 func execCommand() {
@@ -404,19 +429,21 @@ func execCommand() {
 			defer term.Restore(int(os.Stdin.Fd()), oldState)
 		}
 
-		containerID := ""
+		execContainerID := ""
 		if resp.Data != nil {
 			data, _ := json.Marshal(resp.Data)
 			var info struct {
 				ID string `json:"id"`
 			}
 			if json.Unmarshal(data, &info) == nil && info.ID != "" {
-				containerID = info.ID
+				execContainerID = info.ID
 			}
 		}
 
-		if containerID != "" {
-			go handleSIGWINCH(containerID)
+		if execContainerID != "" {
+			ctx, cancel := context.WithCancel(context.Background())
+			go handleSIGWINCH(ctx, execContainerID)
+			defer cancel()
 		}
 
 		stdinDone := make(chan struct{})
@@ -462,11 +489,17 @@ func isTerminal() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-func handleSIGWINCH(containerID string) {
+func handleSIGWINCH(ctx context.Context, containerID string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
-	for range sigCh {
-		sendResize(containerID)
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigCh:
+			sendResize(containerID)
+		}
 	}
 }
 
@@ -486,34 +519,24 @@ func sendResize(containerID string) {
 }
 
 func psCommand() {
-	resp, err := sendRequest(daemon.Request{Type: "ps", Args: map[string]string{}})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("列出容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-
-	// 解析容器列表
-	data, _ := json.Marshal(resp.Data)
-	var containers []*container.ContainerInfo
-	if err := json.Unmarshal(data, &containers); err != nil {
-		fmt.Printf("解析容器列表失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(containers) == 0 {
-		fmt.Println("没有容器")
-		return
-	}
-
-	fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n", "容器ID", "名称", "镜像", "状态", "创建时间")
-	for _, c := range containers {
-		fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n",
-			utils.FormatShortID(c.ID), c.Name, c.Image, c.Status, c.CreatedAt)
-	}
+	execSimpleCmd(daemon.Request{Type: "ps", Args: map[string]string{}},
+		"列出容器", func(resp *daemon.Response) {
+			data, _ := json.Marshal(resp.Data)
+			var containers []*container.ContainerInfo
+			if err := json.Unmarshal(data, &containers); err != nil {
+				fmt.Printf("解析容器列表失败: %v\n", err)
+				os.Exit(1)
+			}
+			if len(containers) == 0 {
+				fmt.Println("没有容器")
+				return
+			}
+			fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n", "容器ID", "名称", "镜像", "状态", "创建时间")
+			for _, c := range containers {
+				fmt.Printf("%-20s %-15s %-15s %-12s %-20s\n",
+					c.ID, c.Name, c.Image, c.Status, c.CreatedAt)
+			}
+		}, "")
 }
 
 func startCommand() {
@@ -522,20 +545,8 @@ func startCommand() {
 		fmt.Println("用法: mini-docker start <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "start",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("启动容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("容器 %s 已启动\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "start", Args: map[string]string{"container_id": args[0]}},
+		"启动容器", nil, "容器 %s 已启动", args[0])
 }
 
 func stopCommand() {
@@ -544,20 +555,8 @@ func stopCommand() {
 		fmt.Println("用法: mini-docker stop <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "stop",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("停止容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("容器 %s 已停止\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "stop", Args: map[string]string{"container_id": args[0]}},
+		"停止容器", nil, "容器 %s 已停止", args[0])
 }
 
 func pauseCommand() {
@@ -566,20 +565,8 @@ func pauseCommand() {
 		fmt.Println("用法: mini-docker pause <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "pause",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("暂停容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("容器 %s 已暂停\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "pause", Args: map[string]string{"container_id": args[0]}},
+		"暂停容器", nil, "容器 %s 已暂停", args[0])
 }
 
 func unpauseCommand() {
@@ -588,20 +575,8 @@ func unpauseCommand() {
 		fmt.Println("用法: mini-docker unpause <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "unpause",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("恢复容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("容器 %s 已恢复\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "unpause", Args: map[string]string{"container_id": args[0]}},
+		"恢复容器", nil, "容器 %s 已恢复", args[0])
 }
 
 func rmCommand() {
@@ -610,20 +585,8 @@ func rmCommand() {
 		fmt.Println("用法: mini-docker rm <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "rm",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("删除容器失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("容器 %s 已删除\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "rm", Args: map[string]string{"container_id": args[0]}},
+		"删除容器", nil, "容器 %s 已删除", args[0])
 }
 
 func logsCommand() {
@@ -632,82 +595,56 @@ func logsCommand() {
 		fmt.Println("用法: mini-docker logs <容器ID>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "logs",
-		Args: map[string]string{"container_id": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("获取日志失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-
-	// 打印日志
-	if logData, ok := resp.Data.([]string); ok {
-		for _, line := range logData {
-			fmt.Print(line)
-		}
-	} else if resp.Data != nil {
-		fmt.Printf("%v\n", resp.Data)
-	}
+	execSimpleCmd(daemon.Request{Type: "logs", Args: map[string]string{"container_id": args[0]}},
+		"获取日志", func(resp *daemon.Response) {
+			if resp.Data != nil {
+				data, _ := json.Marshal(resp.Data)
+				var logLines []string
+				if err := json.Unmarshal(data, &logLines); err == nil {
+					for _, line := range logLines {
+						fmt.Print(line)
+					}
+				} else {
+					fmt.Printf("%v\n", resp.Data)
+				}
+			}
+		}, "")
 }
 
 func eventsCommand() {
-	resp, err := sendRequest(daemon.Request{Type: "events", Args: map[string]string{}})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("获取事件失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-
-	// 打印事件
-	if events, ok := resp.Data.([]interface{}); ok {
-		for _, e := range events {
-			data, _ := json.Marshal(e)
-			fmt.Println(string(data))
-		}
-	}
+	execSimpleCmd(daemon.Request{Type: "events", Args: map[string]string{}},
+		"获取事件", func(resp *daemon.Response) {
+			if resp.Data != nil {
+				data, _ := json.Marshal(resp.Data)
+				var events []map[string]interface{}
+				if err := json.Unmarshal(data, &events); err == nil {
+					for _, e := range events {
+						edata, _ := json.Marshal(e)
+						fmt.Println(string(edata))
+					}
+				}
+			}
+		}, "")
 }
 
 func imagesCommand() {
-	resp, err := sendRequest(daemon.Request{Type: "images", Args: map[string]string{}})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("列出镜像失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-
-	data, _ := json.Marshal(resp.Data)
-	type ImageInfo struct {
-		Name      string `json:"name"`
-		Size      string `json:"size"`
-		CreatedAt string `json:"created_at"`
-	}
-	var images []ImageInfo
-	if err := json.Unmarshal(data, &images); err != nil {
-		fmt.Printf("解析镜像列表失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(images) == 0 {
-		fmt.Println("没有本地镜像，使用 mini-docker pull <镜像名> 拉取镜像")
-		return
-	}
-
-	fmt.Printf("%-30s %-15s %-20s\n", "镜像名", "大小", "创建时间")
-	for _, img := range images {
-		fmt.Printf("%-30s %-15s %-20s\n", img.Name, img.Size, img.CreatedAt)
-	}
+	execSimpleCmd(daemon.Request{Type: "images", Args: map[string]string{}},
+		"列出镜像", func(resp *daemon.Response) {
+			data, _ := json.Marshal(resp.Data)
+			var images []image.ImageInfo
+			if err := json.Unmarshal(data, &images); err != nil {
+				fmt.Printf("解析镜像列表失败: %v\n", err)
+				os.Exit(1)
+			}
+			if len(images) == 0 {
+				fmt.Println("没有本地镜像，使用 mini-docker pull <镜像名> 拉取镜像")
+				return
+			}
+			fmt.Printf("%-30s %-15s %-20s\n", "镜像名", "大小", "创建时间")
+			for _, img := range images {
+				fmt.Printf("%-30s %-15s %-20s\n", img.Name, img.Size, img.CreatedAt)
+			}
+		}, "")
 }
 
 func pullCommand() {
@@ -717,7 +654,8 @@ func pullCommand() {
 		os.Exit(1)
 	}
 
-	resp, err := sendRequest(daemon.Request{
+	client := daemon.NewClient().WithTimeout(constants.LongOperationTimeout)
+	resp, err := client.Send(daemon.Request{
 		Type: "pull",
 		Args: map[string]string{"image": args[0]},
 	})
@@ -738,20 +676,8 @@ func rmiCommand() {
 		fmt.Println("用法: mini-docker rmi <镜像名>")
 		os.Exit(1)
 	}
-
-	resp, err := sendRequest(daemon.Request{
-		Type: "rmi",
-		Args: map[string]string{"image": args[0]},
-	})
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-	if !resp.Success {
-		fmt.Printf("删除镜像失败: %s\n", resp.Message)
-		os.Exit(1)
-	}
-	fmt.Printf("镜像 %s 已删除\n", args[0])
+	execSimpleCmd(daemon.Request{Type: "rmi", Args: map[string]string{"image": args[0]}},
+		"删除镜像", nil, "镜像 %s 已删除", args[0])
 }
 
 func networkCommand() {
@@ -767,66 +693,33 @@ func networkCommand() {
 			fmt.Println("用法: mini-docker network create <名称>")
 			os.Exit(1)
 		}
-		resp, err := sendRequest(daemon.Request{
-			Type: "network_create",
-			Args: map[string]string{"name": args[1]},
-		})
-		if err != nil {
-			fmt.Printf("错误: %v\n", err)
-			os.Exit(1)
-		}
-		if !resp.Success {
-			fmt.Printf("创建网络失败: %s\n", resp.Message)
-			os.Exit(1)
-		}
-		fmt.Printf("网络 %s 创建成功\n", args[1])
+		execSimpleCmd(daemon.Request{Type: "network_create", Args: map[string]string{"name": args[1]}},
+			"创建网络", nil, "网络 %s 创建成功", args[1])
 	case "list":
-		resp, err := sendRequest(daemon.Request{Type: "network_list", Args: map[string]string{}})
-		if err != nil {
-			fmt.Printf("错误: %v\n", err)
-			os.Exit(1)
-		}
-		if !resp.Success {
-			fmt.Printf("列出网络失败: %s\n", resp.Message)
-			os.Exit(1)
-		}
-		data, _ := json.Marshal(resp.Data)
-		type NetInfo struct {
-			Name      string   `json:"name"`
-			Subnet    string   `json:"subnet"`
-			Allocated []string `json:"allocated"`
-		}
-		var nets []NetInfo
-		if err := json.Unmarshal(data, &nets); err != nil {
-			fmt.Printf("解析网络列表失败: %v\n", err)
-			os.Exit(1)
-		}
-		if len(nets) == 0 {
-			fmt.Println("没有自定义网络")
-			return
-		}
-		fmt.Printf("%-20s %-20s %-20s\n", "网络名称", "子网", "已分配IP数")
-		for _, n := range nets {
-			fmt.Printf("%-20s %-20s %-20d\n", n.Name, n.Subnet, len(n.Allocated))
-		}
+		execSimpleCmd(daemon.Request{Type: "network_list", Args: map[string]string{}},
+			"列出网络", func(resp *daemon.Response) {
+				data, _ := json.Marshal(resp.Data)
+				var nets []network.NetworkInfo
+				if err := json.Unmarshal(data, &nets); err != nil {
+					fmt.Printf("解析网络列表失败: %v\n", err)
+					os.Exit(1)
+				}
+				if len(nets) == 0 {
+					fmt.Println("没有自定义网络")
+					return
+				}
+				fmt.Printf("%-20s %-20s %-20s\n", "网络名称", "子网", "已分配IP数")
+				for _, n := range nets {
+					fmt.Printf("%-20s %-20s %-20d\n", n.Name, n.Subnet, len(n.Allocated))
+				}
+			}, "")
 	case "delete":
 		if len(args) < 2 {
 			fmt.Println("用法: mini-docker network delete <名称>")
 			os.Exit(1)
 		}
-		resp, err := sendRequest(daemon.Request{
-			Type: "network_delete",
-			Args: map[string]string{"name": args[1]},
-		})
-		if err != nil {
-			fmt.Printf("错误: %v\n", err)
-			os.Exit(1)
-		}
-		if !resp.Success {
-			fmt.Printf("删除网络失败: %s\n", resp.Message)
-			os.Exit(1)
-		}
-		fmt.Printf("网络 %s 已删除\n", args[1])
+		execSimpleCmd(daemon.Request{Type: "network_delete", Args: map[string]string{"name": args[1]}},
+			"删除网络", nil, "网络 %s 已删除", args[1])
 	default:
 		fmt.Printf("未知网络子命令: %s\n", args[0])
 		os.Exit(1)
@@ -846,50 +739,50 @@ func volumeCommand() {
 			fmt.Println("用法: mini-docker volume create <名称>")
 			os.Exit(1)
 		}
-		info, err := volume.Create(args[1])
-		if err != nil {
-			fmt.Printf("创建卷失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("卷 %s 创建成功 (路径: %s)\n", info.Name, info.MountPath)
+		execSimpleCmd(daemon.Request{Type: "volume_create", Args: map[string]string{"name": args[1]}},
+			"创建卷", nil, "卷 %s 创建成功", args[1])
 	case "list":
-		volumes, err := volume.List()
-		if err != nil {
-			fmt.Printf("列出卷失败: %v\n", err)
-			os.Exit(1)
-		}
-		if len(volumes) == 0 {
-			fmt.Println("没有数据卷")
-			return
-		}
-		fmt.Printf("%-20s %-20s %-40s %-20s\n", "卷名", "驱动", "挂载路径", "创建时间")
-		for _, v := range volumes {
-			fmt.Printf("%-20s %-20s %-40s %-20s\n", v.Name, v.Driver, v.MountPath, v.CreatedAt)
-		}
+		execSimpleCmd(daemon.Request{Type: "volume_list", Args: map[string]string{}},
+			"列出卷", func(resp *daemon.Response) {
+				volumes, ok := resp.Data.([]interface{})
+				if !ok || len(volumes) == 0 {
+					fmt.Println("没有数据卷")
+					return
+				}
+				var volList []volume.VolumeInfo
+				vdata, _ := json.Marshal(resp.Data)
+				if json.Unmarshal(vdata, &volList) != nil || len(volList) == 0 {
+					fmt.Println("没有数据卷")
+					return
+				}
+				fmt.Printf("%-20s %-20s %-40s %-20s\n", "卷名", "驱动", "挂载路径", "创建时间")
+				for _, v := range volList {
+					fmt.Printf("%-20s %-20s %-40s %-20s\n", v.Name, v.Driver, v.MountPath, v.CreatedAt)
+				}
+			}, "")
 	case "rm":
 		if len(args) < 2 {
 			fmt.Println("用法: mini-docker volume rm <名称>")
 			os.Exit(1)
 		}
-		if err := volume.Remove(args[1]); err != nil {
-			fmt.Printf("删除卷失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("卷 %s 已删除\n", args[1])
+		execSimpleCmd(daemon.Request{Type: "volume_rm", Args: map[string]string{"name": args[1]}},
+			"删除卷", nil, "卷 %s 已删除", args[1])
 	case "inspect":
 		if len(args) < 2 {
 			fmt.Println("用法: mini-docker volume inspect <名称>")
 			os.Exit(1)
 		}
-		info, err := volume.Inspect(args[1])
-		if err != nil {
-			fmt.Printf("查看卷失败: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("卷名:     %s\n", info.Name)
-		fmt.Printf("驱动:     %s\n", info.Driver)
-		fmt.Printf("挂载路径: %s\n", info.MountPath)
-		fmt.Printf("创建时间: %s\n", info.CreatedAt)
+		execSimpleCmd(daemon.Request{Type: "volume_inspect", Args: map[string]string{"name": args[1]}},
+			"查看卷", func(resp *daemon.Response) {
+				var vol volume.VolumeInfo
+				vdata, _ := json.Marshal(resp.Data)
+				if json.Unmarshal(vdata, &vol) == nil {
+					fmt.Printf("卷名:     %s\n", vol.Name)
+					fmt.Printf("驱动:     %s\n", vol.Driver)
+					fmt.Printf("挂载路径: %s\n", vol.MountPath)
+					fmt.Printf("创建时间: %s\n", vol.CreatedAt)
+				}
+			}, "")
 	default:
 		fmt.Printf("未知卷子命令: %s\n", args[0])
 		os.Exit(1)
@@ -927,18 +820,28 @@ func buildCommand() {
 		os.Exit(1)
 	}
 
-	config := builder.BuildConfig{
-		ContextDir: contextDir,
-		Tag:        tag,
-	}
-
-	result, err := builder.Build(config)
+	resp, err := daemon.NewClient().WithTimeout(constants.LongOperationTimeout).Send(daemon.Request{
+		Type: "build",
+		Args: map[string]string{
+			"dockerfile": filepath.Join(contextDir, "Dockerfile"),
+			"context":    contextDir,
+			"tag":        tag,
+		},
+	})
 	if err != nil {
 		fmt.Printf("构建失败: %v\n", err)
 		os.Exit(1)
 	}
+	if !resp.Success {
+		fmt.Printf("构建失败: %s\n", resp.Message)
+		os.Exit(1)
+	}
 
-	_ = result
+	if result, ok := resp.Data.(map[string]interface{}); ok {
+		if imageID, ok := result["image_id"].(string); ok && imageID != "" {
+			fmt.Printf("构建成功: %s\n", imageID)
+		}
+	}
 }
 
 func runtimeCommand() {

@@ -47,34 +47,32 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"mini-docker/constants"
 	"mini-docker/utils"
 )
 
-// BuildConfig 构建配置
 type BuildConfig struct {
-	DockerfilePath string // Dockerfile 路径
-	ContextDir     string // 构建上下文目录
-	Tag            string // 镜像标签 (name:tag)
+	DockerfilePath string
+	ContextDir     string
+	Tag            string
 }
 
-// BuildResult 构建结果
 type BuildResult struct {
-	ImageName string   // 生成的镜像名
-	Tag       string   // 标签
-	Layers    []string // 生成的层 ID 列表
-	ImageID   string   // 最终镜像 ID
+	ImageName string
+	Tag       string
+	Layers    []string
+	ImageID   string
 }
 
-// DockerfileInstruction Dockerfile 指令
 type DockerfileInstruction struct {
-	Instruction string   // 指令名（FROM, RUN, COPY 等）
-	Arguments   []string // 参数
-	LineNum     int      // 行号（用于错误报告）
-	Flags       []string // 标志参数（如 --chown）
+	Instruction string
+	Arguments   []string
+	LineNum     int
 }
 
 // ParseDockerfile 解析 Dockerfile
@@ -251,7 +249,7 @@ func Build(config BuildConfig) (*BuildResult, error) {
 	result.ImageName = name
 	result.Tag = tag
 	result.Layers = buildCtx.layers
-	result.ImageID = fmt.Sprintf("%x", len(buildCtx.layers))
+	result.ImageID = fmt.Sprintf("%x", time.Now().UnixNano())
 
 	// 保存镜像元数据
 	if err := buildCtx.saveFinalImage(name, tag); err != nil {
@@ -264,19 +262,21 @@ func Build(config BuildConfig) (*BuildResult, error) {
 
 // buildContext 构建上下文（跟踪构建状态）
 type buildContext struct {
-	contextDir   string            // 构建上下文目录
-	workDir      string            // 当前工作目录
-	envVars      map[string]string // 环境变量
-	cmd          []string          // 默认命令
-	exposedPorts []string          // 暴露端口
-	imageName    string            // 基础镜像名
-	layers       []string          // 已生成的层 ID
-	rootfsPath   string            // 当前 rootfs 路径
+	contextDir     string
+	workDir        string
+	envVars        map[string]string
+	cmd            []string
+	exposedPorts   []string
+	imageName      string
+	layers         []string
+	rootfsPath     string
+	baseRootfsPath string
 }
 
 func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 	ctx.imageName = inst.Arguments[0]
 	ctx.rootfsPath = filepath.Join(constants.ImageStoreDir, ctx.imageName, "rootfs")
+	ctx.baseRootfsPath = ctx.rootfsPath
 
 	// 检查基础镜像是否存在
 	if _, err := os.Stat(ctx.rootfsPath); os.IsNotExist(err) {
@@ -290,17 +290,68 @@ func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 	cmd := strings.Join(inst.Arguments, " ")
 
-	// 在临时 overlay 中执行命令
-	// 简化实现：直接在宿主机执行（需要 chroot 或 namespace 隔离）
-	// 教学版本：直接执行并记录
 	fmt.Printf("    → 执行: %s\n", cmd)
 
-	// 实际 Docker 会创建临时容器执行命令
-	// 这里简化为提示用户
-	fmt.Printf("    提示: RUN 指令需要创建临时容器执行，当前为教学简化版\n")
-	fmt.Printf("    实际执行命令: %s\n", cmd)
+	buildLayerDir := filepath.Join(constants.ImageStoreDir, ".build-layers")
+	os.MkdirAll(buildLayerDir, 0755)
 
-	ctx.layers = append(ctx.layers, fmt.Sprintf("run-%d", len(ctx.layers)))
+	layerID := fmt.Sprintf("run-%d-%x", len(ctx.layers), time.Now().UnixNano())
+	layerUpper := filepath.Join(buildLayerDir, layerID, "upper")
+	layerWork := filepath.Join(buildLayerDir, layerID, "work")
+	layerMerged := filepath.Join(buildLayerDir, layerID, "merged")
+
+	if err := os.MkdirAll(layerUpper, 0755); err != nil {
+		return fmt.Errorf("创建层 upper 目录失败: %w", err)
+	}
+	if err := os.MkdirAll(layerWork, 0755); err != nil {
+		return fmt.Errorf("创建层 work 目录失败: %w", err)
+	}
+	if err := os.MkdirAll(layerMerged, 0755); err != nil {
+		return fmt.Errorf("创建层 merged 目录失败: %w", err)
+	}
+
+	lowerDir := ctx.rootfsPath
+	if len(ctx.layers) > 0 {
+		var lowerDirs []string
+		for _, lid := range ctx.layers {
+			lowerDirs = append(lowerDirs, filepath.Join(buildLayerDir, lid, "upper"))
+		}
+		lowerDirs = append(lowerDirs, ctx.baseRootfsPath)
+		lowerDir = strings.Join(lowerDirs, ":")
+	}
+	mountCmd := exec.Command("mount", "-t", "overlay", "overlay",
+		"-o", fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDir, layerUpper, layerWork),
+		layerMerged)
+	if err := mountCmd.Run(); err != nil {
+		os.RemoveAll(filepath.Join(buildLayerDir, layerID))
+		return fmt.Errorf("挂载 OverlayFS 失败: %w", err)
+	}
+
+	essentialDirs := []string{"proc", "sys", "dev"}
+	for _, dir := range essentialDirs {
+		dirPath := filepath.Join(layerMerged, dir)
+		if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+			os.MkdirAll(dirPath, 0755)
+		}
+	}
+
+	execCmd := exec.Command("unshare", "-m", "-u", "-i", "-p", "-f", "--",
+		"chroot", layerMerged, "/bin/sh", "-c", cmd)
+	execCmd.Stdout = os.Stdout
+	execCmd.Stderr = os.Stderr
+
+	runErr := execCmd.Run()
+
+	exec.Command("umount", layerMerged).Run()
+
+	if runErr != nil {
+		os.RemoveAll(filepath.Join(buildLayerDir, layerID))
+		return fmt.Errorf("执行命令失败: %w", runErr)
+	}
+
+	ctx.layers = append(ctx.layers, layerID)
+	ctx.rootfsPath = layerMerged
+	fmt.Printf("    → 层 %s 已生成\n", layerID)
 	return nil
 }
 

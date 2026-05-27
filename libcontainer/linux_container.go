@@ -5,6 +5,7 @@ package libcontainer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"mini-docker/libcontainer/cgroups"
 	"mini-docker/libcontainer/configs"
+	"mini-docker/spec"
 
 	"golang.org/x/sys/unix"
 )
@@ -41,11 +43,7 @@ func newLinuxContainer(id string, config *configs.Config) (*linuxContainer, erro
 	}
 
 	if config.Cgroups != nil {
-		shortID := id
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
-		}
-		cgm, err := cgroups.NewManager(config.Cgroups, "mini-docker-"+shortID)
+		cgm, err := cgroups.NewManager(config.Cgroups, "mini-docker-"+id)
 		if err != nil {
 			return nil, fmt.Errorf("创建 cgroup 管理器失败: %w", err)
 		}
@@ -95,35 +93,13 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 	}
 
 	if config.Cgroups != nil {
-		shortID := id
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
-		}
-		cgm, err := cgroups.NewManager(config.Cgroups, "mini-docker-"+shortID)
+		cgm, err := cgroups.NewManager(config.Cgroups, "mini-docker-"+id)
 		if err == nil {
 			lc.cgm = cgm
 		}
 	}
 
 	return lc, nil
-}
-
-func listLinuxContainers() ([]Container, error) {
-	ids, err := listContainerIDs()
-	if err != nil {
-		return nil, err
-	}
-
-	var containers []Container
-	for _, id := range ids {
-		c, err := loadLinuxContainer(id)
-		if err != nil {
-			continue
-		}
-		containers = append(containers, c)
-	}
-
-	return containers, nil
 }
 
 func (c *linuxContainer) ID() string {
@@ -182,6 +158,11 @@ func (c *linuxContainer) Start(process *Process) error {
 		//Cloneflags 包含了 CLONE_NEWPID、CLONE_NEWNS、CLONE_NEWNET 等，指示内核在clone派生子进程时将其放入全新的隔离空间。
 		Cloneflags: c.config.Namespaces.CloneFlags(), // 开启 Namespace 隔离！
 	}
+	//setsid() 做了三件事:
+	//1. 创建新的会话 (Session)  → init 进程成为新会话的首领
+	//2. 创建新的进程组          → init 进程成为新进程组的组长
+	//3. 断开与原控制终端的关联  → init 进程不再受宿主机终端影响
+	//Setctty = true 让内核将 cmd.Stdin （即 PTY Slave）设为 init 进程的 控制终端,也就是Setctty 将 PTY Slave (/dev/pts/X) 设为它的控制终端
 	if process.Terminal {
 		cmd.SysProcAttr.Setctty = true
 		cmd.SysProcAttr.Setsid = true
@@ -243,7 +224,16 @@ func (c *linuxContainer) Start(process *Process) error {
 	c.pid = cmd.Process.Pid
 	c.status = StatusCreated
 
+	// Apply cgroup（对标 Docker/runc：cgroup 在 create 阶段应用）
+	// 容器进程从第一行代码开始就受 cgroup 约束
+	if c.cgm != nil {
+		if err := c.cgm.Apply(c.pid); err != nil {
+			log.Printf("警告: 应用 cgroup 失败: %v\n", err)
+		}
+	}
+
 	state := &ContainerState{
+		OCIVersion: spec.CurrentOCIVersion,
 		ID:         c.id,
 		Pid:        c.pid,
 		BundlePath: c.config.BundlePath,
@@ -308,7 +298,16 @@ func (c *linuxContainer) Destroy() error {
 	if c.status == StatusRunning || c.status == StatusCreated {
 		c.Signal(int(syscall.SIGKILL))
 		if c.initCmd != nil {
-			c.initCmd.Process.Wait()
+			done := make(chan struct{})
+			go func() {
+				c.initCmd.Process.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				log.Printf("警告: 等待容器 %s 进程退出超时\n", c.id)
+			}
 		} else {
 			time.Sleep(100 * time.Millisecond)
 		}

@@ -87,7 +87,7 @@ func ApplyCapabilities(capAdd []string, capDrop []string) error {
 			keepSet[val] = true
 		}
 	}
-
+	// 2. 应用 capDrop
 	for _, name := range capDrop {
 		if strings.ToUpper(name) == "ALL" {
 			keepSet = make(map[int]bool)
@@ -98,18 +98,18 @@ func ApplyCapabilities(capAdd []string, capDrop []string) error {
 			fmt.Printf("  警告: %v，跳过\n", err)
 			continue
 		}
-		delete(keepSet, cap)
+		delete(keepSet, cap) // 从保留集中移除
 	}
-
+	// 3. 应用 capAdd
 	for _, name := range capAdd {
 		cap, err := configs.ResolveCapName(name)
 		if err != nil {
 			fmt.Printf("  警告: %v，跳过\n", err)
 			continue
 		}
-		keepSet[cap] = true
+		keepSet[cap] = true // 添加到保留集
 	}
-
+	// 4. 计算最终需要 drop 的能力
 	var toDrop []int
 	for _, capName := range configs.AllKnownCapabilities {
 		capName = strings.TrimPrefix(capName, "CAP_")
@@ -121,7 +121,7 @@ func ApplyCapabilities(capAdd []string, capDrop []string) error {
 			toDrop = append(toDrop, val)
 		}
 	}
-
+	// 5. 对每个需要 drop 的能力调用系统调用
 	for _, cap := range toDrop {
 		if err := utils.DropCapability(cap); err != nil {
 			fmt.Printf("  提示: drop CAP_%s 失败（可能不受支持）: %v\n",

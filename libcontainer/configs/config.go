@@ -102,26 +102,6 @@ func (n Namespaces) CloneFlags() uintptr {
 	return flags
 }
 
-// Contains 检查是否包含指定类型的 Namespace
-func (n Namespaces) Contains(nsType string) bool {
-	for _, ns := range n {
-		if ns.Type == nsType {
-			return true
-		}
-	}
-	return false
-}
-
-// Get 按类型获取 Namespace 配置
-func (n Namespaces) Get(nsType string) *Namespace {
-	for i, ns := range n {
-		if ns.Type == nsType {
-			return &n[i]
-		}
-	}
-	return nil
-}
-
 // Capabilities 容器 Capability 配置
 type Capabilities struct {
 	Bounding    []string `json:"bounding"`

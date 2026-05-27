@@ -4,6 +4,15 @@ package network
 
 import "fmt"
 
+// Manager 网络管理器接口（对齐 Docker: libnetwork 的 Endpoint 抽象）
+// 定义在 network 包中，避免 container 包与 network 包之间的循环依赖
+type Manager interface {
+	Connect(pid int) error
+	Disconnect() error
+	GetVethHost() string
+	GetContainerIP() string
+}
+
 type NetworkInfo struct {
 	Name      string   `json:"name"`
 	Subnet    string   `json:"subnet"`
@@ -18,6 +27,15 @@ type NetworkManager struct {
 	VethHost    string
 	VethCont    string
 	ContainerIP string
+}
+
+func NewManagerFromInfo(networkName, portMap, containerIP, vethHost string) *NetworkManager {
+	return &NetworkManager{
+		NetworkName: networkName,
+		PortMap:     portMap,
+		ContainerIP: containerIP,
+		VethHost:    vethHost,
+	}
 }
 
 func (n *NetworkManager) Create(name string) error {
@@ -46,9 +64,6 @@ func (n *NetworkManager) GetVethHost() string {
 
 func (n *NetworkManager) GetContainerIP() string {
 	return ""
-}
-
-func ReleaseIP(networkName string, ip string) {
 }
 
 func LoadNetworkInfo(name string) (*NetworkInfo, error) {

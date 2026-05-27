@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -13,21 +15,22 @@ import (
 	"mini-docker/constants"
 )
 
-// FormatShortID 截取容器 ID 的前 12 位作为短 ID
-func FormatShortID(id string) string {
-	if len(id) > constants.ShortIDLength {
-		return id[:constants.ShortIDLength]
+// GenerateContainerID 生成随机的容器 ID（12 字符 hex，48 bit 随机）
+func GenerateContainerID() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	return id
+	return hex.EncodeToString(b)
 }
 
 // CheckProcessAlive 检查进程是否存活
-func CheckProcessAlive(pid int) error {
+func CheckProcessAlive(pid int) bool {
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return err
+		return false
 	}
-	return process.Signal(syscall.Signal(0))
+	return process.Signal(syscall.Signal(0)) == nil
 }
 
 // CopyFile 复制文件
@@ -95,26 +98,33 @@ func NowFormatted() string {
 	return time.Now().Format(constants.TimeFormat)
 }
 
-func GracefulStopProcess(sendSignalFn func(sig syscall.Signal) error, isAliveFn func() bool) error {
+func GracefulStopProcess(sendSignalFn func(sig syscall.Signal) error, isAliveFn func() bool) (killed bool, err error) {
 	if err := sendSignalFn(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("发送 SIGTERM 失败: %w", err)
+		return false, fmt.Errorf("发送 SIGTERM 失败: %w", err)
 	}
 
 	deadline := time.Now().Add(constants.GracefulStopTimeout)
 	for time.Now().Before(deadline) {
 		if !isAliveFn() {
-			return nil
+			return false, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	if isAliveFn() {
 		if err := sendSignalFn(syscall.SIGKILL); err != nil {
-			return fmt.Errorf("发送 SIGKILL 失败: %w", err)
+			return true, fmt.Errorf("发送 SIGKILL 失败: %w", err)
 		}
+		for i := 0; i < 50; i++ {
+			if !isAliveFn() {
+				return true, nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return true, fmt.Errorf("SIGKILL 后进程仍未退出")
 	}
 
-	return nil
+	return false, nil
 }
 
 // CleanupPortMapping 清理端口映射的 iptables 规则

@@ -23,10 +23,6 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 	return nil, fmt.Errorf("libcontainer 仅支持 Linux")
 }
 
-func listLinuxContainers() ([]Container, error) {
-	return nil, fmt.Errorf("libcontainer 仅支持 Linux")
-}
-
 func (c *linuxContainer) ID() string                         { return c.id }
 func (c *linuxContainer) Status() (Status, error)            { return c.status, nil }
 func (c *linuxContainer) Config() configs.Config             { return *c.config }

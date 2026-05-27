@@ -19,21 +19,29 @@ import (
 
 const (
 	networkStorePath = constants.NetworkStoreDir
-	defaultSubnet    = constants.DefaultSubnet
-	defaultGateway   = constants.DefaultGateway
 )
 
-type NetworkInfo struct {
-	Name      string   `json:"name"`
-	Subnet    string   `json:"subnet"`
-	Gateway   string   `json:"gateway"`
-	Bridge    string   `json:"bridge"`
-	Allocated []string `json:"allocated"`
+// Manager 网络管理器接口（对齐 Docker: libnetwork 的 Endpoint 抽象）
+// 定义在 network 包中，避免 container 包与 network 包之间的循环依赖
+type Manager interface {
+	Connect(pid int) error
+	Disconnect() error
+	GetVethHost() string
+	GetContainerIP() string
 }
 
+type NetworkInfo struct {
+	Name      string   `json:"name"`      // 如 "mynet"
+	Subnet    string   `json:"subnet"`    // 如 "172.33.0.0/16"
+	Gateway   string   `json:"gateway"`   // 如 "172.33.0.1"
+	Bridge    string   `json:"bridge"`    // 如 "mini-mynet"
+	Allocated []string `json:"allocated"` // 已分配 IP 列表
+}
+
+// 容器的网络连接控制器，用来记录单个容器和网络之间的绑定状态
 type NetworkManager struct {
 	NetworkName string
-	PortMap     string
+	PortMap     string // 如 "8080:80"
 	VethHost    string
 	VethCont    string
 	ContainerIP string
@@ -47,8 +55,11 @@ func (n *NetworkManager) Create(name string) error {
 	}
 
 	bridgeName := "mini-" + name
-	subnet := defaultSubnet
-	gateway := defaultGateway
+
+	subnet, gateway, err := allocateSubnet()
+	if err != nil {
+		return fmt.Errorf("分配子网失败: %w", err)
+	}
 
 	cmd := exec.Command("ip", "link", "add", bridgeName, "type", "bridge")
 	if err := cmd.Run(); err != nil {
@@ -127,6 +138,18 @@ func (n *NetworkManager) Delete(name string) error {
 	return os.Remove(infoPath)
 }
 
+// NewManagerFromInfo 从持久化的容器元数据重建 NetworkManager（对齐 Docker: Daemon 恢复场景）
+// 用于容器恢复、rm、start 等只有 ContainerInfo 而没有运行时 NetworkManager 实例的场景
+// 重建的 NetworkManager 可正常调用 Disconnect()，但 Connect() 不应被调用
+func NewManagerFromInfo(networkName, portMap, containerIP, vethHost string) *NetworkManager {
+	return &NetworkManager{
+		NetworkName: networkName,
+		PortMap:     portMap,
+		ContainerIP: containerIP,
+		VethHost:    vethHost,
+	}
+}
+
 func (n *NetworkManager) Connect(pid int) error {
 	if n.NetworkName == "" {
 		return nil
@@ -143,8 +166,8 @@ func (n *NetworkManager) Connect(pid int) error {
 	}
 	n.ContainerIP = containerIP
 
-	vethHost := fmt.Sprintf("veth-%d-h", pid)
-	vethContainer := fmt.Sprintf("veth-%d-c", pid)
+	vethHost := fmt.Sprintf("vh-%x", pid)
+	vethContainer := fmt.Sprintf("vc-%x", pid)
 	n.VethHost = vethHost
 	n.VethCont = vethContainer
 
@@ -344,11 +367,6 @@ func releaseIP(networkName string, ip string) {
 	}
 }
 
-// ReleaseIP 释放 IP 地址（公开版本）
-func ReleaseIP(networkName string, ip string) {
-	releaseIP(networkName, ip)
-}
-
 func incIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -389,6 +407,43 @@ func saveNetworkInfo(info *NetworkInfo) error {
 	}
 
 	return os.WriteFile(filepath.Join(networkStorePath, info.Name+".json"), data, 0644)
+}
+
+func allocateSubnet() (subnet string, gateway string, err error) {
+	if err := os.MkdirAll(networkStorePath, 0755); err != nil {
+		return "", "", err
+	}
+
+	usedSeconds := make(map[byte]bool)
+	entries, err := os.ReadDir(networkStorePath)
+	if err == nil {
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			data, readErr := os.ReadFile(filepath.Join(networkStorePath, entry.Name()))
+			if readErr != nil {
+				continue
+			}
+			var netInfo NetworkInfo
+			if json.Unmarshal(data, &netInfo) == nil && netInfo.Subnet != "" {
+				parts := strings.SplitN(netInfo.Subnet, ".", 3)
+				if len(parts) >= 2 {
+					if sec, e := strconv.Atoi(parts[1]); e == nil {
+						usedSeconds[byte(sec)] = true
+					}
+				}
+			}
+		}
+	}
+
+	for sec := 33; sec <= 99; sec++ {
+		if !usedSeconds[byte(sec)] {
+			return fmt.Sprintf("172.%d.0.0/16", sec), fmt.Sprintf("172.%d.0.1", sec), nil
+		}
+	}
+
+	return "", "", fmt.Errorf("可用子网已耗尽（已使用 172.33-99.0.0/16）")
 }
 
 func LoadNetworkInfo(name string) (*NetworkInfo, error) {

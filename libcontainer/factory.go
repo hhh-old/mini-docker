@@ -10,20 +10,21 @@ import (
 )
 
 const (
-	// StateDir 容器状态存储目录（与 containerd service 的 runtimeDir 保持一致）
 	StateDir = constants.RuntimeDir
-
-	// InitPipeFd init 进程的 ready 信号 pipe fd
-	InitPipeFd = 3
 )
 
-// ContainerState 容器持久化状态
+// ContainerState 容器持久化状态（统一存储，对标 Docker/runc 的 state.json）
+// 合并了原 libcontainer.ContainerState 和 spec.State 的职责，
+// 消除两者写入同一 state.json 文件但结构不同导致的覆盖风险。
+// 对齐 Docker: runc 的 state.json 是运行时状态的唯一来源
 type ContainerState struct {
-	ID         string `json:"id"`
-	Pid        int    `json:"pid"`
-	BundlePath string `json:"bundle_path"`
-	Rootfs     string `json:"rootfs"`
-	Status     Status `json:"status"`
+	OCIVersion  string            `json:"ociVersion"`
+	ID          string            `json:"id"`
+	Pid         int               `json:"pid"`
+	BundlePath  string            `json:"bundle_path"`
+	Rootfs      string            `json:"rootfs"`
+	Status      Status            `json:"status"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // getContainerDir 获取容器状态目录
@@ -71,8 +72,14 @@ func removeContainerState(id string) error {
 	return os.RemoveAll(getContainerDir(id))
 }
 
-// listContainerIDs 列出所有容器 ID
-func listContainerIDs() ([]string, error) {
+// LoadContainerState 公开加载容器状态（供 containerd 等外部包使用）
+func LoadContainerState(id string) (*ContainerState, error) {
+	return loadContainerState(id)
+}
+
+// ListContainerStates 扫描 runtime 目录，加载所有容器的状态
+// 对齐 Docker: containerd 通过扫描 runc 的 state.json 列出所有任务
+func ListContainerStates() ([]*ContainerState, error) {
 	entries, err := os.ReadDir(StateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -81,15 +88,16 @@ func listContainerIDs() ([]string, error) {
 		return nil, err
 	}
 
-	var ids []string
+	var states []*ContainerState
 	for _, entry := range entries {
-		if entry.IsDir() {
-			statePath := filepath.Join(StateDir, entry.Name(), "state.json")
-			if _, err := os.Stat(statePath); err == nil {
-				ids = append(ids, entry.Name())
-			}
+		if !entry.IsDir() {
+			continue
 		}
+		state, err := loadContainerState(entry.Name())
+		if err != nil {
+			continue
+		}
+		states = append(states, state)
 	}
-
-	return ids, nil
+	return states, nil
 }

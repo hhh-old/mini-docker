@@ -22,6 +22,7 @@ package container
 */
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -106,38 +107,42 @@ func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
 		FailCount: failCount,
 	}
 
-	cmd := exec.Command("nsenter",
+	timeout := config.Timeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "nsenter",
 		"-t", fmt.Sprintf("%d", info.Pid),
 		"-m", "-p", "-n",
 		"/bin/sh", "-c", config.Cmd,
 	)
 
-	if config.Timeout > 0 {
-		timer := time.AfterFunc(config.Timeout, func() {
-			if cmd.Process != nil {
-				cmd.Process.Kill()
-			}
-		})
-		defer timer.Stop()
-	}
-
 	output, err := cmd.CombinedOutput()
 	result.Output = string(output)
 
 	if err != nil {
-		result.ExitCode = 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = 1
+		}
 		result.FailCount++
 	} else {
 		result.ExitCode = 0
 		result.FailCount = 0
 	}
 
-	if result.FailCount >= config.Retries {
-		result.Status = HealthUnhealthy
-	} else if result.ExitCode == 0 {
+	if result.ExitCode == 0 {
 		result.Status = HealthHealthy
-	} else {
+	} else if result.FailCount >= config.Retries {
+		result.Status = HealthUnhealthy
+	} else if prevResult == nil || prevResult.Status == HealthStarting {
 		result.Status = HealthStarting
+	} else {
+		result.Status = HealthUnhealthy
 	}
 
 	return result
@@ -145,9 +150,7 @@ func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
 
 // SaveHealthResult 保存健康检查结果
 func SaveHealthResult(containerID string, result *HealthResult) error {
-	shortID := utils.FormatShortID(containerID)
-
-	healthDir := filepath.Join(containerDataDir, shortID)
+	healthDir := filepath.Join(containerDataDir, containerID)
 	if err := os.MkdirAll(healthDir, 0755); err != nil {
 		return err
 	}
@@ -162,9 +165,7 @@ func SaveHealthResult(containerID string, result *HealthResult) error {
 
 // LoadHealthResult 加载健康检查结果
 func LoadHealthResult(containerID string) (*HealthResult, error) {
-	shortID := utils.FormatShortID(containerID)
-
-	data, err := os.ReadFile(filepath.Join(containerDataDir, shortID, "health.json"))
+	data, err := os.ReadFile(filepath.Join(containerDataDir, containerID, "health.json"))
 	if err != nil {
 		return &HealthResult{Status: HealthNone}, nil
 	}

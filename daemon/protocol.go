@@ -25,8 +25,6 @@ package daemon
 =======================================================================
 */
 
-import "encoding/json"
-
 type Request struct {
 	Type string            `json:"type"`
 	Args map[string]string `json:"args"`
@@ -39,19 +37,3 @@ type Response struct {
 	Stream      bool          `json:"stream,omitempty"`
 	StreamReady chan struct{} `json:"-"`
 }
-
-func EncodeResponse(resp Response) ([]byte, error) {
-	return json.Marshal(resp)
-}
-
-func DecodeResponse(data []byte) (*Response, error) {
-	var resp Response
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-const (
-	StreamMarker = "\n<<STREAM>>\n"
-)

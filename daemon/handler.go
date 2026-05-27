@@ -22,8 +22,8 @@ package daemon
 */
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,14 +36,15 @@ import (
 	"syscall"
 	"time"
 
-	"mini-docker/cgroup"
+	"mini-docker/builder"
 	"mini-docker/constants"
 	"mini-docker/container"
 	"mini-docker/containerd"
 	"mini-docker/image"
+	"mini-docker/libcontainer"
 	"mini-docker/network"
-	"mini-docker/types"
 	"mini-docker/utils"
+	"mini-docker/volume"
 )
 
 func mustMarshalJSON(v interface{}) string {
@@ -51,7 +52,114 @@ func mustMarshalJSON(v interface{}) string {
 	return string(data)
 }
 
+func getBoolArg(args map[string]string, key string) bool {
+	return args[key] == "true"
+}
+
+func buildRunRequest(info *container.ContainerInfo) Request {
+	volumesStr := ""
+	if len(info.Volumes) > 0 {
+		volumesStr = strings.Join(info.Volumes, "|")
+	}
+
+	req := Request{
+		Type: "run",
+		Args: map[string]string{
+			"image":           info.Image,
+			"cmd":             strings.Join(info.Cmd, " "),
+			"cmd_json":        mustMarshalJSON(info.Cmd),
+			"restart_policy":  info.RestartPolicy,
+			"detach":          "true",
+			"name":            info.Name,
+			"network":         info.Network,
+			"port_map":        info.PortMap,
+			"volumes":         volumesStr,
+			"memory":          info.Memory,
+			"cpu_shares":      info.CPUShares,
+			"health_cmd":      info.HealthCmd,
+			"health_interval": info.HealthInterval,
+			"health_timeout":  info.HealthTimeout,
+		},
+	}
+	if info.HealthRetries > 0 {
+		req.Args["health_retries"] = fmt.Sprintf("%d", info.HealthRetries)
+	}
+	if info.MaxRestartRetries > 0 {
+		req.Args["max_restart_retries"] = fmt.Sprintf("%d", info.MaxRestartRetries)
+	}
+	return req
+}
+
+func relayStream(daemonConn, shimConn net.Conn, streamReady chan struct{}) {
+	defer daemonConn.Close()
+	defer shimConn.Close()
+
+	close(streamReady)
+
+	var once sync.Once
+	done := make(chan struct{})
+
+	go func() {
+		defer once.Do(func() { close(done) })
+		_, _ = io.Copy(shimConn, daemonConn)
+	}()
+	go func() {
+		defer once.Do(func() { close(done) })
+		_, _ = io.Copy(daemonConn, shimConn)
+	}()
+
+	<-done
+}
+
 func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
+	return d.runWithID(req, conn, "")
+}
+
+// 容器进程同步：
+// ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
+// │   Daemon    │          │    Shim     │          │  容器进程    │
+// └─────────────┘          └─────────────┘          └─────────────┘
+//
+//	│                        │                        │
+//	│ 1. CreateTask          │                        │
+//	│ ──────────────────────→│                        │
+//	│                        │                        │
+//	│                        │ 2. runtime create      │
+//	│                        │ ──────────────────────→│
+//	│                        │                        │
+//	│                        │ 3. 写入 created 文件    │
+//	│                        │    (PID)               │
+//	│                        │ ──────┐                │
+//	│                        │       │                │
+//	│ 4. WaitForCreate       │       │                │
+//	│    (轮询 created 文件)  │       │                │
+//	│ ──────────────────────→│←──────┘                │
+//	│                        │                        │
+//	│    返回 PID             │                        │
+//	│ ←──────────────────────│                        │
+//	│                        │                        │
+//	│ 5. 设置网络 (Connect)   │                        │
+//	│    ┌─────────────┐     │                        │
+//	│    │ veth pair   │     │                        │
+//	│    │ IP 分配     │     │                        │
+//	│    │ 路由配置    │     │                        │
+//	│    └─────────────┘     │                        │
+//	│                        │                        │
+//	│                        │ ◄─── shim 阻塞在       │
+//	│                        │      <-startReady      │
+//	│                        │                        │
+//	│ 6. StartTask           │                        │
+//	│    (发送 "start" 请求)  │                        │
+//	│ ──────────────────────→│                        │
+//	│                        │                        │
+//	│                        │ 7. close(startReady)   │
+//	│                        │ ──────┐                │
+//	│                        │       │                │
+//	│                        │ 8. runtime start       │
+//	│                        │ ──────────────────────→│
+//	│                        │                        │
+//	│                        │                        │ 容器进程启动
+func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Response {
 	imageName := req.Args["image"]
 	cmdStr := req.Args["cmd"]
 	if imageName == "" || cmdStr == "" {
@@ -68,7 +176,7 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 		cmd = strings.Fields(cmdStr)
 	}
 
-	tty := req.Args["tty"] == "true"
+	tty := getBoolArg(req.Args, "tty")
 
 	memory := req.Args["memory"]
 	cpuShares := req.Args["cpu_shares"]
@@ -90,14 +198,30 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 		fmt.Sscanf(hr, "%d", &healthRetries)
 	}
 
+	var maxRestartRetries int
+	if mrr := req.Args["max_restart_retries"]; mrr != "" {
+		fmt.Sscanf(mrr, "%d", &maxRestartRetries)
+	}
+
 	rootFSPath := filepath.Join(constants.ImageStoreDir, imageName, "rootfs")
 	if _, err := os.Stat(rootFSPath); os.IsNotExist(err) {
 		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 不存在，请先使用 mini-docker pull 拉取", imageName)}
 	}
 
-	containerID := generateDaemonContainerID()
+	containerID := existingID
+	if containerID == "" {
+		containerID = utils.GenerateContainerID()
+	}
 	if name == "" {
-		name = utils.FormatShortID(containerID)
+		name = containerID
+	}
+
+	if existingContainers, err := container.ListContainers(); err == nil {
+		for _, c := range existingContainers {
+			if c.Name == name && (c.Status == libcontainer.StatusRunning || c.Status == libcontainer.StatusCreated || c.Status == libcontainer.StatusPaused) {
+				return Response{Success: false, Message: fmt.Sprintf("容器名 %s 已被使用", name)}
+			}
+		}
 	}
 
 	overlay, err := container.CreateOverlayDirs(containerID)
@@ -105,62 +229,61 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 		return Response{Success: false, Message: fmt.Sprintf("创建 OverlayFS 目录失败: %v", err)}
 	}
 
-	taskConfig := &containerd.TaskConfig{
-		ID:            containerID,
-		Image:         imageName,
-		Hostname:      name,
-		Cmd:           cmd,
-		Tty:           tty,
-		Memory:        memory,
-		CPUShares:     cpuShares,
-		Network:       netName,
-		PortMap:       portMap,
-		RestartPolicy: restartPolicy,
-		Volumes:       volumes,
-		RootFSPath:    rootFSPath,
-		Overlay: &types.OverlayDirs{
-			Merged: overlay.Merged,
-			Upper:  overlay.Upper,
-			Work:   overlay.Work,
-		},
+	// 先构建 ContainerInfo（持久化的真相来源），再从它派生 TaskConfig
+	// 运行时字段（Pid、网络信息）在后续步骤中补全
+	containerInfo := &container.ContainerInfo{
+		ID:                containerID,
+		Name:              name,
+		Image:             imageName,
+		Cmd:               cmd,
+		Status:            libcontainer.StatusCreated,
+		CreatedAt:         time.Now().Format(constants.TimeFormat),
+		RootFS:            rootFSPath,
+		OverlayMerged:     overlay.Merged,
+		OverlayUpper:      overlay.Upper,
+		OverlayWork:       overlay.Work,
+		RestartPolicy:     restartPolicy,
+		MaxRestartRetries: maxRestartRetries,
+		Volumes:           volumes,
+		Network:           netName,
+		PortMap:           portMap,
+		CgroupName:        constants.CgroupPrefix + containerID,
+		Tty:               tty,
+		HealthCmd:         req.Args["health_cmd"],
+		HealthInterval:    req.Args["health_interval"],
+		HealthTimeout:     req.Args["health_timeout"],
+		HealthRetries:     healthRetries,
+		Memory:            memory,
+		CPUShares:         cpuShares,
 	}
+
+	// 从 ContainerInfo 派生 TaskConfig，统一字段映射，避免手动逐字段拷贝
+	taskConfig := containerd.NewTaskConfigFromInfo(containerInfo)
 
 	shimPID, err := d.service.CreateTask(taskConfig)
 	if err != nil {
-		container.CleanupOverlay(&container.ContainerInfo{
-			ID:            containerID,
-			OverlayMerged: overlay.Merged,
-			OverlayUpper:  overlay.Upper,
-			OverlayWork:   overlay.Work,
-		})
+		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
 	}
 
-	var containerPid int
-	containerStatus := constants.StatusRunning
-	if state, _ := d.service.GetTaskState(containerID); state != nil {
-		containerPid = state.Pid
-		if state.Status != "" {
-			containerStatus = string(state.Status)
-		}
+	// 等待容器创建完成（对齐 Docker: runc create 返回后才设置网络）
+	containerPid, err := d.service.WaitForCreate(containerID, 15*time.Second)
+	if err != nil {
+		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
+		return Response{Success: false, Message: fmt.Sprintf("等待容器创建失败: %v", err)}
 	}
 
-	var cgMgr container.CgroupManager
-	if containerPid > 0 && (memory != "" || cpuShares != "") {
-		cg := &cgroup.CgroupManager{CgroupName: constants.CgroupPrefix + utils.FormatShortID(containerID)}
-		if memory != "" {
-			cg.MemoryLimit = memory
-		}
-		if cpuShares != "" {
-			cg.CPUShares = cpuShares
-		}
-		if err := cg.Apply(containerPid); err != nil {
-			log.Printf("警告: 设置 cgroup 失败: %v\n", err)
-		}
-		cgMgr = cg
-	}
+	// cgroup 已由 libcontainer 在 runtime create 阶段通过 OCI spec 应用
+	// 对齐 Docker: cgroup 在 runc create 时生效，容器进程从第一行代码就受 cgroup 约束
 
-	var netMgr container.NetworkManager
+	// 在 create 和 start 之间设置网络（对齐 Docker: runc create → 设置网络 → runc start）
+	// 为什么在 Daemon 中设置网络是正确的?
+	//		原因 							说明
+	//网络是宿主机资源 	veth pair、bridge、iptables 规则都属于宿主机，不属于容器 namespace
+	//需要 root 权限 		网络配置需要特权操作，daemon 通常以 root 运行
+	//需要全局视点 		IP 分配、端口映射需要跨容器协调，daemon 有全局状态
+	//Docker 的设计 		libnetwork 运行在 dockerd 中，containerd 只负责生命周期
+	var netMgr network.Manager
 	if containerPid > 0 && netName != "" {
 		nm := &network.NetworkManager{NetworkName: netName}
 		if portMap != "" {
@@ -173,75 +296,65 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 		}
 	}
 
-	containerInfo := &container.ContainerInfo{
-		ID:             containerID,
-		Name:           name,
-		Image:          imageName,
-		Cmd:            cmd,
-		Pid:            containerPid,
-		Status:         containerStatus,
-		CreatedAt:      time.Now().Format(constants.TimeFormat),
-		RootFS:         rootFSPath,
-		OverlayMerged:  overlay.Merged,
-		OverlayUpper:   overlay.Upper,
-		OverlayWork:    overlay.Work,
-		RestartPolicy:  restartPolicy,
-		Volumes:        volumes,
-		NetworkName:    netName,
-		PortMap:        portMap,
-		CgroupName:     constants.CgroupPrefix + utils.FormatShortID(containerID),
-		Tty:            tty,
-		HealthCmd:      req.Args["health_cmd"],
-		HealthInterval: req.Args["health_interval"],
-		HealthTimeout:  req.Args["health_timeout"],
-		HealthRetries:  healthRetries,
-		MemoryLimit:    memory,
-		CPUShares:      cpuShares,
-	}
-
+	// 补全运行时字段
+	containerInfo.Pid = containerPid
 	if netMgr != nil {
 		containerInfo.VethHost = netMgr.GetVethHost()
 		containerInfo.ContainerIP = netMgr.GetContainerIP()
 	}
 
 	if err := container.SaveContainerInfo(containerInfo); err != nil {
-		if netMgr != nil {
-			netMgr.Disconnect()
-		}
-		if cgMgr != nil {
-			cgMgr.Destroy()
-		}
-		d.service.DeleteTask(containerID)
-		container.CleanupOverlay(&container.ContainerInfo{
-			ID:            containerID,
-			OverlayMerged: overlay.Merged,
-			OverlayUpper:  overlay.Upper,
-			OverlayWork:   overlay.Work,
-		})
+		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
 	}
 
 	d.RegisterContainer(&ContainerState{
-		ID:            containerID,
-		Pid:           containerPid,
-		ShimPID:       shimPID,
-		CreatedAt:     time.Now(),
-		RestartPolicy: restartPolicy,
-		CgroupMgr:     cgMgr,
-		NetMgr:        netMgr,
+		Info:    containerInfo,
+		ShimPID: shimPID,
+		NetMgr:  netMgr,
 	})
 
 	go d.WatchContainer(containerID)
-	//	区分是否流式返回
+
+	// 对于 -it 模式，先 attach 再 start（确保容器启动后的第一行输出都不会丢失）
 	if req.Args["stream"] == "true" && conn != nil {
 		shimConn, err := d.service.AttachTask(containerID)
 		if err != nil {
-			log.Printf("attach 到容器 %s 失败: %v\n", utils.FormatShortID(containerID), err)
-		} else {
-			streamReady := make(chan struct{})
-			go d.handleAttachStream(conn, shimConn, streamReady)
-			return Response{Success: true, Data: containerInfo, Stream: true, StreamReady: streamReady}
+			d.UnregisterContainer(containerID)
+			d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+			return Response{Success: false, Message: fmt.Sprintf("attach 到容器失败: %v", err)}
 		}
+		// attach 已建立，现在发送 start 信号
+		if err := d.service.StartTask(containerID); err != nil {
+			log.Printf("启动容器 %s 失败: %v\n", containerID, err)
+			shimConn.Close()
+			return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
+		}
+		containerInfo.Status = libcontainer.StatusRunning
+		container.SaveContainerInfo(containerInfo)
+		streamReady := make(chan struct{})
+		go relayStream(conn, shimConn, streamReady)
+		return Response{Success: true, Data: containerInfo, Stream: true, StreamReady: streamReady}
+	}
+
+	// 非 -it 模式：直接发送 start 信号
+	if err := d.service.StartTask(containerID); err != nil {
+		d.UnregisterContainer(containerID)
+		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
+	}
+	containerInfo.Status = libcontainer.StatusRunning
+	container.SaveContainerInfo(containerInfo)
+
+	d.eventBus.Publish(Event{
+		Type:      "container_start",
+		Container: containerID,
+		Time:      time.Now(),
+	})
+
+	// 启动健康检查（对齐 Docker: Daemon 周期执行 HEALTHCHECK）
+	if containerInfo.HealthCmd != "" {
+		go d.runHealthCheckLoop(containerID)
 	}
 
 	return Response{
@@ -251,33 +364,15 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 	}
 }
 
-// handleAttachStream 处理 -it 模式的流式 I/O 转发
-// 对齐 Docker 的 attach 行为：CLI ←→ Daemon ←→ Shim ←→ pty ←→ 容器进程
-func (d *Daemon) handleAttachStream(daemonConn net.Conn, shimConn net.Conn, streamReady chan struct{}) {
-	defer daemonConn.Close()
-	defer shimConn.Close()
-
-	close(streamReady)
-
-	var once sync.Once
-	done := make(chan struct{})
-
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = io.Copy(shimConn, daemonConn)
-	}()
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = io.Copy(daemonConn, shimConn)
-	}()
-
-	<-done
-}
-
 func (d *Daemon) handleStop(req Request) Response {
 	containerID := req.Args["container_id"]
 	if containerID == "" {
 		return Response{Success: false, Message: "需要指定容器ID"}
+	}
+
+	info, err := container.LoadContainerInfoByID(containerID)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("容器 %s 不存在", containerID)}
 	}
 
 	if state, ok := d.GetContainerState(containerID); ok {
@@ -286,40 +381,33 @@ func (d *Daemon) handleStop(req Request) Response {
 		state.mu.Unlock()
 	}
 
-	if err := utils.GracefulStopProcess(
+	killed, err := utils.GracefulStopProcess(
 		func(sig syscall.Signal) error { return d.service.KillTask(containerID, sig) },
 		func() bool {
-			state, _ := d.service.GetTaskState(containerID)
-			return state != nil && (state.Status == constants.StatusRunning || state.Status == constants.StatusCreated)
+			return utils.CheckProcessAlive(info.Pid)
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("停止容器失败: %v", err)}
 	}
 
-	var netMgr container.NetworkManager
-	var cgMgr container.CgroupManager
-	if state, ok := d.GetContainerState(containerID); ok {
-		netMgr = state.NetMgr
-		cgMgr = state.CgroupMgr
+	exitCode := 0
+	if killed {
+		exitCode = 128 + int(syscall.SIGKILL)
+	}
+	info.Status = libcontainer.StatusStopped
+	info.ExitCode = exitCode
+	info.Pid = 0
+	info.FinishedAt = utils.NowFormatted()
+	container.SaveContainerInfo(info)
+
+	var state *ContainerState
+	if s, ok := d.GetContainerState(containerID); ok {
+		state = s
 	}
 	d.UnregisterContainer(containerID)
 
-	d.service.DeleteTask(containerID)
-
-	if netMgr != nil {
-		_ = netMgr.Disconnect()
-	}
-	if cgMgr != nil {
-		_ = cgMgr.Destroy()
-	}
-
-	info, err := container.LoadContainerInfoByID(containerID)
-	if err == nil {
-		info.Status = constants.StatusExited
-		info.Pid = 0
-		info.FinishedAt = utils.NowFormatted()
-		container.SaveContainerInfo(info)
-	}
+	d.cleanupContainerResources(containerID, state, CleanupOptions{DeleteTask: true})
 
 	d.eventBus.Publish(Event{
 		Type:      "container_stop",
@@ -342,58 +430,22 @@ func (d *Daemon) handleStart(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("查找容器失败: %v", err)}
 	}
 
-	if info.Status != constants.StatusExited && info.Status != constants.StatusStopped && info.Status != constants.StatusCreated {
-		return Response{Success: false, Message: fmt.Sprintf("容器状态为 %s，无法启动（仅 exited/stopped/created 可启动）", info.Status)}
+	if info.Status != libcontainer.StatusStopped && info.Status != libcontainer.StatusCreated {
+		return Response{Success: false, Message: fmt.Sprintf("容器状态为 %s，无法启动（仅 stopped/created 可启动）", info.Status)}
 	}
 
-	imageName := info.Image
-	cmd := info.Cmd
-	restartPolicy := info.RestartPolicy
+	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 
-	d.service.DeleteTask(containerID)
+	savedInfo := *info
+	newReq := buildRunRequest(info)
 
-	volumesStr := ""
-	if len(info.Volumes) > 0 {
-		volumesStr = strings.Join(info.Volumes, "|")
-	}
-
-	newReq := Request{
-		Type: "run",
-		Args: map[string]string{
-			"image":           imageName,
-			"cmd":             strings.Join(cmd, " "),
-			"cmd_json":        mustMarshalJSON(cmd),
-			"restart_policy":  restartPolicy,
-			"detach":          "true",
-			"name":            info.Name,
-			"network":         info.NetworkName,
-			"port_map":        info.PortMap,
-			"volumes":         volumesStr,
-			"health_cmd":      info.HealthCmd,
-			"health_interval": info.HealthInterval,
-			"health_timeout":  info.HealthTimeout,
-		},
-	}
-	if info.HealthRetries > 0 {
-		newReq.Args["health_retries"] = fmt.Sprintf("%d", info.HealthRetries)
-	}
-
-	backupInfo := *info
-
-	resp := d.handleRun(newReq, nil)
+	resp := d.runWithID(newReq, nil, containerID)
 	if !resp.Success {
-		backupInfo.Status = constants.StatusExited
-		container.SaveContainerInfo(&backupInfo)
-		log.Printf("警告: 容器 %s 重启失败，已恢复容器信息\n", utils.FormatShortID(containerID))
-		return resp
+		log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
+		savedInfo.Status = libcontainer.StatusStopped
+		container.SaveContainerInfo(&savedInfo)
 	}
-
-	container.CleanupContainerNetwork(info)
-	container.CleanupOverlay(info)
-	container.CleanupCgroup(info.CgroupName)
-	container.RemoveContainerInfo(containerID)
-
-	return Response{Success: true, Message: fmt.Sprintf("容器 %s 已启动", info.Name), Data: resp.Data}
+	return resp
 }
 
 func (d *Daemon) handlePause(req Request) Response {
@@ -404,6 +456,11 @@ func (d *Daemon) handlePause(req Request) Response {
 
 	if err := d.service.PauseTask(containerID); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("暂停容器失败: %v", err)}
+	}
+
+	if info, err := container.LoadContainerInfoByID(containerID); err == nil {
+		info.Status = libcontainer.StatusPaused
+		container.SaveContainerInfo(info)
 	}
 
 	d.eventBus.Publish(Event{
@@ -425,6 +482,11 @@ func (d *Daemon) handleUnpause(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("恢复容器失败: %v", err)}
 	}
 
+	if info, err := container.LoadContainerInfoByID(containerID); err == nil {
+		info.Status = libcontainer.StatusRunning
+		container.SaveContainerInfo(info)
+	}
+
 	d.eventBus.Publish(Event{
 		Type:      "container_unpause",
 		Container: containerID,
@@ -441,13 +503,13 @@ func (d *Daemon) handleRm(req Request) Response {
 	}
 
 	state, _ := d.service.GetTaskState(containerID)
-	if state != nil && (state.Status == constants.StatusRunning || state.Status == constants.StatusCreated || state.Status == constants.StatusPaused) {
+	if state != nil && (state.Status == libcontainer.StatusRunning || state.Status == libcontainer.StatusCreated || state.Status == libcontainer.StatusPaused) {
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 正在运行，请先停止容器", containerID)}
 	}
 
 	info, err := container.LoadContainerInfoByID(containerID)
-	if err == nil && (info.Status == constants.StatusRunning || info.Status == constants.StatusPaused) && info.Pid > 0 {
-		if utils.CheckProcessAlive(info.Pid) == nil {
+	if err == nil && (info.Status == libcontainer.StatusRunning || info.Status == libcontainer.StatusPaused) && info.Pid > 0 {
+		if utils.CheckProcessAlive(info.Pid) {
 			return Response{Success: false, Message: fmt.Sprintf("容器 %s 进程仍在运行 (PID: %d)，请先停止容器", containerID, info.Pid)}
 		}
 	}
@@ -459,17 +521,7 @@ func (d *Daemon) handleRm(req Request) Response {
 	}
 	d.UnregisterContainer(containerID)
 
-	if err := d.service.DeleteTask(containerID); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("删除容器失败: %v", err)}
-	}
-
-	if info != nil {
-		container.CleanupContainerNetwork(info)
-		container.CleanupOverlay(info)
-		container.CleanupCgroup(info.CgroupName)
-	}
-
-	container.RemoveContainerInfo(containerID)
+	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 
 	d.eventBus.Publish(Event{
 		Type:      "container_rm",
@@ -505,7 +557,7 @@ func (d *Daemon) handleExec(req Request, conn net.Conn) Response {
 		cmd = strings.Fields(cmdStr)
 	}
 
-	tty := req.Args["tty"] == "true"
+	tty := getBoolArg(req.Args, "tty")
 
 	shimConn, err := d.service.ExecTaskStream(containerID, cmd, tty)
 	if err != nil {
@@ -513,37 +565,21 @@ func (d *Daemon) handleExec(req Request, conn net.Conn) Response {
 	}
 
 	if !tty {
-		shimConn.SetDeadline(time.Now().Add(30 * time.Second))
-		output, _ := io.ReadAll(shimConn)
+		shimConn.SetDeadline(time.Now().Add(5 * time.Minute))
+		var buf bytes.Buffer
+		scanner := bufio.NewScanner(shimConn)
+		for scanner.Scan() {
+			buf.WriteString(scanner.Text())
+			buf.WriteByte('\n')
+		}
 		shimConn.Close()
-		result := strings.TrimRight(string(output), "\n")
+		result := strings.TrimRight(buf.String(), "\n")
 		return Response{Success: true, Data: result}
 	}
 
 	streamReady := make(chan struct{})
-	go d.handleExecStream(conn, shimConn, streamReady)
+	go relayStream(conn, shimConn, streamReady)
 	return Response{Success: true, Stream: true, StreamReady: streamReady}
-}
-
-func (d *Daemon) handleExecStream(daemonConn net.Conn, shimConn net.Conn, streamReady chan struct{}) {
-	defer daemonConn.Close()
-	defer shimConn.Close()
-
-	close(streamReady)
-
-	var once sync.Once
-	done := make(chan struct{})
-
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = io.Copy(shimConn, daemonConn)
-	}()
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = io.Copy(daemonConn, shimConn)
-	}()
-
-	<-done
 }
 
 func (d *Daemon) handleLogs(req Request) Response {
@@ -666,10 +702,73 @@ func (d *Daemon) handleNetworkDelete(req Request) Response {
 	return Response{Success: true, Message: fmt.Sprintf("网络 %s 已删除", name)}
 }
 
-func generateDaemonContainerID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+func (d *Daemon) handleVolumeCreate(req Request) Response {
+	name := req.Args["name"]
+	if name == "" {
+		return Response{Success: false, Message: "需要指定卷名"}
 	}
-	return hex.EncodeToString(b)
+
+	vol, err := volume.Create(name)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("创建卷失败: %v", err)}
+	}
+
+	return Response{Success: true, Data: vol}
+}
+
+func (d *Daemon) handleVolumeList(req Request) Response {
+	vols, err := volume.List()
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("列出卷失败: %v", err)}
+	}
+	return Response{Success: true, Data: vols}
+}
+
+func (d *Daemon) handleVolumeRm(req Request) Response {
+	name := req.Args["name"]
+	if name == "" {
+		return Response{Success: false, Message: "需要指定卷名"}
+	}
+
+	if err := volume.Remove(name); err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("删除卷失败: %v", err)}
+	}
+
+	return Response{Success: true, Message: fmt.Sprintf("卷 %s 已删除", name)}
+}
+
+func (d *Daemon) handleVolumeInspect(req Request) Response {
+	name := req.Args["name"]
+	if name == "" {
+		return Response{Success: false, Message: "需要指定卷名"}
+	}
+
+	vol, err := volume.Inspect(name)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("查询卷失败: %v", err)}
+	}
+
+	return Response{Success: true, Data: vol}
+}
+
+func (d *Daemon) handleBuild(req Request) Response {
+	dockerfilePath := req.Args["dockerfile"]
+	contextDir := req.Args["context"]
+	tag := req.Args["tag"]
+	if dockerfilePath == "" && contextDir == "" {
+		return Response{Success: false, Message: "需要指定 Dockerfile 路径或构建上下文"}
+	}
+
+	config := builder.BuildConfig{
+		DockerfilePath: dockerfilePath,
+		ContextDir:     contextDir,
+		Tag:            tag,
+	}
+
+	result, err := builder.Build(config)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("构建镜像失败: %v", err)}
+	}
+
+	return Response{Success: true, Data: result}
 }

@@ -28,7 +28,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"time"
 
@@ -40,11 +39,17 @@ type Client struct {
 	timeout    time.Duration
 }
 
-// 连接deamon进程
 func NewClient() *Client {
 	return &Client{
 		socketPath: SocketPath,
 		timeout:    constants.DefaultConnectTimeout,
+	}
+}
+
+func (c *Client) WithTimeout(timeout time.Duration) *Client {
+	return &Client{
+		socketPath: c.socketPath,
+		timeout:    timeout,
 	}
 }
 
@@ -69,19 +74,16 @@ func (c *Client) Send(req Request) (*Response, error) {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	conn.SetDeadline(time.Now().Add(c.timeout))
+	conn.SetWriteDeadline(time.Now().Add(c.timeout))
 
 	if _, err := conn.Write(data); err != nil {
 		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
 
-	respData, err := io.ReadAll(conn)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
+	conn.SetReadDeadline(time.Now().Add(c.timeout))
 
 	var resp Response
-	if err := json.Unmarshal(respData, &resp); err != nil {
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("解析响应失败: %w", err)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"mini-docker/constants"
 	"mini-docker/types"
@@ -91,6 +92,14 @@ func SetupRootFS(rootFSPath string, overlay *types.OverlayDirs) error {
 	}
 
 	return nil
+}
+
+func setHostname(name string) error {
+	return unix.Sethostname([]byte(name))
+}
+
+func syscallExec(argv0 string, argv []string, envv []string) error {
+	return syscall.Exec(argv0, argv, envv)
 }
 
 func pivotRoot(newRoot string, putOld string) error {

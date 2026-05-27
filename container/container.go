@@ -1,18 +1,17 @@
 package container
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
-	"time"
 
 	"mini-docker/constants"
+	"mini-docker/libcontainer"
+	"mini-docker/libcontainer/configs"
 	"mini-docker/network"
 	"mini-docker/spec"
 	"mini-docker/types"
@@ -22,175 +21,38 @@ import (
 const (
 	containerStoreDir = constants.ContainerStoreDir
 	containerDataDir  = constants.ContainerDataDir
-	imageStoreDir     = constants.ImageStoreDir
 )
 
 type ContainerInfo struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Pid            int      `json:"pid"`
-	Image          string   `json:"image"`
-	Cmd            []string `json:"cmd"`
-	Status         string   `json:"status"` // created, running, paused, exited, stopped, dead, restarting
-	CreatedAt      string   `json:"created_at"`
-	RootFS         string   `json:"rootfs"`
-	CgroupName     string   `json:"cgroup_name"`
-	NetworkName    string   `json:"network_name"`
-	VethHost       string   `json:"veth_host"`
-	ContainerIP    string   `json:"container_ip"`
-	PortMap        string   `json:"port_map"`
-	OverlayMerged  string   `json:"overlay_merged"`
-	OverlayUpper   string   `json:"overlay_upper"`
-	OverlayWork    string   `json:"overlay_work"`
-	RestartPolicy  string   `json:"restart_policy"` // no, always, on-failure
-	Tty            bool     `json:"tty"`
-	ExitCode       int      `json:"exit_code"`
-	FinishedAt     string   `json:"finished_at"`
-	Volumes        []string `json:"volumes"` // 记录容器的 volume 挂载
-	HealthCmd      string   `json:"health_cmd"`
-	HealthInterval string   `json:"health_interval"`
-	HealthTimeout  string   `json:"health_timeout"`
-	HealthRetries  int      `json:"health_retries"`
-	MemoryLimit    string   `json:"memory_limit"`
-	CPUShares      string   `json:"cpu_shares"`
-}
-
-type CgroupManager interface {
-	Apply(pid int) error
-	Destroy() error
-	Freeze() error
-	Thaw() error
-}
-
-type NetworkManager interface {
-	Connect(pid int) error
-	Disconnect() error
-	GetVethHost() string
-	GetContainerIP() string
-}
-
-func Exec(containerID string, cmd []string) error {
-	containerInfo, err := loadContainerInfo(containerID)
-	if err != nil {
-		return fmt.Errorf("查找容器失败: %w", err)
-	}
-
-	if containerInfo.Status != constants.StatusRunning {
-		return fmt.Errorf("容器 %s 未在运行", containerID)
-	}
-
-	// 使用 nsenter 命令进入容器的所有 namespace 执行命令
-	// 原因：Go 运行时是多线程的，直接调用 setns() 加入 mount namespace
-	// 会返回 EINVAL（setns 要求调用进程单线程）
-	// Docker 的做法也是通过 nsenter 或 fork 子进程后再 setns
-	//
-	// nsenter 参数说明：
-	//   -t <pid>   → 目标进程 PID
-	//   -m         → 进入 mount namespace
-	//   -u         → 进入 UTS namespace
-	//   -i         → 进入 IPC namespace
-	//   -n         → 进入 network namespace
-	//   -p         → 进入 PID namespace
-	//   --         → 后面是要执行的命令
-	nsenterCmd := exec.Command("nsenter",
-		"-t", fmt.Sprintf("%d", containerInfo.Pid),
-		"-m", "-u", "-i", "-n", "-p",
-		"--",
-	)
-	nsenterCmd.Args = append(nsenterCmd.Args, cmd...)
-
-	nsenterCmd.Stdin = os.Stdin
-	nsenterCmd.Stdout = os.Stdout
-	nsenterCmd.Stderr = os.Stderr
-
-	return nsenterCmd.Run()
-}
-
-func Stop(containerID string) error {
-	containerInfo, err := loadContainerInfo(containerID)
-	if err != nil {
-		return fmt.Errorf("查找容器失败: %w", err)
-	}
-
-	if containerInfo.Status != constants.StatusRunning && containerInfo.Status != constants.StatusPaused {
-		return fmt.Errorf("容器 %s 未在运行", containerID)
-	}
-
-	if containerInfo.Pid <= 0 {
-		containerInfo.Status = constants.StatusExited
-		containerInfo.FinishedAt = utils.NowFormatted()
-		SaveContainerInfo(containerInfo)
-		return fmt.Errorf("容器 %s PID 无效，状态已更新为 exited", containerID)
-	}
-
-	if err := utils.GracefulStopProcess(
-		func(sig syscall.Signal) error { return sendSignal(containerInfo.Pid, int(sig)) },
-		func() bool { return utils.CheckProcessAlive(containerInfo.Pid) == nil },
-	); err != nil {
-		return err
-	}
-
-	containerInfo.Status = constants.StatusExited
-	containerInfo.ExitCode = constants.SIGTERMExitCode
-	containerInfo.FinishedAt = utils.NowFormatted()
-	containerInfo.Pid = 0
-	cleanupContainerNetwork(containerInfo)
-	cleanupCgroup(containerInfo.CgroupName)
-	return SaveContainerInfo(containerInfo)
-}
-
-func Pause(containerID string, cg CgroupManager) error {
-	containerInfo, err := loadContainerInfo(containerID)
-	if err != nil {
-		return fmt.Errorf("查找容器失败: %w", err)
-	}
-
-	if containerInfo.Status != constants.StatusRunning {
-		return fmt.Errorf("容器 %s 未在运行", containerID)
-	}
-
-	if err := cg.Freeze(); err != nil {
-		return fmt.Errorf("冻结容器失败: %w", err)
-	}
-
-	containerInfo.Status = constants.StatusPaused
-	return SaveContainerInfo(containerInfo)
-}
-
-func Unpause(containerID string, cg CgroupManager) error {
-	containerInfo, err := loadContainerInfo(containerID)
-	if err != nil {
-		return fmt.Errorf("查找容器失败: %w", err)
-	}
-
-	if containerInfo.Status != constants.StatusPaused {
-		return fmt.Errorf("容器 %s 未处于暂停状态", containerID)
-	}
-
-	if err := cg.Thaw(); err != nil {
-		return fmt.Errorf("恢复容器失败: %w", err)
-	}
-
-	containerInfo.Status = constants.StatusRunning
-	return SaveContainerInfo(containerInfo)
-}
-
-func Remove(containerID string) error {
-	containerInfo, err := loadContainerInfo(containerID)
-	if err != nil {
-		return fmt.Errorf("查找容器失败: %w", err)
-	}
-
-	if containerInfo.Status == constants.StatusRunning || containerInfo.Status == constants.StatusPaused || containerInfo.Status == constants.StatusRestarting {
-		return fmt.Errorf("容器 %s 正在运行（状态: %s），请先停止容器", containerID, containerInfo.Status)
-	}
-
-	cleanupContainerNetwork(containerInfo)
-	cleanupOverlay(containerInfo)
-	cleanupCgroup(containerInfo.CgroupName)
-
-	infoPath := getContainerInfoPath(containerID)
-	return os.Remove(infoPath)
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Pid               int      `json:"pid"`
+	ShimPID           int      `json:"shim_pid"`
+	Image             string   `json:"image"`
+	Cmd               []string `json:"cmd"`
+	Status            string   `json:"status"` // created, running, paused, stopped, dead, restarting
+	CreatedAt         string   `json:"created_at"`
+	RootFS            string   `json:"rootfs"`
+	CgroupName        string   `json:"cgroup_name"`
+	Network           string   `json:"network"`
+	VethHost          string   `json:"veth_host"`
+	ContainerIP       string   `json:"container_ip"`
+	PortMap           string   `json:"port_map"`
+	OverlayMerged     string   `json:"overlay_merged"`
+	OverlayUpper      string   `json:"overlay_upper"`
+	OverlayWork       string   `json:"overlay_work"`
+	RestartPolicy     string   `json:"restart_policy"`      // no, always, on-failure
+	MaxRestartRetries int      `json:"max_restart_retries"` // on-failure 最大重启次数
+	Tty               bool     `json:"tty"`
+	ExitCode          int      `json:"exit_code"`
+	FinishedAt        string   `json:"finished_at"`
+	Volumes           []string `json:"volumes"` // 记录容器的 volume 挂载
+	HealthCmd         string   `json:"health_cmd"`
+	HealthInterval    string   `json:"health_interval"`
+	HealthTimeout     string   `json:"health_timeout"`
+	HealthRetries     int      `json:"health_retries"`
+	Memory            string   `json:"memory"`
+	CPUShares         string   `json:"cpu_shares"`
 }
 
 func ListContainers() ([]*ContainerInfo, error) {
@@ -223,9 +85,9 @@ func ListContainers() ([]*ContainerInfo, error) {
 			continue
 		}
 
-		if c.Status == constants.StatusRunning {
-			if err := utils.CheckProcessAlive(c.Pid); err != nil {
-				c.Status = constants.StatusStopped
+		if c.Status == libcontainer.StatusRunning {
+			if !utils.CheckProcessAlive(c.Pid) {
+				c.Status = libcontainer.StatusStopped
 				_ = SaveContainerInfo(&c)
 			}
 		}
@@ -288,14 +150,16 @@ func HandleOCIInit() {
 
 	pipe := os.NewFile(3, "ready-pipe") //runtime create进程传递的pipeWrite管道就是fd3
 	if pipe != nil {
-		if _, err := pipe.Write([]byte("ready\n")); err != nil { //发送 ready 信号
+		if _, err := pipe.Write([]byte("ready\n")); err != nil { //发送 ready 信号给 runtime create 进程
 			fmt.Fprintf(os.Stderr, "发送 ready 信号失败: %v\n", err)
 		}
 		pipe.Close()
 	}
-
-	buf := make([]byte, 16)
-	fifo.Read(buf) //阻塞等待 FIFO 的 "start" 信号,等待 runtime start 命令写入 "start\n".
+	//runtime start 唯一做的事情就是向 FIFO 写入一个字节，唤醒阻塞在 io.ReadFull(fifo) 上的 init 进程。
+	//init 进程被唤醒后才会执行 syscallExec 替换为用户的 cmd 命令。
+	//在 runtime start 之前，init 进程虽然已经存在（PID 已分配、namespace 已隔离、rootfs 已设置），但它被"冻结"在 FIFO 读取上，不会执行任何用户代码。
+	//这正是 create/start 分离的核心价值——在"冻结"期间，Daemon 可以安全地配置网络、设置安全策略等
+	_, _ = io.ReadFull(fifo, make([]byte, 1)) // 阻塞！等 FIFO 里有数据,只有runtime start进程执行后,向".start-fifo"管道中写了数据,容器init进程才会向下执行容器中的cmd命令(容器第一条命令)
 	fifo.Close()
 
 	args := ociSpec.Process.Args
@@ -384,40 +248,36 @@ func extractOverlayFromAnnotations(s *spec.Spec) *types.OverlayDirs {
 	}
 }
 
-func applyOCICapabilities(caps *spec.Capabilities) {
+func applyOCICapabilities(caps *configs.Capabilities) {
 	if caps == nil {
 		ApplyCapabilitiesFromEnv()
 		return
 	}
-	var capDrop []string
-	allCaps := []string{
-		"CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL",
-		"SETGID", "SETUID", "SETPCAP", "LINUX_IMMUTABLE", "NET_BIND_SERVICE",
-		"NET_BROADCAST", "NET_ADMIN", "NET_RAW", "IPC_LOCK", "IPC_OWNER",
-		"SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT",
-		"SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME",
-		"SYS_TTY_CONFIG", "MKNOD", "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL",
-		"SETFCAP",
-	}
-	keepSet := make(map[string]bool)
+
+	keepSet := make(map[int]bool)
 	for _, c := range caps.Bounding {
-		keepSet[strings.TrimPrefix(c, "CAP_")] = true
-	}
-	for _, c := range allCaps {
-		if !keepSet[c] {
-			capDrop = append(capDrop, c)
+		if capVal, err := configs.ResolveCapName(c); err == nil {
+			keepSet[capVal] = true
 		}
 	}
-	if len(capDrop) > 0 {
-		ApplyCapabilities(nil, capDrop)
+
+	for _, capName := range configs.AllKnownCapabilities {
+		capVal, err := configs.ResolveCapName(capName)
+		if err != nil {
+			continue
+		}
+		if !keepSet[capVal] {
+			if err := utils.DropCapability(capVal); err != nil {
+				fmt.Printf("  提示: drop CAP_%s 失败（可能不受支持）: %v\n",
+					configs.CapValueToName[capVal], err)
+			}
+		}
 	}
 }
 
 // 宿主机上
 func CreateOverlayDirs(containerID string) (*types.OverlayDirs, error) {
-	shortID := utils.FormatShortID(containerID)
-
-	baseDir := filepath.Join(containerDataDir, shortID, "overlay")
+	baseDir := filepath.Join(containerDataDir, containerID, "overlay")
 	mergedDir := filepath.Join(baseDir, "merged")
 	upperDir := filepath.Join(baseDir, "upper")
 	workDir := filepath.Join(baseDir, "work")
@@ -442,8 +302,9 @@ func cleanupOverlay(info *ContainerInfo) {
 		return
 	}
 
-	shortID := utils.FormatShortID(info.ID)
-	containerDir := filepath.Join(containerDataDir, shortID)
+	exec.Command("umount", info.OverlayMerged).Run()
+
+	containerDir := filepath.Join(containerDataDir, info.ID)
 	os.RemoveAll(containerDir)
 }
 
@@ -451,7 +312,14 @@ func cleanupCgroup(cgroupName string) {
 	if cgroupName == "" {
 		return
 	}
-	subsystems := []string{"memory", "cpu", "freezer"}
+	// cgroup v2: 统一层级 /sys/fs/cgroup/<cgroupName>
+	cgroupV2Path := filepath.Join(constants.CgroupRootPath, cgroupName)
+	if _, err := os.Stat(cgroupV2Path); err == nil {
+		os.RemoveAll(cgroupV2Path)
+		return
+	}
+	// cgroup v1: 各子系统独立挂载
+	subsystems := []string{"memory", "cpu", "freezer", "pids"}
 	for _, subsys := range subsystems {
 		cgroupPath := filepath.Join(constants.CgroupRootPath, subsys, cgroupName)
 		if _, err := os.Stat(cgroupPath); err == nil {
@@ -460,16 +328,8 @@ func cleanupCgroup(cgroupName string) {
 	}
 }
 
-func generateContainerID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
-}
-
 func getContainerInfoPath(containerID string) string {
-	return filepath.Join(containerStoreDir, utils.FormatShortID(containerID)+".json")
+	return filepath.Join(containerStoreDir, containerID+".json")
 }
 
 func SaveContainerInfo(info *ContainerInfo) error {
@@ -506,10 +366,16 @@ func CleanupCgroup(cgroupName string) {
 }
 
 func loadContainerInfo(containerID string) (*ContainerInfo, error) {
-	if err := os.MkdirAll(containerStoreDir, 0755); err != nil {
-		return nil, err
+	infoPath := getContainerInfoPath(containerID)
+	data, err := os.ReadFile(infoPath)
+	if err == nil {
+		var c ContainerInfo
+		if err := json.Unmarshal(data, &c); err == nil {
+			return &c, nil
+		}
 	}
 
+	// 直接路径读取失败，按容器名遍历查找
 	entries, err := os.ReadDir(containerStoreDir)
 	if err != nil {
 		return nil, fmt.Errorf("容器 %s 不存在", containerID)
@@ -531,7 +397,7 @@ func loadContainerInfo(containerID string) (*ContainerInfo, error) {
 			continue
 		}
 
-		if strings.HasPrefix(c.ID, containerID) || c.Name == containerID {
+		if c.Name == containerID {
 			return &c, nil
 		}
 	}
@@ -539,49 +405,20 @@ func loadContainerInfo(containerID string) (*ContainerInfo, error) {
 	return nil, fmt.Errorf("容器 %s 不存在", containerID)
 }
 
+// cleanupContainerNetwork 通过重建 NetworkManager 并调用 Disconnect() 来清理网络资源
+// 统一使用 NetworkManager.Disconnect() 作为网络清理的唯一实现，避免逻辑重复
 func cleanupContainerNetwork(info *ContainerInfo) {
-	vethExisted := false
-	if info.VethHost != "" {
-		if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", info.VethHost)); err == nil {
-			vethExisted = true
-		}
-		cmd := exec.Command("ip", "link", "delete", info.VethHost)
-		_ = cmd.Run()
+	if info.Network == "" && info.VethHost == "" {
+		return
 	}
-
-	if info.PortMap != "" && info.ContainerIP != "" {
-		utils.CleanupPortMapping(info.PortMap, info.ContainerIP)
-	}
-
-	if info.NetworkName != "" && info.ContainerIP != "" {
-		network.ReleaseIP(info.NetworkName, info.ContainerIP)
-	}
-
-	if vethExisted && info.NetworkName != "" {
-		if netInfo, err := network.LoadNetworkInfo(info.NetworkName); err == nil {
-			if len(netInfo.Allocated) == 0 {
-				network.CleanupMasquerade(netInfo.Subnet, netInfo.Bridge)
-			}
-		}
-	}
+	nm := network.NewManagerFromInfo(info.Network, info.PortMap, info.ContainerIP, info.VethHost)
+	nm.Disconnect()
 }
 
 // ReadContainerLogs 读取容器日志（对齐 Docker 的 json-log 格式）
 func ReadContainerLogs(containerID string) ([]string, error) {
 	shimLogPath := filepath.Join(constants.ShimDir, containerID, "container.log")
 	data, err := os.ReadFile(shimLogPath)
-	if err != nil {
-		entries, _ := os.ReadDir(constants.ShimDir)
-		for _, e := range entries {
-			if e.IsDir() && strings.HasPrefix(e.Name(), containerID) {
-				shimLogPath = filepath.Join(constants.ShimDir, e.Name(), "container.log")
-				data, err = os.ReadFile(shimLogPath)
-				if err == nil {
-					break
-				}
-			}
-		}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("读取日志失败: %w", err)
 	}

@@ -9,7 +9,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DropCapability 从能力边界集中移除一个能力
 func DropCapability(cap int) error {
 	_, _, errno := syscall.Syscall6(
 		unix.SYS_PRCTL,
