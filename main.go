@@ -203,13 +203,16 @@ parseLoop:
 			}
 			reqArgs["cpu_shares"] = args[i+1]
 			i += 2
-		case "-n":
+		case "-n", "--network":
 			if i+1 >= len(args) {
 				fmt.Println("错误: -n 需要指定网络名称")
 				os.Exit(1)
 			}
 			reqArgs["network"] = args[i+1]
 			i += 2
+		case "--network=none", "--network=host":
+			reqArgs["network"] = strings.TrimPrefix(args[i], "--network=")
+			i++
 		case "-p":
 			if i+1 >= len(args) {
 				fmt.Println("错误: -p 需要指定端口映射（如 8080:80）")
@@ -705,12 +708,16 @@ func networkCommand() {
 					os.Exit(1)
 				}
 				if len(nets) == 0 {
-					fmt.Println("没有自定义网络")
+					fmt.Println("没有网络")
 					return
 				}
-				fmt.Printf("%-20s %-20s %-20s\n", "网络名称", "子网", "已分配IP数")
+				fmt.Printf("%-20s %-20s %-20s %-20s\n", "网络名称", "子网", "已分配IP数", "类型")
 				for _, n := range nets {
-					fmt.Printf("%-20s %-20s %-20d\n", n.Name, n.Subnet, len(n.Allocated))
+					netType := "自定义"
+					if network.IsDefaultNetwork(n.Name) {
+						netType = "默认"
+					}
+					fmt.Printf("%-20s %-20s %-20d %-20s\n", n.Name, n.Subnet, len(n.Allocated), netType)
 				}
 			}, "")
 	case "delete":

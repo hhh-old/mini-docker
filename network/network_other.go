@@ -72,3 +72,22 @@ func LoadNetworkInfo(name string) (*NetworkInfo, error) {
 
 func CleanupMasquerade(subnet string, bridgeName string) {
 }
+
+const (
+	DefaultNetworkName = "bridge"
+	DefaultBridgeName  = "mini-bridge"
+)
+
+func EnsureDefaultNetwork() error {
+	return fmt.Errorf("网络管理仅在 Linux 上可用")
+}
+
+func IsDefaultNetwork(name string) bool {
+	return name == DefaultNetworkName
+}
+
+func EnableLoopback(pid int) {
+}
+
+func CleanupAllIptables() {
+}

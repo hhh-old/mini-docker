@@ -127,7 +127,10 @@ func GracefulStopProcess(sendSignalFn func(sig syscall.Signal) error, isAliveFn 
 	return false, nil
 }
 
+const miniDockerNatChain = "MD"
+
 // CleanupPortMapping 清理端口映射的 iptables 规则
+// 对齐 Docker: 端口映射 DNAT 规则在 MD 专用链中，而非系统 PREROUTING 链
 func CleanupPortMapping(portMap string, containerIP string) {
 	parts := strings.Split(portMap, ":")
 	if len(parts) != 2 {
@@ -136,17 +139,23 @@ func CleanupPortMapping(portMap string, containerIP string) {
 	hostPort := parts[0]
 	containerPort := parts[1]
 
-	cmd := exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
+	// 优先使用 iptables-legacy（在 WSL2 等 iptables-nft 环境下更可靠）
+	ipt := "iptables"
+	if p, err := exec.LookPath("iptables-legacy"); err == nil {
+		ipt = p
+	}
+
+	cmd := exec.Command(ipt, "-t", "nat", "-D", miniDockerNatChain,
 		"-p", "tcp", "--dport", hostPort,
 		"-j", "DNAT", "--to-destination", containerIP+":"+containerPort)
 	_ = cmd.Run()
 
-	cmd = exec.Command("iptables", "-t", "nat", "-D", "OUTPUT",
+	cmd = exec.Command(ipt, "-t", "nat", "-D", "OUTPUT",
 		"-p", "tcp", "--dport", hostPort,
-		"-j", "DNAT", "--to-destination", containerIP+":"+containerPort)
+		"-j", miniDockerNatChain)
 	_ = cmd.Run()
 
-	cmd = exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING",
+	cmd = exec.Command(ipt, "-t", "nat", "-D", "POSTROUTING",
 		"-p", "tcp", "-d", containerIP, "--dport", containerPort,
 		"-j", "MASQUERADE")
 	_ = cmd.Run()

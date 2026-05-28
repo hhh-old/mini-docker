@@ -7,12 +7,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"mini-docker/constants"
 	"mini-docker/libcontainer/configs"
-)
-
-const (
-	// cgroupRoot cgroup 根路径
-	cgroupRoot = "/sys/fs/cgroup"
 )
 
 // Manager cgroup 管理器接口（对标 libcontainer/cgroups.Manager）
@@ -104,14 +100,16 @@ func NewManager(config *configs.Resources, name string) (Manager, error) {
 }
 
 // IsCgroupV2 检测是否使用 cgroup v2
+// /sys/fs/cgroup/cgroup.controllers 是 Linux 内核自己创建的,不是项目创建的，是 Linux 内核自动生成的。
+// 使用 cgroup v1 还是 v2，也是由 Linux 内核（以及系统引导配置）决定的，不是应用程序能选择的
 func IsCgroupV2() bool {
-	_, err := ReadFile(cgroupRoot, "cgroup.controllers")
+	_, err := ReadFile(constants.CgroupRootPath, "cgroup.controllers")
 	return err == nil
 }
 
 // getCgroupPath 获取 cgroup 子系统路径
 func getCgroupPath(subsystem, name string) string {
-	return filepath.Join(cgroupRoot, subsystem, name)
+	return filepath.Join(constants.CgroupRootPath, subsystem, name)
 }
 
 // WriteFile 写入 cgroup 文件

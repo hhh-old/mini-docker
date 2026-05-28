@@ -75,21 +75,24 @@ func LoadSpec(bundlePath string) (*Spec, error) {
 	return &s, nil
 }
 
-// RunConfig 与现有 container.RunConfig 对齐，用于生成 OCI Spec
-type RunConfig struct {
+type SpecConfig struct {
 	Tty           bool
 	Memory        string
 	CPUShares     string
 	Image         string
-	ImageRootFS   string
+	RootFS        string
 	Cmd           []string
 	Volumes       []string
 	Hostname      string
 	Network       string
 	RestartPolicy string
+	OverlayMerged string
+	OverlayUpper  string
+	OverlayWork   string
+	PortMap       string
 }
 
-func DefaultSpec(config *RunConfig) *Spec {
+func DefaultSpec(config *SpecConfig) *Spec {
 	s := &Spec{
 		OCIVersion: CurrentOCIVersion,
 		Process: &Process{
@@ -110,7 +113,7 @@ func DefaultSpec(config *RunConfig) *Spec {
 			},
 		},
 		Root: &Root{
-			Path:     config.ImageRootFS,
+			Path:     config.RootFS,
 			Readonly: false,
 		},
 		Hostname: config.Hostname,
@@ -120,14 +123,8 @@ func DefaultSpec(config *RunConfig) *Spec {
 			{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", "size=67108864"}},
 		},
 		Linux: &Linux{
-			Namespaces: []configs.Namespace{
-				{Type: "pid"},
-				{Type: "network"},
-				{Type: "ipc"},
-				{Type: "uts"},
-				{Type: "mount"},
-			},
-			Resources: &configs.Resources{},
+			Namespaces: buildNamespaces(config.Network),
+			Resources:  &configs.Resources{},
 		},
 		Annotations: map[string]string{
 			"mini-docker.image":          config.Image,
@@ -137,7 +134,7 @@ func DefaultSpec(config *RunConfig) *Spec {
 	}
 
 	if config.Memory != "" {
-		memBytes, err := utils.ParseMemory(config.Memory)
+		memBytes, err := utils.ParseMemory(config.Memory) //调用 utils.ParseMemory() 将字符串转为字节数,后面cgroup要用到字节数单位的内存
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "警告: 解析内存限制失败: %v，将不设置内存限制\n", err)
 		} else {
@@ -170,9 +167,21 @@ func DefaultSpec(config *RunConfig) *Spec {
 		})
 	}
 
+	if config.OverlayMerged != "" {
+		s.Annotations["mini-docker.overlay.merged"] = config.OverlayMerged
+		s.Annotations["mini-docker.overlay.upper"] = config.OverlayUpper
+		s.Annotations["mini-docker.overlay.work"] = config.OverlayWork
+	}
+
+	if config.PortMap != "" {
+		s.Annotations["mini-docker.port-map"] = config.PortMap
+	}
+
 	return s
 }
 
+// parseCPUShares 的上下界 2 ~ 262144 来自 Linux 内核 CFS 调度器对 cpu.shares 的硬性约束（ MIN_SHARES=2 , MAX_SHARES=262144 ），
+// 默认值 1024 来自内核的 NICE_0_LOAD 。在用户态做范围检查是为了避免内核静默裁剪导致用户预期不符。
 func parseCPUShares(s string) uint64 {
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
@@ -185,4 +194,24 @@ func parseCPUShares(s string) uint64 {
 		return 262144
 	}
 	return v
+}
+
+// buildNamespaces 根据网络模式动态构建 namespace 列表（对齐 Docker: --network=host 不创建 network namespace）
+// Docker 行为:
+//   - --network=host: 容器共享宿主机网络栈，不创建 network namespace
+//   - --network=none/bridge/<自定义>: 容器创建独立的 network namespace
+func buildNamespaces(networkMode string) []configs.Namespace {
+	namespaces := []configs.Namespace{
+		{Type: "pid"},
+		{Type: "ipc"},
+		{Type: "uts"},
+		{Type: "mount"},
+	}
+
+	// 对齐 Docker: --network=host 时不创建 network namespace，容器共享宿主机网络栈
+	if networkMode != "host" {
+		namespaces = append([]configs.Namespace{{Type: "network"}}, namespaces...)
+	}
+
+	return namespaces
 }

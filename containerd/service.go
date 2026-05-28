@@ -31,62 +31,24 @@ func NewService() *Service {
 	return &Service{}
 }
 
-type TaskConfig struct {
-	ID            string
-	OCIConfigJSON string
-	RunConfig     *spec.RunConfig
-	PortMap       string
-	Overlay       *types.OverlayDirs
-}
-
-// NewTaskConfigFromInfo 从 ContainerInfo 派生 TaskConfig
-// 统一字段映射，消除 handler 中手动逐字段拷贝的重复逻辑
-func NewTaskConfigFromInfo(info *container.ContainerInfo) *TaskConfig {
-	tc := &TaskConfig{
-		ID: info.ID,
-		RunConfig: &spec.RunConfig{
-			Tty:           info.Tty,
-			Memory:        info.Memory,
-			CPUShares:     info.CPUShares,
-			Image:         info.Image,
-			ImageRootFS:   info.RootFS,
-			Cmd:           info.Cmd,
-			Volumes:       info.Volumes,
-			Hostname:      info.Name,
-			Network:       info.Network,
-			RestartPolicy: info.RestartPolicy,
-		},
-		PortMap: info.PortMap,
-	}
-	if info.OverlayMerged != "" {
-		tc.Overlay = &types.OverlayDirs{
-			Merged: info.OverlayMerged,
-			Upper:  info.OverlayUpper,
-			Work:   info.OverlayWork,
-		}
-	}
-	return tc
-}
-
-// 启动shim进程，启动容器
-func (s *Service) CreateTask(config *TaskConfig) (shimPID int, err error) {
-	if config.ID == "" {
+func (s *Service) CreateTask(info *container.ContainerInfo) (shimPID int, err error) {
+	if info.ID == "" {
 		return 0, fmt.Errorf("容器 ID 不能为空")
 	}
-	bundlePath := filepath.Join(runtimeDir, config.ID, "bundle")
-	ociSpec := buildOCISpec(config)
+	bundlePath := filepath.Join(runtimeDir, info.ID, "bundle")
+	ociSpec := buildOCISpec(info)
 	if err := spec.SaveSpec(ociSpec, bundlePath); err != nil {
 		return 0, fmt.Errorf("保存 config.json 失败: %w", err)
 	}
 	//启动shim进程
 	cmd := exec.Command("/proc/self/exe",
-		"shim", config.ID, bundlePath)
+		"shim", info.ID, bundlePath)
 	cmd.SysProcAttr = newShimSysProcAttr()
 	logDir := filepath.Join(filepath.Dir(constants.DaemonLogPath), "shim")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return 0, fmt.Errorf("创建 shim 日志目录失败: %w", err)
 	}
-	logPath := filepath.Join(logDir, config.ID+".log")
+	logPath := filepath.Join(logDir, info.ID+".log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	//这段代码的作用是重定向 Shim 进程的标准输出（Stdout）和标准错误（Stderr）到指定的日志文件中
 	if err == nil {
@@ -111,7 +73,7 @@ func (s *Service) CreateTask(config *TaskConfig) (shimPID int, err error) {
 
 	shimPID = cmd.Process.Pid
 	//同步等待就绪：调用 waitForSocket 轮询等待 Shim 创建的 Unix 套接字 shim.sock 出现。一旦就绪，说明 Shim 已经成功启动并做好了管理准备，此时才向 Daemon 返回
-	socketPath := filepath.Join(shimDir, config.ID, "shim.sock")
+	socketPath := filepath.Join(shimDir, info.ID, "shim.sock")
 	if err := waitForSocket(socketPath, constants.SocketWaitTimeout); err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -122,53 +84,21 @@ func (s *Service) CreateTask(config *TaskConfig) (shimPID int, err error) {
 }
 
 func (s *Service) KillTask(containerID string, signal syscall.Signal) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	req := types.ShimRequest{Type: "kill", Signal: int(signal)}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("kill 失败: %s", resp.Message)
-	}
-	return nil
+	return shimCall(containerID, types.ShimRequest{Type: "kill", Signal: int(signal)})
 }
 
 // 向指定的 Shim 发送 state 请求，获取容器当前的运行状态（如 running, stopped 等）
+// Shim 不在线时降级为从磁盘加载 state.json
 func (s *Service) GetTaskState(containerID string) (*libcontainer.ContainerState, error) {
 	conn, err := connectShim(containerID)
 	if err != nil {
-		// Shim 不在线时，直接从磁盘加载 state.json
 		return libcontainer.LoadContainerState(containerID)
 	}
-	defer conn.Close()
+	conn.Close()
 
-	req := types.ShimRequest{Type: "state"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return nil, fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("查询状态失败: %s", resp.Message)
-	}
-
-	data, _ := json.Marshal(resp.Data)
 	var state libcontainer.ContainerState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("解析状态失败: %w", err)
+	if err := shimCallWithData(containerID, types.ShimRequest{Type: "state"}, &state); err != nil {
+		return nil, err
 	}
 	return &state, nil
 }
@@ -180,25 +110,11 @@ func (s *Service) GetExitInfo(containerID string) (*ExitInfo, error) {
 	if err != nil {
 		return readExitInfoFromFile(containerID)
 	}
-	defer conn.Close()
+	conn.Close()
 
-	req := types.ShimRequest{Type: "exit_info"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return nil, fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		return nil, fmt.Errorf("%s", resp.Message)
-	}
-
-	data, _ := json.Marshal(resp.Data)
 	var info ExitInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("解析退出信息失败: %w", err)
+	if err := shimCallWithData(containerID, types.ShimRequest{Type: "exit_info"}, &info); err != nil {
+		return nil, err
 	}
 	return &info, nil
 }
@@ -343,47 +259,11 @@ func (s *Service) RestartShim(containerID string, containerPID int) (int, error)
 }
 
 func (s *Service) PauseTask(containerID string) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	req := types.ShimRequest{Type: "pause"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("pause 失败: %s", resp.Message)
-	}
-	return nil
+	return shimCall(containerID, types.ShimRequest{Type: "pause"})
 }
 
 func (s *Service) ResumeTask(containerID string) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	req := types.ShimRequest{Type: "unpause"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("unpause 失败: %s", resp.Message)
-	}
-	return nil
+	return shimCall(containerID, types.ShimRequest{Type: "unpause"})
 }
 
 // WaitForCreate 等待容器创建完成（对齐 Docker: create 与 start 分离）
@@ -408,25 +288,7 @@ func (s *Service) WaitForCreate(containerID string, timeout time.Duration) (int,
 
 // StartTask 通知 shim 执行 runtime start（对齐 Docker: Daemon → shim → runc start）
 func (s *Service) StartTask(containerID string) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	req := types.ShimRequest{Type: "start"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送 start 请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取 start 响应失败: %w", err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("start 失败: %s", resp.Message)
-	}
-	return nil
+	return shimCall(containerID, types.ShimRequest{Type: "start"})
 }
 
 func (s *Service) ExecTaskStream(containerID string, args []string, tty bool) (net.Conn, error) {
@@ -482,25 +344,7 @@ func (s *Service) AttachTask(containerID string) (net.Conn, error) {
 }
 
 func (s *Service) ResizeTask(containerID string, rows, cols uint16) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	req := types.ShimRequest{Type: "resize", Rows: rows, Cols: cols}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送 resize 请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取 resize 响应失败: %w", err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("resize 失败: %s", resp.Message)
-	}
-	return nil
+	return shimCall(containerID, types.ShimRequest{Type: "resize", Rows: rows, Cols: cols})
 }
 
 // ListTasks 扫描 runtime 目录，列出所有容器任务的状态
@@ -538,6 +382,55 @@ func connectShim(containerID string) (net.Conn, error) {
 	return conn, nil
 }
 
+// shimCall 向 shim 发送请求并等待响应，仅检查 Success 字段
+func shimCall(containerID string, req types.ShimRequest) error {
+	conn, err := connectShim(containerID)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("发送%s请求失败: %w", req.Type, err)
+	}
+
+	var resp types.ShimResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return fmt.Errorf("读取%s响应失败: %w", req.Type, err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s失败: %s", req.Type, resp.Message)
+	}
+	return nil
+}
+
+// shimCallWithData 向 shim 发送请求，成功时将 resp.Data 反序列化到 result
+func shimCallWithData(containerID string, req types.ShimRequest, result any) error {
+	conn, err := connectShim(containerID)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("发送%s请求失败: %w", req.Type, err)
+	}
+
+	var resp types.ShimResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return fmt.Errorf("读取%s响应失败: %w", req.Type, err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s失败: %s", req.Type, resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	if err := json.Unmarshal(data, result); err != nil {
+		return fmt.Errorf("解析%s数据失败: %w", req.Type, err)
+	}
+	return nil
+}
+
 func readExitInfoFromFile(containerID string) (*ExitInfo, error) {
 	shimContainerDir := resolveShimDir(containerID)
 	exitPath := filepath.Join(shimContainerDir, "exit.json")
@@ -573,26 +466,23 @@ func waitForSocket(path string, timeout time.Duration) error {
 	return fmt.Errorf("等待 socket %s 超时", path)
 }
 
-func buildOCISpec(config *TaskConfig) *spec.Spec {
-	s := spec.DefaultSpec(config.RunConfig)
-
-	if config.Overlay != nil {
-		if s.Annotations == nil {
-			s.Annotations = make(map[string]string)
-		}
-		s.Annotations["mini-docker.overlay.merged"] = config.Overlay.Merged
-		s.Annotations["mini-docker.overlay.upper"] = config.Overlay.Upper
-		s.Annotations["mini-docker.overlay.work"] = config.Overlay.Work
-	}
-
-	if config.PortMap != "" {
-		if s.Annotations == nil {
-			s.Annotations = make(map[string]string)
-		}
-		s.Annotations["mini-docker.port-map"] = config.PortMap
-	}
-
-	return s
+func buildOCISpec(info *container.ContainerInfo) *spec.Spec {
+	return spec.DefaultSpec(&spec.SpecConfig{
+		Tty:           info.Tty,
+		Memory:        info.Memory,
+		CPUShares:     info.CPUShares,
+		Image:         info.Image,
+		RootFS:        info.RootFS,
+		Cmd:           info.Cmd,
+		Volumes:       info.Volumes,
+		Hostname:      info.Name,
+		Network:       info.Network,
+		RestartPolicy: info.RestartPolicy,
+		OverlayMerged: info.OverlayMerged,
+		OverlayUpper:  info.OverlayUpper,
+		OverlayWork:   info.OverlayWork,
+		PortMap:       info.PortMap,
+	})
 }
 
 func IsShimAlive(containerID string) bool {

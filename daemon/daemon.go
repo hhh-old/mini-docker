@@ -126,6 +126,11 @@ func (d *Daemon) Start() error {
 
 	log.Printf("Daemon 启动成功，监听 %s (PID: %d)\n", SocketPath, os.Getpid())
 
+	// 确保默认网络存在（对齐 Docker: dockerd 启动时自动创建 bridge 网络）
+	if err := network.EnsureDefaultNetwork(); err != nil {
+		log.Printf("警告: 创建默认网络失败: %v\n", err)
+	}
+
 	// 恢复已有容器的管理（Daemon 重启后）
 	d.restoreContainers()
 
@@ -160,6 +165,9 @@ func (d *Daemon) Stop() {
 	if d.listener != nil {
 		d.listener.Close()
 	}
+	// 对齐 Docker: Daemon 停止时清理 iptables 规则
+	// Docker 在 dockerd 停止时清理 DOCKER 链，mini-docker 清理 MINI-DOCKER 链
+	network.CleanupAllIptables()
 	os.Remove(SocketPath)
 	os.Remove(DaemonPidFile)
 	log.Println("Daemon 已停止")

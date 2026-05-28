@@ -66,7 +66,7 @@ package container
 
   1. 用户执行: mini-docker run -m 100m myimage /bin/sh
      ↓
-  2. main.go 解析参数，构造 RunConfig
+  2. main.go 解析参数，构造 ContainerInfo
      ↓
   3. Daemon handler.runWithID() 被调用:
      a. 准备 RootFS 路径
@@ -103,7 +103,7 @@ package container
   docker ps              →  container.ListContainers()   →  读取 JSON 元数据
   docker pull            →  image.Pull()                →  创建 rootfs 目录
   docker images          →  image.ListImages()          →  读取 JSON 元数据
-  docker network create  →  network.Create()            →  ip link add bridge
+  docker network create  →  network.CreateNetwork()    →  ip link add bridge
   -m 100m                →  cgroup.setMemoryLimit()      →  memory.limit_in_bytes
   --cpu-shares 512       →  cgroup.setCpuShares()        →  cpu.shares
   docker pause           →  handler.handlePause()        →  shim → libcontainer.Pause → cgroup.Freeze

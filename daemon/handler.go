@@ -39,7 +39,6 @@ import (
 	"mini-docker/builder"
 	"mini-docker/constants"
 	"mini-docker/container"
-	"mini-docker/containerd"
 	"mini-docker/image"
 	"mini-docker/libcontainer"
 	"mini-docker/network"
@@ -229,7 +228,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		return Response{Success: false, Message: fmt.Sprintf("创建 OverlayFS 目录失败: %v", err)}
 	}
 
-	// 先构建 ContainerInfo（持久化的真相来源），再从它派生 TaskConfig
+	// 先构建 ContainerInfo（持久化的真相来源）
 	// 运行时字段（Pid、网络信息）在后续步骤中补全
 	containerInfo := &container.ContainerInfo{
 		ID:                containerID,
@@ -257,10 +256,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		CPUShares:         cpuShares,
 	}
 
-	// 从 ContainerInfo 派生 TaskConfig，统一字段映射，避免手动逐字段拷贝
-	taskConfig := containerd.NewTaskConfigFromInfo(containerInfo)
-
-	shimPID, err := d.service.CreateTask(taskConfig)
+	shimPID, err := d.service.CreateTask(containerInfo)
 	if err != nil {
 		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
@@ -283,9 +279,21 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 	//需要 root 权限 		网络配置需要特权操作，daemon 通常以 root 运行
 	//需要全局视点 		IP 分配、端口映射需要跨容器协调，daemon 有全局状态
 	//Docker 的设计 		libnetwork 运行在 dockerd 中，containerd 只负责生命周期
+
+	// 对齐 Docker: 不指定 --network 时自动连接默认 bridge 网络
+	// Docker 的行为: docker run busybox → 自动连接到 bridge 网络（docker0 网桥）
+	// 指定 --network=none 时跳过网络设置（创建独立 netns 但不连接任何网络）
+	// 指定 --network=host 时跳过网络设置（共享宿主机网络栈，spec 中已不含 network namespace）
+	effectiveNetName := netName
+	if effectiveNetName == "" {
+		effectiveNetName = network.DefaultNetworkName
+	} else if effectiveNetName == "none" || effectiveNetName == "host" {
+		effectiveNetName = ""
+	}
+
 	var netMgr network.Manager
-	if containerPid > 0 && netName != "" {
-		nm := &network.NetworkManager{NetworkName: netName}
+	if containerPid > 0 && effectiveNetName != "" {
+		nm := &network.NetworkManager{NetworkName: effectiveNetName}
 		if portMap != "" {
 			nm.PortMap = portMap
 		}
@@ -296,8 +304,22 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		}
 	}
 
+	// 对齐 Docker: --network=none 时启用容器内的 loopback 接口
+	// Docker 行为: --network=none 创建独立 netns，但只启用 lo 接口，不创建 veth pair
+	// 之前跳过 Connect() 导致 lo 处于 DOWN 状态，容器内本地 socket 通信（如某些数据库）会失败
+	if containerPid > 0 && netName == "none" {
+		network.EnableLoopback(containerPid)
+	}
+
 	// 补全运行时字段
 	containerInfo.Pid = containerPid
+	// 对齐 Docker: Network 字段保存用户指定的网络模式（host/none/bridge/自定义），
+	// 而非 effectiveNetName（内部使用的实际网络名），
+	// 这样容器重启时可以正确恢复网络模式
+	containerInfo.Network = netName
+	if netName == "" {
+		containerInfo.Network = network.DefaultNetworkName
+	}
 	if netMgr != nil {
 		containerInfo.VethHost = netMgr.GetVethHost()
 		containerInfo.ContainerIP = netMgr.GetContainerIP()
@@ -669,8 +691,7 @@ func (d *Daemon) handleNetworkCreate(req Request) Response {
 		return Response{Success: false, Message: "需要指定网络名称"}
 	}
 
-	netMgr := &network.NetworkManager{}
-	err := netMgr.Create(name)
+	err := network.CreateNetwork(name)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("创建网络失败: %v", err)}
 	}
@@ -679,8 +700,7 @@ func (d *Daemon) handleNetworkCreate(req Request) Response {
 }
 
 func (d *Daemon) handleNetworkList(req Request) Response {
-	netMgr := &network.NetworkManager{}
-	nets, err := netMgr.List()
+	nets, err := network.ListNetworks()
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("列出网络失败: %v", err)}
 	}
@@ -693,8 +713,7 @@ func (d *Daemon) handleNetworkDelete(req Request) Response {
 		return Response{Success: false, Message: "需要指定网络名称"}
 	}
 
-	netMgr := &network.NetworkManager{}
-	err := netMgr.Delete(name)
+	err := network.DeleteNetwork(name)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("删除网络失败: %v", err)}
 	}

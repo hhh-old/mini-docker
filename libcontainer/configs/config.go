@@ -87,7 +87,7 @@ func NamespaceTypeToCloneFlag(nsType string) uintptr {
 	case "user":
 		return syscall.CLONE_NEWUSER
 	case "cgroup":
-		return syscall.CLONE_NEWCGROUP
+		return 0x02000000 // syscall.CLONE_NEWCGROUP
 	default:
 		return 0
 	}
