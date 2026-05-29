@@ -31,12 +31,13 @@ type linuxContainer struct {
 // 序列化到 state.json 时的唯一入口，确保 BundlePath/Rootfs/OCIVersion 等配置字段不遗漏
 func (c *linuxContainer) toContainerState() *ContainerState {
 	return &ContainerState{
-		OCIVersion: c.runState.OCIVersion,
-		ID:         c.runState.ID,
-		Pid:        c.runState.Pid,
-		Bundle:     c.config.BundlePath,
-		Rootfs:     c.config.Rootfs,
-		Status:     c.runState.Status,
+		OCIVersion:  c.runState.OCIVersion,
+		ID:          c.runState.ID,
+		Pid:         c.runState.Pid,
+		Bundle:      c.config.BundlePath,
+		Rootfs:      c.config.Rootfs,
+		Status:      c.runState.Status,
+		Annotations: c.config.Annotations,
 	}
 }
 
@@ -90,15 +91,22 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 		bundlePath = getContainerDir(id)
 	}
 
+	var config *configs.Config
 	ociSpec, err := spec.LoadSpec(bundlePath)
 	if err != nil {
-		return nil, fmt.Errorf("加载 OCI Spec 失败: %w", err)
-	}
-
-	config := spec.SpecToConfig(ociSpec, bundlePath)
-	config.BundlePath = bundlePath
-	if state.Rootfs != "" {
-		config.Rootfs = state.Rootfs
+		if state.Status != StatusStopped {
+			return nil, fmt.Errorf("加载 OCI Spec 失败: %w", err)
+		}
+		config = &configs.Config{
+			BundlePath: bundlePath,
+			Rootfs:     state.Rootfs,
+		}
+	} else {
+		config = spec.SpecToConfig(ociSpec, bundlePath)
+		config.BundlePath = bundlePath
+		if state.Rootfs != "" {
+			config.Rootfs = state.Rootfs
+		}
 	}
 
 	lc := &linuxContainer{
@@ -133,6 +141,7 @@ func (c *linuxContainer) Status() (Status, error) {
 		if c.runState.Pid > 0 {
 			if err := syscall.Kill(c.runState.Pid, 0); err != nil {
 				c.runState.Status = StatusStopped
+				saveContainerState(c.toContainerState())
 			}
 		}
 	}
@@ -157,8 +166,8 @@ func (c *linuxContainer) Start(process *Process) error {
 
 func (c *linuxContainer) startLocked(process *Process) error {
 
-	if c.runState.Status == StatusRunning {
-		return fmt.Errorf("容器已在运行")
+	if c.runState.Status != StatusCreated || c.runState.Pid != 0 {
+		return fmt.Errorf("容器只能在初始状态启动，当前: %s", c.runState.Status)
 	}
 
 	// FIFO 创建在 bundle 目录（宿主机文件系统），而非 rootfs 内部
@@ -174,6 +183,7 @@ func (c *linuxContainer) startLocked(process *Process) error {
 	// 创建 ready 信号 pipe,用来做子进程和当前进程的同步工作，当 cmd.Start()子进程做好前置工作以后给当前进程发送一个消息
 	pipeRead, pipeWrite, err := os.Pipe()
 	if err != nil {
+		os.Remove(fifoPath)
 		return fmt.Errorf("创建 pipe 失败: %w", err)
 	}
 
@@ -319,9 +329,9 @@ func (c *linuxContainer) Destroy() error {
 	defer c.mu.Unlock()
 
 	if c.runState.Status == StatusRunning || c.runState.Status == StatusCreated || c.runState.Status == StatusPaused {
-		c.signalLocked(int(syscall.SIGKILL)) //给容器init机场呢发送一个杀死信号
+		c.signalLocked(int(syscall.SIGKILL)) //给容器init进程发送一个杀死信号
 		if c.runState.Pid > 0 {
-			c.waitForProcessExit(c.runState.Pid, 10000)
+			WaitForProcessExit(c.runState.Pid, 10000)
 		}
 	}
 
@@ -332,15 +342,17 @@ func (c *linuxContainer) Destroy() error {
 	return removeContainerState(c.runState.ID)
 }
 
-func (c *linuxContainer) waitForProcessExit(pid int, timeoutMs int) {
+// WaitForProcessExit 轮询等待指定进程退出（对齐 runc 的 waitForExit）
+// 通过 syscall.Kill(pid, 0) 探测进程是否存在，信号 0 不会实际发送
+func WaitForProcessExit(pid int, timeoutMs int) {
 	deadline := timeoutMs / 10
 	for i := 0; i < deadline; i++ {
-		if err := syscall.Kill(pid, 0); err != nil { //发一个探针消息过去查看是否进程已经终止， syscall.Kill(pid, 0) 中，信号参数 0 是一个特殊的保留值，它的含义是：不发送任何实际信号，仅检查目标进程是否存在以及当前用户是否有权限向其发送信号
+		if err := syscall.Kill(pid, 0); err != nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	log.Printf("警告: 等待容器进程 %d 退出超时\n", pid)
+	log.Printf("警告: 等待进程 %d 退出超时\n", pid)
 }
 
 func (c *linuxContainer) Pause() error {
@@ -386,6 +398,9 @@ func (c *linuxContainer) Signal(sig int) error {
 func (c *linuxContainer) signalLocked(sig int) error {
 	if c.runState.Pid <= 0 {
 		return fmt.Errorf("容器 PID 无效")
+	}
+	if c.runState.Status == StatusStopped {
+		return fmt.Errorf("容器未在运行")
 	}
 	//kill 在 Linux 中不仅仅是"杀死"进程，它的本质是 向进程发送信号 。不同信号有不同效果：
 	//信号	    编号	效果

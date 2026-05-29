@@ -4,25 +4,26 @@ package configs
 
 // Config 容器完整配置（对标 OCI runtime-spec + libcontainer 扩展）
 type Config struct {
-	OCIVersion      string        `json:"oci_version,omitempty"`
-	BundlePath      string        `json:"bundle_path,omitempty"`
-	Rootfs          string        `json:"rootfs"`
-	ReadonlyRootfs  bool          `json:"readonly_rootfs,omitempty"`
-	Hostname        string        `json:"hostname,omitempty"`
-	Args            []string      `json:"args,omitempty"`
-	Env             []string      `json:"env,omitempty"`
-	Cwd             string        `json:"cwd,omitempty"`
-	User            string        `json:"user,omitempty"`
-	Namespaces      Namespaces    `json:"namespaces"`
-	Capabilities    *Capabilities `json:"capabilities,omitempty"`
-	Networks        []*Network    `json:"networks,omitempty"`
-	Routes          []*Route      `json:"routes,omitempty"`
-	Cgroups         *Resources    `json:"cgroups,omitempty"`
-	Mounts          []*Mount      `json:"mounts,omitempty"`
-	MaskedPaths     []string      `json:"masked_paths,omitempty"`
-	ReadonlyPaths   []string      `json:"readonly_paths,omitempty"`
-	Seccomp         *Seccomp      `json:"seccomp,omitempty"`
-	NoNewPrivileges bool          `json:"no_new_privileges,omitempty"`
+	OCIVersion      string            `json:"oci_version,omitempty"`
+	BundlePath      string            `json:"bundle_path,omitempty"`
+	Rootfs          string            `json:"rootfs"`
+	ReadonlyRootfs  bool              `json:"readonly_rootfs,omitempty"`
+	Hostname        string            `json:"hostname,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	Env             []string          `json:"env,omitempty"`
+	Cwd             string            `json:"cwd,omitempty"`
+	User            string            `json:"user,omitempty"`
+	Namespaces      Namespaces        `json:"namespaces"`
+	Capabilities    *Capabilities     `json:"capabilities,omitempty"`
+	Networks        []*Network        `json:"networks,omitempty"`
+	Routes          []*Route          `json:"routes,omitempty"`
+	Cgroups         *Resources        `json:"cgroups,omitempty"`
+	Mounts          []*Mount          `json:"mounts,omitempty"`
+	MaskedPaths     []string          `json:"masked_paths,omitempty"`
+	ReadonlyPaths   []string          `json:"readonly_paths,omitempty"`
+	Seccomp         *Seccomp          `json:"seccomp,omitempty"`
+	NoNewPrivileges bool              `json:"no_new_privileges,omitempty"`
+	Annotations     map[string]string `json:"annotations,omitempty"`
 }
 
 type Namespaces []Namespace

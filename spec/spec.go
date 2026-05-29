@@ -220,8 +220,9 @@ func buildNamespaces(networkMode string) []configs.Namespace {
 
 func SpecToConfig(s *Spec, bundlePath string) *configs.Config {
 	config := &configs.Config{
-		OCIVersion: s.OCIVersion,
-		Hostname:   s.Hostname,
+		OCIVersion:  s.OCIVersion,
+		Hostname:    s.Hostname,
+		Annotations: s.Annotations,
 	}
 
 	if s.Root != nil {

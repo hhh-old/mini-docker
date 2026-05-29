@@ -18,18 +18,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"mini-docker/constants"
 	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/configs"
 	"mini-docker/spec"
-
-	"golang.org/x/sys/unix"
 )
+
+var containerIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+
+func validateContainerID(id string) {
+	if !containerIDPattern.MatchString(id) {
+		fmt.Fprintf(os.Stderr, "错误: 容器 ID 格式无效，必须匹配 [a-zA-Z0-9][a-zA-Z0-9_.-]+\n")
+		os.Exit(1)
+	}
+}
 
 // Create 对标 runc create：创建容器环境（namespace + rootfs），但不启动用户进程
 func Create(args []string) {
@@ -39,6 +46,7 @@ func Create(args []string) {
 	}
 
 	containerID := args[0]
+	validateContainerID(containerID)
 	bundlePath := ""
 	consolePath := "" //PTY 设备路径,TTY模式下shim创建的从设备
 	stdoutFd := -1    //
@@ -161,6 +169,7 @@ func Start(args []string) {
 	}
 
 	containerID := args[0]
+	validateContainerID(containerID)
 
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
@@ -190,6 +199,7 @@ func Kill(args []string) {
 	}
 
 	containerID := args[0]
+	validateContainerID(containerID)
 	signalStr := args[1]
 
 	sig, err := parseSignal(signalStr)
@@ -204,26 +214,36 @@ func Kill(args []string) {
 		os.Exit(1)
 	}
 
+	container.Status()
+
 	if err := container.Signal(int(sig)); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 发送信号失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	if sig == syscall.SIGKILL || sig == syscall.SIGTERM {
-		waitForExit(container.Pid(), 5000)
+		libcontainer.WaitForProcessExit(container.Pid(), 5000)
 	}
 
 	os.Exit(0)
 }
 
 // Delete 对标 runc delete：删除容器，清理资源
+// OCI 规范要求：对 running/paused 容器必须带 --force 才能删除（先 kill 再清理）
 func Delete(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime delete <id>\n")
+		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime delete <id> [--force]\n")
 		os.Exit(1)
 	}
 
 	containerID := args[0]
+	validateContainerID(containerID)
+	force := false
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--force" {
+			force = true
+		}
+	}
 
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
@@ -232,6 +252,12 @@ func Delete(args []string) {
 			os.RemoveAll(stateDir)
 		}
 		os.Exit(0)
+	}
+
+	status, _ := container.Status()
+	if !force && (status == libcontainer.StatusRunning || status == libcontainer.StatusPaused) {
+		fmt.Fprintf(os.Stderr, "错误: 容器正在运行，请先停止或使用 --force\n")
+		os.Exit(1)
 	}
 
 	if err := container.Destroy(); err != nil {
@@ -251,12 +277,15 @@ func State(args []string) {
 	}
 
 	containerID := args[0]
+	validateContainerID(containerID)
 
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 加载容器失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	container.Status()
 
 	state := container.State()
 
@@ -270,16 +299,6 @@ func convertToConfig(s *spec.Spec, bundlePath string) *configs.Config {
 	return spec.SpecToConfig(s, bundlePath)
 }
 
-func waitForExit(pid int, timeoutMs int) {
-	deadline := timeoutMs / 10
-	for i := 0; i < deadline; i++ {
-		if err := unix.Kill(pid, 0); err != nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // kill 在 docker 中不仅仅是"杀死"进程，它的本质是 向进程发送信号 。不同信号有不同效果：
 // 信号	    编号	效果
 // SIGTERM	15	优雅终止（进程可以捕获并做清理）
@@ -290,6 +309,9 @@ func waitForExit(pid int, timeoutMs int) {
 // SIGCONT	18	恢复暂停的进程
 func parseSignal(s string) (syscall.Signal, error) {
 	if sig, err := strconv.Atoi(s); err == nil {
+		if sig < 1 || sig > 31 {
+			return 0, fmt.Errorf("信号编号 %d 超出有效范围 (1-31)", sig)
+		}
 		return syscall.Signal(sig), nil
 	}
 	s = strings.ToUpper(s)

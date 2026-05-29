@@ -63,6 +63,9 @@ type Config struct {
 
 	// NoNewPrivileges 是否设置 PR_SET_NO_NEW_PRIVS
 	NoNewPrivileges bool `json:"no_new_privileges,omitempty"`
+
+	// Annotations 容器注解（来自 OCI Spec）
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // Namespaces Namespace 配置集合

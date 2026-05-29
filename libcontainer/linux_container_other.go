@@ -21,6 +21,8 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 	return nil, fmt.Errorf("libcontainer 仅支持 Linux")
 }
 
+func WaitForProcessExit(pid int, timeoutMs int) {}
+
 func (c *linuxContainer) ID() string                         { return c.runState.ID }
 func (c *linuxContainer) Status() (Status, error)            { return c.runState.Status, nil }
 func (c *linuxContainer) Config() configs.Config             { return *c.config }

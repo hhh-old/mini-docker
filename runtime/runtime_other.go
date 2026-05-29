@@ -31,3 +31,13 @@ func State(args []string) {
 	fmt.Fprintln(os.Stderr, "runtime state 仅支持 Linux")
 	os.Exit(1)
 }
+
+func Pause(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime pause 仅支持 Linux")
+	os.Exit(1)
+}
+
+func Resume(args []string) {
+	fmt.Fprintln(os.Stderr, "runtime resume 仅支持 Linux")
+	os.Exit(1)
+}
