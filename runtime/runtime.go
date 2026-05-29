@@ -10,6 +10,7 @@
 // - state:  查询容器状态
 //
 // 使用 libcontainer 库实现核心功能。
+// 这个包是runc的接口层
 package runtime
 
 import (
@@ -161,40 +162,21 @@ func Start(args []string) {
 
 	containerID := args[0]
 
-	// 加载容器
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 加载容器失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 检查状态
 	status, _ := container.Status()
 	if status != libcontainer.StatusCreated {
 		fmt.Fprintf(os.Stderr, "错误: 容器状态必须是 created，当前: %s\n", status)
 		os.Exit(1)
 	}
 
-	// FIFO 创建在 bundle 目录（与 container.Start 中的路径一致）
-	config := container.Config()
-	fifoPath := filepath.Join(config.BundlePath, ".start-fifo")
-
-	// 发送 start 信号（通过 FIFO）
-	f, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 打开 FIFO 失败: %v\n", err)
+	if err := container.ExecStart(); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: 启动容器失败: %v\n", err)
 		os.Exit(1)
-	}
-	if _, err := f.Write([]byte("start\n")); err != nil {
-		f.Close()
-		fmt.Fprintf(os.Stderr, "错误: 写入 FIFO 失败: %v\n", err)
-		os.Exit(1)
-	}
-	f.Close()
-	os.Remove(fifoPath)
-
-	if err := container.SetStatus(libcontainer.StatusRunning); err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 更新容器状态失败: %v\n", err)
 	}
 
 	os.Exit(0)
@@ -261,6 +243,7 @@ func Delete(args []string) {
 }
 
 // State 对标 runc state：查询容器当前状态
+// 对标 OCI runtime-spec Query State：MUST return the state of a container as specified in the State section
 func State(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime state <id>\n")
@@ -275,16 +258,7 @@ func State(args []string) {
 		os.Exit(1)
 	}
 
-	status, _ := container.Status()
-	state := struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-		Pid    int    `json:"pid"`
-	}{
-		ID:     container.ID(),
-		Status: string(status),
-		Pid:    container.Pid(),
-	}
+	state := container.State()
 
 	data, _ := json.MarshalIndent(state, "", "  ")
 	fmt.Println(string(data))
@@ -293,64 +267,7 @@ func State(args []string) {
 
 // convertToConfig 将 OCI Spec 转换为 libcontainer 配置
 func convertToConfig(s *spec.Spec, bundlePath string) *configs.Config {
-	config := &configs.Config{
-		Hostname: s.Hostname,
-	}
-
-	if s.Root != nil {
-		rootfs := s.Root.Path
-		if !filepath.IsAbs(rootfs) {
-			rootfs = filepath.Join(bundlePath, rootfs)
-		}
-		config.Rootfs = filepath.Clean(rootfs)
-		config.ReadonlyRootfs = s.Root.Readonly
-	}
-
-	if s.Process != nil {
-		config.Args = s.Process.Args
-		config.Env = s.Process.Env
-		config.Cwd = s.Process.Cwd
-	}
-
-	if s.Linux != nil {
-		for _, ns := range s.Linux.Namespaces {
-			config.Namespaces = append(config.Namespaces, configs.Namespace{
-				Type: ns.Type,
-				Path: ns.Path,
-			})
-		}
-
-		if s.Linux.Resources != nil {
-			config.Cgroups = &configs.Resources{}
-			if s.Linux.Resources.Memory != nil {
-				config.Cgroups.Memory = &configs.Memory{
-					Limit: s.Linux.Resources.Memory.Limit,
-				}
-			}
-			if s.Linux.Resources.CPU != nil {
-				config.Cgroups.CPU = &configs.CPU{
-					Shares: s.Linux.Resources.CPU.Shares,
-					Cpus:   s.Linux.Resources.CPU.Cpus,
-				}
-			}
-			if s.Linux.Resources.Pids != nil {
-				config.Cgroups.Pids = &configs.Pids{
-					Limit: s.Linux.Resources.Pids.Limit,
-				}
-			}
-		}
-	}
-
-	for _, m := range s.Mounts {
-		config.Mounts = append(config.Mounts, &configs.Mount{
-			Destination: m.Destination,
-			Type:        m.Type,
-			Source:      m.Source,
-			Options:     m.Options,
-		})
-	}
-
-	return config
+	return spec.SpecToConfig(s, bundlePath)
 }
 
 func waitForExit(pid int, timeoutMs int) {
@@ -363,6 +280,14 @@ func waitForExit(pid int, timeoutMs int) {
 	}
 }
 
+// kill 在 docker 中不仅仅是"杀死"进程，它的本质是 向进程发送信号 。不同信号有不同效果：
+// 信号	    编号	效果
+// SIGTERM	15	优雅终止（进程可以捕获并做清理）
+// SIGKILL	9	强制杀死（进程无法捕获，立即终止）
+// SIGHUP	1	挂起（常用于重载配置）
+// SIGINT	2	中断（相当于 Ctrl+C）
+// SIGSTOP	19	暂停进程
+// SIGCONT	18	恢复暂停的进程
 func parseSignal(s string) (syscall.Signal, error) {
 	if sig, err := strconv.Atoi(s); err == nil {
 		return syscall.Signal(sig), nil

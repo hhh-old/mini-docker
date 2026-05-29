@@ -186,8 +186,8 @@ func DeleteNetwork(name string) error {
 	}
 
 	// 检查网络是否还有容器在使用
-	if len(info.Allocated) > 0 {
-		return fmt.Errorf("网络 %s 还有 %d 个容器在使用，请先删除相关容器", name, len(info.Allocated))
+	if len(info.Allocated) > 1 {
+		return fmt.Errorf("网络 %s 还有 %d 个容器在使用，请先删除相关容器", name, len(info.Allocated)-1)
 	}
 
 	// 对齐 Docker: 删除网络时清理该网络的所有 iptables 规则

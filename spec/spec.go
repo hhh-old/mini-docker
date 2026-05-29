@@ -15,22 +15,22 @@ import (
 // Spec 对应 OCI runtime-spec 的 config.json
 // 参考: https://github.com/opencontainers/runtime-spec/blob/main/config.md
 type Spec struct {
-	OCIVersion  string            `json:"ociVersion"`
-	Process     *Process          `json:"process"`
-	Root        *Root             `json:"root"`
+	OCIVersion  string            `json:"ociVersion"` //所遵循的 OCI 运行时规范版本
+	Process     *Process          `json:"process"`    //定义容器启动时要执行的进程
+	Root        *Root             `json:"root"`       //指定容器根文件系统的路径
 	Hostname    string            `json:"hostname"`
 	Mounts      []configs.Mount   `json:"mounts"`
-	Linux       *Linux            `json:"linux,omitempty"`
+	Linux       *Linux            `json:"linux,omitempty"` //平台相关配置
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type Process struct {
 	Terminal     bool                  `json:"terminal"`
-	User         User                  `json:"user"`
+	User         User                  `json:"user"` //运行进程的用户和组
 	Args         []string              `json:"args"` //要执行的命令及其参数，index为0的是命令
 	Env          []string              `json:"env"`
-	Cwd          string                `json:"cwd"` //Cwd 是 Current Working Directory （当前工作目录）的缩写
-	Capabilities *configs.Capabilities `json:"capabilities,omitempty"`
+	Cwd          string                `json:"cwd"`                    //Cwd 是 Current Working Directory （当前工作目录）的缩写
+	Capabilities *configs.Capabilities `json:"capabilities,omitempty"` //进程拥有的 Linux 权限子集
 }
 
 type User struct {
@@ -90,6 +90,7 @@ type SpecConfig struct {
 	OverlayUpper  string
 	OverlayWork   string
 	PortMap       string
+	CgroupName    string
 }
 
 func DefaultSpec(config *SpecConfig) *Spec {
@@ -130,6 +131,7 @@ func DefaultSpec(config *SpecConfig) *Spec {
 			"mini-docker.image":          config.Image,
 			"mini-docker.restart-policy": config.RestartPolicy,
 			"mini-docker.network":        config.Network,
+			"mini-docker.cgroup-name":    config.CgroupName,
 		},
 	}
 
@@ -214,4 +216,73 @@ func buildNamespaces(networkMode string) []configs.Namespace {
 	}
 
 	return namespaces
+}
+
+func SpecToConfig(s *Spec, bundlePath string) *configs.Config {
+	config := &configs.Config{
+		OCIVersion: s.OCIVersion,
+		Hostname:   s.Hostname,
+	}
+
+	if s.Root != nil {
+		rootfs := s.Root.Path
+		if !filepath.IsAbs(rootfs) {
+			rootfs = filepath.Join(bundlePath, rootfs)
+		}
+		config.Rootfs = filepath.Clean(rootfs)
+		config.ReadonlyRootfs = s.Root.Readonly
+	}
+
+	if s.Process != nil {
+		config.Args = s.Process.Args
+		config.Env = s.Process.Env
+		config.Cwd = s.Process.Cwd
+	}
+
+	if s.Linux != nil {
+		for _, ns := range s.Linux.Namespaces {
+			config.Namespaces = append(config.Namespaces, configs.Namespace{
+				Type: ns.Type,
+				Path: ns.Path,
+			})
+		}
+
+		if s.Linux.Resources != nil {
+			config.Cgroups = &configs.Resources{}
+			if s.Linux.Resources.Memory != nil {
+				config.Cgroups.Memory = &configs.Memory{
+					Limit: s.Linux.Resources.Memory.Limit,
+				}
+			}
+			if s.Linux.Resources.CPU != nil {
+				config.Cgroups.CPU = &configs.CPU{
+					Shares: s.Linux.Resources.CPU.Shares,
+					Cpus:   s.Linux.Resources.CPU.Cpus,
+				}
+			}
+			if s.Linux.Resources.Pids != nil {
+				config.Cgroups.Pids = &configs.Pids{
+					Limit: s.Linux.Resources.Pids.Limit,
+				}
+			}
+		}
+	}
+
+	if cgroupName, ok := s.Annotations["mini-docker.cgroup-name"]; ok && cgroupName != "" {
+		if config.Cgroups == nil {
+			config.Cgroups = &configs.Resources{}
+		}
+		config.Cgroups.CgroupName = cgroupName
+	}
+
+	for _, m := range s.Mounts {
+		config.Mounts = append(config.Mounts, &configs.Mount{
+			Destination: m.Destination,
+			Type:        m.Type,
+			Source:      m.Source,
+			Options:     m.Options,
+		})
+	}
+
+	return config
 }

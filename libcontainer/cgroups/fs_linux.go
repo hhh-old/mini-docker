@@ -21,10 +21,20 @@ type managerV1 struct {
 }
 
 func newManagerV1(config *configs.Resources) (Manager, error) {
-	return &managerV1{
+	m := &managerV1{
 		config: config,
 		paths:  make(map[string]string),
-	}, nil
+	}
+	name := config.CgroupName
+	if name != "" {
+		for _, subsys := range []string{"memory", "cpu", "pids", "freezer"} {
+			cgPath := getCgroupPath(subsys, name)
+			if _, err := os.Stat(cgPath); err == nil {
+				m.paths[subsys] = cgPath
+			}
+		}
+	}
+	return m, nil
 }
 
 // Apply 在 cgroup v1 中为每个子系统创建独立目录，写入资源限制，并将进程加入各子系统
@@ -58,6 +68,11 @@ func (m *managerV1) Apply(pid int) error {
 			if err := WriteFile(memPath, "memory.limit_in_bytes", formatMemory(*m.config.Memory.Limit)); err != nil {
 				return fmt.Errorf("设置内存限制失败: %w", err)
 			}
+			memswLimit := *m.config.Memory.Limit * 2
+			if m.config.Memory.Swap != nil {
+				memswLimit = *m.config.Memory.Limit + *m.config.Memory.Swap
+			}
+			_ = WriteFile(memPath, "memory.memsw.limit_in_bytes", formatMemory(memswLimit))
 		}
 		if err := WriteFile(memPath, "cgroup.procs", pidStr); err != nil {
 			return fmt.Errorf("添加进程到 memory cgroup 失败: %w", err)
@@ -120,8 +135,8 @@ func (m *managerV1) Apply(pid int) error {
 			cpus := *m.config.CPU.Cpus
 			cfsQuota := calculateCfsQuota(cpus, cfsPeriod)
 			if cfsQuota > 0 {
-				WriteFile(cpuPath, "cfs_period_us", strconv.FormatInt(cfsPeriod, 10))
-				WriteFile(cpuPath, "cfs_quota_us", strconv.FormatInt(cfsQuota, 10))
+				WriteFile(cpuPath, "cpu.cfs_period_us", strconv.FormatInt(cfsPeriod, 10))
+				WriteFile(cpuPath, "cpu.cfs_quota_us", strconv.FormatInt(cfsQuota, 10))
 			}
 		}
 		if err := WriteFile(cpuPath, "cgroup.procs", pidStr); err != nil {
@@ -177,10 +192,13 @@ func (m *managerV1) Apply(pid int) error {
 }
 
 func (m *managerV1) Destroy() error {
+	var firstErr error
 	for _, path := range m.paths {
-		unix.Rmdir(path)
+		if err := unix.Rmdir(path); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("删除 cgroup %s 失败: %w", path, err)
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (m *managerV1) GetPaths() map[string]string {
@@ -211,19 +229,18 @@ func (m *managerV1) GetStats() (*Stats, error) {
 // cgroup freezer 的机制：内核暂停调度该 cgroup 中的所有进程，它们不会消耗任何 CPU 时间
 // 这比 SIGSTOP 更优雅，因为 freezer 是 cgroup 级别操作，不需要逐个发送信号
 func (m *managerV1) Freeze() error {
-	name := m.config.CgroupName
-	freezerPath := getCgroupPath("freezer", name)
-	if err := mkdirAll(freezerPath); err != nil {
-		return err
+	freezerPath, ok := m.paths["freezer"]
+	if !ok {
+		return fmt.Errorf("freezer cgroup 未初始化")
 	}
-	// freezer.state 的值：FROZEN（冻结）、THAWED（解冻）、FREEZING（正在冻结中）
 	return WriteFile(freezerPath, "freezer.state", "FROZEN")
 }
 
-// Thaw 解冻容器内所有进程（对应 v2 的 cgroup.freeze=0，对应 Docker 的 unpause）
 func (m *managerV1) Thaw() error {
-	name := m.config.CgroupName
-	freezerPath := getCgroupPath("freezer", name)
+	freezerPath, ok := m.paths["freezer"]
+	if !ok {
+		return fmt.Errorf("freezer cgroup 未初始化")
+	}
 	return WriteFile(freezerPath, "freezer.state", "THAWED")
 }
 

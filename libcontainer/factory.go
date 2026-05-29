@@ -13,15 +13,16 @@ const (
 	StateDir = constants.RuntimeDir
 )
 
-// ContainerState 容器持久化状态（统一存储，对标 Docker/runc 的 state.json）
-// 合并了原 libcontainer.ContainerState 和 spec.State 的职责，
-// 消除两者写入同一 state.json 文件但结构不同导致的覆盖风险。
+// 存储位置 ： /var/lib/mini-docker/runtime/<containerID>/state.json
 // 对齐 Docker: runc 的 state.json 是运行时状态的唯一来源
+// 记录容器进程的 PID、运行状态（created/running/stopped）、bundle 路径 等纯运行时信息。这是容器运行时状态的"唯一来源"
+// 对标 OCI runtime-spec State 定义：ociVersion/id/status/pid/bundle/annotations 为 REQUIRED 字段
+// 由于像 runc 这样的 OCI 运行时在宿主机上是无状态的命令行工具（它不是一个一直运行的守护进程，执行完 runc create 后进程就退出了，linuxContainer对象也消亡了），为了让后续的 runc start、runc kill、runc delete 依然能找到这个容器，它必须在宿主机上找个地方把容器的动态运行状态存起来
 type ContainerState struct {
 	OCIVersion  string            `json:"ociVersion"`
 	ID          string            `json:"id"`
 	Pid         int               `json:"pid"`
-	BundlePath  string            `json:"bundle_path"`
+	Bundle      string            `json:"bundle"`
 	Rootfs      string            `json:"rootfs"`
 	Status      Status            `json:"status"`
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -37,8 +38,10 @@ func getStatePath(id string) string {
 	return filepath.Join(getContainerDir(id), "state.json")
 }
 
-// saveContainerState 保存容器状态
-func saveContainerState(state *ContainerState) error {
+// saveContainerState 保存容器状态（原子写入，对标 runc saveState）
+// 使用临时文件 + os.Rename 实现原子写入，避免写入过程中崩溃导致 state.json 损坏
+// os.Rename 在同一文件系统上是内核保证的原子操作，不存在中间状态
+func saveContainerState(state *ContainerState) (retErr error) {
 	dir := getContainerDir(state.ID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("创建容器目录失败: %w", err)
@@ -49,7 +52,27 @@ func saveContainerState(state *ContainerState) error {
 		return fmt.Errorf("序列化状态失败: %w", err)
 	}
 
-	return os.WriteFile(getStatePath(state.ID), data, 0644)
+	tmpFile, err := os.CreateTemp(dir, "state-")
+	if err != nil {
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	defer func() {
+		if retErr != nil {
+			tmpFile.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+
+	return os.Rename(tmpName, getStatePath(state.ID))
 }
 
 // loadContainerState 加载容器状态

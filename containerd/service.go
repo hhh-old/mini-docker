@@ -482,6 +482,7 @@ func buildOCISpec(info *container.ContainerInfo) *spec.Spec {
 		OverlayUpper:  info.OverlayUpper,
 		OverlayWork:   info.OverlayWork,
 		PortMap:       info.PortMap,
+		CgroupName:    info.CgroupName,
 	})
 }
 

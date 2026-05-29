@@ -9,10 +9,8 @@ import (
 )
 
 type linuxContainer struct {
-	id     string
-	config *configs.Config
-	pid    int
-	status Status
+	runState containerRunState
+	config   *configs.Config
 }
 
 func newLinuxContainer(id string, config *configs.Config) (*linuxContainer, error) {
@@ -23,12 +21,14 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 	return nil, fmt.Errorf("libcontainer 仅支持 Linux")
 }
 
-func (c *linuxContainer) ID() string                         { return c.id }
-func (c *linuxContainer) Status() (Status, error)            { return c.status, nil }
+func (c *linuxContainer) ID() string                         { return c.runState.ID }
+func (c *linuxContainer) Status() (Status, error)            { return c.runState.Status, nil }
 func (c *linuxContainer) Config() configs.Config             { return *c.config }
-func (c *linuxContainer) Pid() int                           { return c.pid }
+func (c *linuxContainer) Pid() int                           { return c.runState.Pid }
+func (c *linuxContainer) State() *ContainerState             { return nil }
 func (c *linuxContainer) Start(process *Process) error       { return fmt.Errorf("不支持") }
 func (c *linuxContainer) Run(process *Process) error         { return fmt.Errorf("不支持") }
+func (c *linuxContainer) ExecStart() error                   { return fmt.Errorf("不支持") }
 func (c *linuxContainer) Destroy() error                     { return fmt.Errorf("不支持") }
 func (c *linuxContainer) Pause() error                       { return fmt.Errorf("不支持") }
 func (c *linuxContainer) Resume() error                      { return fmt.Errorf("不支持") }

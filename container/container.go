@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mini-docker/libcontainer/cgroups"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ const (
 	containerDataDir  = constants.ContainerDataDir
 )
 
+// 存储位置 ： /var/run/mini-docker/<containerID>.json
 type ContainerInfo struct {
 	ID                string   `json:"id"`
 	Name              string   `json:"name"`
@@ -309,23 +311,7 @@ func cleanupOverlay(info *ContainerInfo) {
 }
 
 func cleanupCgroup(cgroupName string) {
-	if cgroupName == "" {
-		return
-	}
-	// cgroup v2: 统一层级 /sys/fs/cgroup/<cgroupName>
-	cgroupV2Path := filepath.Join(constants.CgroupRootPath, cgroupName)
-	if _, err := os.Stat(cgroupV2Path); err == nil {
-		os.RemoveAll(cgroupV2Path)
-		return
-	}
-	// cgroup v1: 各子系统独立挂载
-	subsystems := []string{"memory", "cpu", "freezer", "pids"}
-	for _, subsys := range subsystems {
-		cgroupPath := filepath.Join(constants.CgroupRootPath, subsys, cgroupName)
-		if _, err := os.Stat(cgroupPath); err == nil {
-			os.RemoveAll(cgroupPath)
-		}
-	}
+	cgroups.RemoveCgroup(cgroupName)
 }
 
 func getContainerInfoPath(containerID string) string {

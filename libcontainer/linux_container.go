@@ -3,7 +3,6 @@
 package libcontainer
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -22,13 +21,29 @@ import (
 
 // linuxContainer Linux 容器实现（对标 libcontainer/container_linux.go）
 type linuxContainer struct {
-	mu      sync.Mutex
-	id      string
-	config  *configs.Config
-	pid     int
-	status  Status
-	cgm     cgroups.Manager
-	initCmd *exec.Cmd
+	mu       sync.Mutex
+	runState containerRunState
+	config   *configs.Config
+	cgm      cgroups.Manager
+}
+
+// toContainerState 从运行时状态 + 配置构造完整的 ContainerState（对标 runc 的 currentState()）
+// 序列化到 state.json 时的唯一入口，确保 BundlePath/Rootfs/OCIVersion 等配置字段不遗漏
+func (c *linuxContainer) toContainerState() *ContainerState {
+	return &ContainerState{
+		OCIVersion: c.runState.OCIVersion,
+		ID:         c.runState.ID,
+		Pid:        c.runState.Pid,
+		Bundle:     c.config.BundlePath,
+		Rootfs:     c.config.Rootfs,
+		Status:     c.runState.Status,
+	}
+}
+
+func (c *linuxContainer) State() *ContainerState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.toContainerState()
 }
 
 func newLinuxContainer(id string, config *configs.Config) (*linuxContainer, error) {
@@ -37,9 +52,12 @@ func newLinuxContainer(id string, config *configs.Config) (*linuxContainer, erro
 	}
 
 	c := &linuxContainer{
-		id:     id,
+		runState: containerRunState{
+			ID:         id,
+			Status:     StatusCreated,
+			OCIVersion: config.OCIVersion,
+		},
 		config: config,
-		status: StatusCreated,
 	}
 
 	if config.Cgroups != nil {
@@ -53,6 +71,7 @@ func newLinuxContainer(id string, config *configs.Config) (*linuxContainer, erro
 	return c, nil
 }
 
+// 使用容器状态持久化文件state.json来恢复出容器对象linuxContainer
 func loadLinuxContainer(id string) (*linuxContainer, error) {
 	state, err := loadContainerState(id)
 	if err != nil {
@@ -66,30 +85,30 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 		}
 	}
 
-	// 从 bundle 路径加载配置，如果没有则从默认目录加载
-	configPath := filepath.Join(getContainerDir(id), "config.json")
-	if state.BundlePath != "" {
-		configPath = filepath.Join(state.BundlePath, "config.json")
+	bundlePath := state.Bundle
+	if bundlePath == "" {
+		bundlePath = getContainerDir(id)
 	}
 
-	configData, err := os.ReadFile(configPath)
+	ociSpec, err := spec.LoadSpec(bundlePath)
 	if err != nil {
-		return nil, fmt.Errorf("读取容器配置失败: %w", err)
+		return nil, fmt.Errorf("加载 OCI Spec 失败: %w", err)
 	}
 
-	var config configs.Config
-	if err := json.Unmarshal(configData, &config); err != nil {
-		return nil, fmt.Errorf("解析容器配置失败: %w", err)
+	config := spec.SpecToConfig(ociSpec, bundlePath)
+	config.BundlePath = bundlePath
+	if state.Rootfs != "" {
+		config.Rootfs = state.Rootfs
 	}
-
-	config.BundlePath = state.BundlePath
-	config.Rootfs = state.Rootfs
 
 	lc := &linuxContainer{
-		id:     id,
-		config: &config,
-		pid:    state.Pid,
-		status: state.Status,
+		runState: containerRunState{
+			ID:         state.ID,
+			Pid:        state.Pid,
+			Status:     state.Status,
+			OCIVersion: state.OCIVersion,
+		},
+		config: config,
 	}
 
 	if config.Cgroups != nil {
@@ -103,18 +122,21 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 }
 
 func (c *linuxContainer) ID() string {
-	return c.id
+	return c.runState.ID
 }
 
+// 调用这个方法来查询、更新容器状态
 func (c *linuxContainer) Status() (Status, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status == StatusRunning || c.status == StatusCreated {
-		if err := syscall.Kill(c.pid, 0); err != nil {
-			c.status = StatusStopped
+	if c.runState.Status == StatusRunning || c.runState.Status == StatusCreated || c.runState.Status == StatusPaused {
+		if c.runState.Pid > 0 {
+			if err := syscall.Kill(c.runState.Pid, 0); err != nil {
+				c.runState.Status = StatusStopped
+			}
 		}
 	}
-	return c.status, nil
+	return c.runState.Status, nil
 }
 
 func (c *linuxContainer) Config() configs.Config {
@@ -124,14 +146,18 @@ func (c *linuxContainer) Config() configs.Config {
 func (c *linuxContainer) Pid() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pid
+	return c.runState.Pid
 }
 
 func (c *linuxContainer) Start(process *Process) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.startLocked(process)
+}
 
-	if c.status == StatusRunning {
+func (c *linuxContainer) startLocked(process *Process) error {
+
+	if c.runState.Status == StatusRunning {
 		return fmt.Errorf("容器已在运行")
 	}
 
@@ -182,8 +208,6 @@ func (c *linuxContainer) Start(process *Process) error {
 		return fmt.Errorf("启动 init 进程失败: %w", err)
 	}
 
-	c.initCmd = cmd
-
 	// 关闭父进程的 pipe 写端
 	pipeWrite.Close()
 
@@ -221,26 +245,18 @@ func (c *linuxContainer) Start(process *Process) error {
 	}
 
 	// 保存容器状态
-	c.pid = cmd.Process.Pid
-	c.status = StatusCreated
+	c.runState.Pid = cmd.Process.Pid
+	c.runState.Status = StatusCreated
 
 	// Apply cgroup（对标 Docker/runc：cgroup 在 create 阶段应用）
 	// 容器进程从第一行代码开始就受 cgroup 约束
 	if c.cgm != nil {
-		if err := c.cgm.Apply(c.pid); err != nil {
+		if err := c.cgm.Apply(c.runState.Pid); err != nil {
 			log.Printf("警告: 应用 cgroup 失败: %v\n", err)
 		}
 	}
 
-	state := &ContainerState{
-		OCIVersion: spec.CurrentOCIVersion,
-		ID:         c.id,
-		Pid:        c.pid,
-		BundlePath: c.config.BundlePath,
-		Rootfs:     c.config.Rootfs,
-		Status:     c.status,
-	}
-	if err := saveContainerState(state); err != nil {
+	if err := saveContainerState(c.toContainerState()); err != nil {
 		return fmt.Errorf("保存容器状态失败: %w", err)
 	}
 
@@ -248,20 +264,34 @@ func (c *linuxContainer) Start(process *Process) error {
 }
 
 func (c *linuxContainer) Run(process *Process) error {
-	// 1. 创建并启动（阻塞在 FIFO）
-	if err := c.Start(process); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.startLocked(process); err != nil {
 		return err
 	}
-
-	// 2. 发送 start 信号
-	return c.sendStartSignal()
+	return c.execStartLocked()
 }
 
-func (c *linuxContainer) sendStartSignal() error {
+// runtime start信号走的路径
+func (c *linuxContainer) ExecStart() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.execStartLocked()
+}
+
+func (c *linuxContainer) execStartLocked() error {
+	if c.runState.Status != StatusCreated {
+		return fmt.Errorf("容器状态必须是 created，当前: %s", c.runState.Status)
+	}
+	return c.sendStartSignalLocked()
+}
+
+func (c *linuxContainer) sendStartSignalLocked() error {
 	// 使用配置中的 BundlePath
 	bundlePath := c.config.BundlePath
 	if bundlePath == "" {
-		bundlePath = getContainerDir(c.id)
+		bundlePath = getContainerDir(c.runState.ID)
 	}
 	fifoPath := filepath.Join(bundlePath, ".start-fifo")
 
@@ -280,53 +310,44 @@ func (c *linuxContainer) sendStartSignal() error {
 	os.Remove(fifoPath)
 
 	// 更新状态
-	c.status = StatusRunning
-	state := &ContainerState{
-		ID:         c.id,
-		Pid:        c.pid,
-		BundlePath: bundlePath,
-		Rootfs:     c.config.Rootfs,
-		Status:     c.status,
-	}
-	return saveContainerState(state)
+	c.runState.Status = StatusRunning
+	return saveContainerState(c.toContainerState())
 }
 
 func (c *linuxContainer) Destroy() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.status == StatusRunning || c.status == StatusCreated {
-		c.Signal(int(syscall.SIGKILL))
-		if c.initCmd != nil {
-			done := make(chan struct{})
-			go func() {
-				c.initCmd.Process.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(10 * time.Second):
-				log.Printf("警告: 等待容器 %s 进程退出超时\n", c.id)
-			}
-		} else {
-			time.Sleep(100 * time.Millisecond)
+	if c.runState.Status == StatusRunning || c.runState.Status == StatusCreated || c.runState.Status == StatusPaused {
+		c.signalLocked(int(syscall.SIGKILL)) //给容器init机场呢发送一个杀死信号
+		if c.runState.Pid > 0 {
+			c.waitForProcessExit(c.runState.Pid, 10000)
 		}
 	}
 
-	// 销毁 cgroup
 	if c.cgm != nil {
 		c.cgm.Destroy()
 	}
 
-	// 删除状态
-	return removeContainerState(c.id)
+	return removeContainerState(c.runState.ID)
+}
+
+func (c *linuxContainer) waitForProcessExit(pid int, timeoutMs int) {
+	deadline := timeoutMs / 10
+	for i := 0; i < deadline; i++ {
+		if err := syscall.Kill(pid, 0); err != nil { //发一个探针消息过去查看是否进程已经终止， syscall.Kill(pid, 0) 中，信号参数 0 是一个特殊的保留值，它的含义是：不发送任何实际信号，仅检查目标进程是否存在以及当前用户是否有权限向其发送信号
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	log.Printf("警告: 等待容器进程 %d 退出超时\n", pid)
 }
 
 func (c *linuxContainer) Pause() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.status != StatusRunning {
+	if c.runState.Status != StatusRunning {
 		return fmt.Errorf("容器未在运行")
 	}
 	if c.cgm == nil {
@@ -335,15 +356,15 @@ func (c *linuxContainer) Pause() error {
 	if err := c.cgm.Freeze(); err != nil {
 		return err
 	}
-	c.status = StatusPaused
-	return nil
+	c.runState.Status = StatusPaused
+	return saveContainerState(c.toContainerState())
 }
 
 func (c *linuxContainer) Resume() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.status != StatusPaused {
+	if c.runState.Status != StatusPaused {
 		return fmt.Errorf("容器未暂停")
 	}
 	if c.cgm == nil {
@@ -352,27 +373,38 @@ func (c *linuxContainer) Resume() error {
 	if err := c.cgm.Thaw(); err != nil {
 		return err
 	}
-	c.status = StatusRunning
-	return nil
+	c.runState.Status = StatusRunning
+	return saveContainerState(c.toContainerState())
 }
 
 func (c *linuxContainer) Signal(sig int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.signalLocked(sig)
+}
 
-	if c.pid <= 0 {
+func (c *linuxContainer) signalLocked(sig int) error {
+	if c.runState.Pid <= 0 {
 		return fmt.Errorf("容器 PID 无效")
 	}
-	return syscall.Kill(c.pid, syscall.Signal(sig))
+	//kill 在 Linux 中不仅仅是"杀死"进程，它的本质是 向进程发送信号 。不同信号有不同效果：
+	//信号	    编号	效果
+	//SIGTERM	15	优雅终止（进程可以捕获并做清理）
+	//SIGKILL	9	强制杀死（进程无法捕获，立即终止）
+	//SIGHUP	1	挂起（常用于重载配置）
+	//SIGINT	2	中断（相当于 Ctrl+C）
+	//SIGSTOP	19	暂停进程
+	//SIGCONT	18	恢复暂停的进程
+	return syscall.Kill(c.runState.Pid, syscall.Signal(sig))
 }
 
 func (c *linuxContainer) Exec(process *Process) error {
 	c.mu.Lock()
-	if c.status != StatusRunning {
+	if c.runState.Status != StatusRunning {
 		c.mu.Unlock()
 		return fmt.Errorf("容器未在运行")
 	}
-	pid := c.pid
+	pid := c.runState.Pid
 	c.mu.Unlock()
 
 	args := []string{
@@ -408,13 +440,23 @@ func (c *linuxContainer) Set(configs.Resources) error {
 func (c *linuxContainer) SetStatus(status Status) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.status = status
-	state := &ContainerState{
-		ID:         c.id,
-		Pid:        c.pid,
-		BundlePath: c.config.BundlePath,
-		Rootfs:     c.config.Rootfs,
-		Status:     c.status,
+	if !isValidTransition(c.runState.Status, status) {
+		return fmt.Errorf("非法状态转换: %s -> %s", c.runState.Status, status)
 	}
-	return saveContainerState(state)
+	c.runState.Status = status
+	return saveContainerState(c.toContainerState())
+}
+
+func isValidTransition(from, to Status) bool {
+	validTransitions := map[Status][]Status{
+		StatusCreated: {StatusRunning, StatusStopped},
+		StatusRunning: {StatusPaused, StatusStopped},
+		StatusPaused:  {StatusRunning, StatusStopped},
+	}
+	for _, allowed := range validTransitions[from] {
+		if allowed == to {
+			return true
+		}
+	}
+	return false
 }

@@ -41,6 +41,7 @@ import (
 	"mini-docker/container"
 	"mini-docker/image"
 	"mini-docker/libcontainer"
+	"mini-docker/libcontainer/cgroups"
 	"mini-docker/network"
 	"mini-docker/utils"
 	"mini-docker/volume"
@@ -258,14 +259,14 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 
 	shimPID, err := d.service.CreateTask(containerInfo)
 	if err != nil {
-		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
 	}
 
 	// 等待容器创建完成（对齐 Docker: runc create 返回后才设置网络）
 	containerPid, err := d.service.WaitForCreate(containerID, 15*time.Second)
 	if err != nil {
-		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("等待容器创建失败: %v", err)}
 	}
 
@@ -326,11 +327,11 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 	}
 
 	if err := container.SaveContainerInfo(containerInfo); err != nil {
-		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
 	}
 
-	d.RegisterContainer(&ContainerState{
+	d.RegisterContainer(&ContainerLive{
 		Info:    containerInfo,
 		ShimPID: shimPID,
 		NetMgr:  netMgr,
@@ -343,7 +344,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		shimConn, err := d.service.AttachTask(containerID)
 		if err != nil {
 			d.UnregisterContainer(containerID)
-			d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+			d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 			return Response{Success: false, Message: fmt.Sprintf("attach 到容器失败: %v", err)}
 		}
 		// attach 已建立，现在发送 start 信号
@@ -362,7 +363,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 	// 非 -it 模式：直接发送 start 信号
 	if err := d.service.StartTask(containerID); err != nil {
 		d.UnregisterContainer(containerID)
-		d.cleanupContainerResources(containerID, &ContainerState{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
 	}
 	containerInfo.Status = libcontainer.StatusRunning
@@ -397,7 +398,7 @@ func (d *Daemon) handleStop(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 不存在", containerID)}
 	}
 
-	if state, ok := d.GetContainerState(containerID); ok {
+	if state, ok := d.GetContainerLive(containerID); ok {
 		state.mu.Lock()
 		state.UserStopped = true
 		state.mu.Unlock()
@@ -423,8 +424,8 @@ func (d *Daemon) handleStop(req Request) Response {
 	info.FinishedAt = utils.NowFormatted()
 	container.SaveContainerInfo(info)
 
-	var state *ContainerState
-	if s, ok := d.GetContainerState(containerID); ok {
+	var state *ContainerLive
+	if s, ok := d.GetContainerLive(containerID); ok {
 		state = s
 	}
 	d.UnregisterContainer(containerID)
@@ -456,16 +457,31 @@ func (d *Daemon) handleStart(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("容器状态为 %s，无法启动（仅 stopped/created 可启动）", info.Status)}
 	}
 
-	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
-
 	savedInfo := *info
+	savedOverlayMerged := info.OverlayMerged
+	savedOverlayUpper := info.OverlayUpper
+	savedOverlayWork := info.OverlayWork
+	savedCgroupName := info.CgroupName
+
 	newReq := buildRunRequest(info)
 
+	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+
 	resp := d.runWithID(newReq, nil, containerID)
-	if !resp.Success {
-		log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
-		savedInfo.Status = libcontainer.StatusStopped
-		container.SaveContainerInfo(&savedInfo)
+	if resp.Success {
+		return resp
+	}
+
+	log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
+	savedInfo.Status = libcontainer.StatusStopped
+	savedInfo.OverlayMerged = savedOverlayMerged
+	savedInfo.OverlayUpper = savedOverlayUpper
+	savedInfo.OverlayWork = savedOverlayWork
+	savedInfo.CgroupName = savedCgroupName
+	container.SaveContainerInfo(&savedInfo)
+	container.CreateOverlayDirs(containerID)
+	if savedCgroupName != "" {
+		cgroups.RemoveCgroup(savedCgroupName)
 	}
 	return resp
 }
@@ -536,7 +552,7 @@ func (d *Daemon) handleRm(req Request) Response {
 		}
 	}
 
-	if cs, ok := d.GetContainerState(containerID); ok {
+	if cs, ok := d.GetContainerLive(containerID); ok {
 		cs.mu.Lock()
 		cs.UserStopped = true
 		cs.mu.Unlock()

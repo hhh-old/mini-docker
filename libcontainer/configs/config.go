@@ -7,6 +7,9 @@ import "syscall"
 
 // Config 容器完整配置（对标 OCI runtime-spec + libcontainer 扩展）
 type Config struct {
+	// OCIVersion OCI 运行时规范版本（来自 config.json 的 ociVersion）
+	OCIVersion string `json:"oci_version,omitempty"`
+
 	// BundlePath OCI bundle 路径（包含 config.json 和 rootfs）
 	BundlePath string `json:"bundle_path,omitempty"`
 

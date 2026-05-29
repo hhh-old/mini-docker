@@ -5,10 +5,13 @@ package cgroups
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"mini-docker/constants"
 	"mini-docker/libcontainer/configs"
+
+	"golang.org/x/sys/unix"
 )
 
 // Manager cgroup 管理器接口（对标 libcontainer/cgroups.Manager）
@@ -130,7 +133,27 @@ func mkdirAll(path string) error {
 // formatMemory 格式化内存大小
 func formatMemory(size int64) string {
 	if size <= 0 {
-		return ""
+		return "0"
 	}
 	return fmt.Sprintf("%d", size)
+}
+
+func RemoveCgroup(cgroupName string) {
+	if cgroupName == "" {
+		return
+	}
+	if IsCgroupV2() {
+		cgPath := filepath.Join(constants.CgroupRootPath, cgroupName)
+		if _, err := os.Stat(cgPath); err == nil {
+			unix.Rmdir(cgPath)
+		}
+		return
+	}
+	subsystems := []string{"memory", "cpu", "freezer", "pids"}
+	for _, subsys := range subsystems {
+		cgPath := filepath.Join(constants.CgroupRootPath, subsys, cgroupName)
+		if _, err := os.Stat(cgPath); err == nil {
+			unix.Rmdir(cgPath)
+		}
+	}
 }

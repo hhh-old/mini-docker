@@ -33,7 +33,6 @@ import (
 	"log"
 	"mini-docker/container"
 	"mini-docker/libcontainer"
-	"mini-docker/libcontainer/cgroups"
 	"mini-docker/network"
 	"net"
 	"os"
@@ -58,31 +57,30 @@ const (
 type Daemon struct {
 	mu         sync.RWMutex
 	once       sync.Once
-	containers map[string]*ContainerState // 运行中的容器状态
+	containers map[string]*ContainerLive // 运行中的容器状态
 	listener   net.Listener
 	eventBus   *EventBus
 	shutdown   chan struct{}
 	service    *containerd.Service
 }
 
-// ContainerState 运行中容器的运行时状态（仅 Daemon 持有）
+// ContainerLive 运行中容器的运行时状态（仅 Daemon 持有）
 // 嵌入 *ContainerInfo 消除重复字段，业务元数据通过 Info 直接访问，
 // 纯内存状态（NetMgr、CgroupMgr 等接口实例）保留在此结构体中，因为它们无法序列化
-type ContainerState struct {
+type ContainerLive struct {
 	mu           sync.Mutex
-	Info         *container.ContainerInfo // 嵌入容器业务元数据，避免字段重复和数据同步问题
-	ShimPID      int                      // shim 进程 PID（Info 中也有，但此处保留运行时实时值以支持 takeover 恢复）
-	Cmd          *os.Process              // 活的进程对象，无法序列化
-	NetMgr       network.Manager          // 网络管理接口，无法序列化
-	CgroupMgr    cgroups.Manager          // cgroup 管理接口，无法序列化
-	RestartCount int                      // 重启计数，纯运行时状态
-	UserStopped  bool                     // 用户主动停止标记，纯运行时状态
+	Info         *container.ContainerInfo
+	ShimPID      int
+	Cmd          *os.Process
+	NetMgr       network.Manager
+	RestartCount int
+	UserStopped  bool
 }
 
 // NewDaemon 创建 Daemon 实例
 func NewDaemon() *Daemon {
 	return &Daemon{
-		containers: make(map[string]*ContainerState),
+		containers: make(map[string]*ContainerLive),
 		eventBus:   NewEventBus(),
 		shutdown:   make(chan struct{}),
 		service:    containerd.NewService(),
@@ -294,7 +292,7 @@ func (d *Daemon) sendResponse(conn net.Conn, resp Response) {
 }
 
 // RegisterContainer 注册运行中的容器到 Daemon
-func (d *Daemon) RegisterContainer(state *ContainerState) {
+func (d *Daemon) RegisterContainer(state *ContainerLive) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.containers[state.Info.ID] = state
@@ -312,8 +310,8 @@ func (d *Daemon) UnregisterContainer(containerID string) {
 	delete(d.containers, containerID)
 }
 
-// GetContainerState 获取容器运行时状态
-func (d *Daemon) GetContainerState(containerID string) (*ContainerState, bool) {
+// GetContainerLive 获取容器运行时状态
+func (d *Daemon) GetContainerLive(containerID string) (*ContainerLive, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	s, ok := d.containers[containerID]
@@ -328,7 +326,7 @@ func (d *Daemon) GetContainerState(containerID string) (*ContainerState, bool) {
 // │  5. 根据重启策略决定是否重启
 // 轮询 shim 直到容器退出，然后处理重启策略或清理资源
 func (d *Daemon) WatchContainer(containerID string) {
-	state, ok := d.GetContainerState(containerID)
+	state, ok := d.GetContainerLive(containerID)
 	if !ok {
 		return
 	}
@@ -405,15 +403,15 @@ func (d *Daemon) WatchContainer(containerID string) {
 		}
 	}
 
-	if _, ok := d.GetContainerState(containerID); !ok {
+	if _, ok := d.GetContainerLive(containerID); !ok {
 		return
 	}
 	//清理退出的容器
 	d.cleanupExitedContainer(containerID)
 }
 
-func buildContainerState(info *container.ContainerInfo, shimPID int) *ContainerState {
-	state := &ContainerState{
+func buildContainerLive(info *container.ContainerInfo, shimPID int) *ContainerLive {
+	state := &ContainerLive{
 		Info:    info,
 		ShimPID: shimPID,
 	}
@@ -434,7 +432,7 @@ func (d *Daemon) handleRestart(containerID string, exitCode int) {
 		return
 	}
 
-	state, ok := d.GetContainerState(containerID)
+	state, ok := d.GetContainerLive(containerID)
 	restartCount := 0
 	if ok {
 		state.mu.Lock()
@@ -481,7 +479,7 @@ func (d *Daemon) handleRestart(containerID string, exitCode int) {
 
 	resp := d.runWithID(req, nil, containerID)
 	if resp.Success {
-		if newState, ok := d.GetContainerState(containerID); ok {
+		if newState, ok := d.GetContainerLive(containerID); ok {
 			newState.mu.Lock()
 			newState.RestartCount = restartCount
 			newState.mu.Unlock()
@@ -604,7 +602,7 @@ func (d *Daemon) restoreContainers() {
 			continue
 		}
 
-		state := buildContainerState(info, shimPID)
+		state := buildContainerLive(info, shimPID)
 
 		d.RegisterContainer(state)
 		go d.WatchContainer(task.ID)
@@ -675,14 +673,14 @@ func (d *Daemon) handleDeadShim(taskID string) bool {
 			if restartErr != nil {
 				log.Printf("容器 %s 重启 shim 失败: %v，降级恢复\n", taskID, restartErr)
 				// 降级恢复：无 shim 监控，仅注册容器状态
-				state := buildContainerState(info, 0)
+				state := buildContainerLive(info, 0)
 				d.RegisterContainer(state)
 				go d.WatchContainer(taskID)
 				info.Status = libcontainer.StatusRunning
 				container.SaveContainerInfo(info)
 				return true
 			}
-			state := buildContainerState(info, shimPID)
+			state := buildContainerLive(info, shimPID)
 			d.RegisterContainer(state)
 			go d.WatchContainer(taskID)
 			info.ShimPID = shimPID
@@ -695,7 +693,7 @@ func (d *Daemon) handleDeadShim(taskID string) bool {
 		log.Printf("容器 %s 进程 (PID=%d) 仍在运行但 shim 已丢失，TTY 模式降级恢复\n",
 			taskID, info.Pid)
 
-		state := buildContainerState(info, 0)
+		state := buildContainerLive(info, 0)
 
 		d.RegisterContainer(state)
 		go d.WatchContainer(taskID)
@@ -821,7 +819,7 @@ type CleanupOptions struct {
 // cleanupContainerResources 统一的容器资源清理方法
 // 嵌入 *ContainerInfo 后，state.Info 直接包含所有元数据，
 // 不再需要"先试运行时状态，不行再试 ContainerInfo"的双路径降级逻辑
-func (d *Daemon) cleanupContainerResources(containerID string, state *ContainerState, opts CleanupOptions) {
+func (d *Daemon) cleanupContainerResources(containerID string, state *ContainerLive, opts CleanupOptions) {
 	// 获取 Info 引用：state 非空时用 Info，否则从磁盘加载
 	var info *container.ContainerInfo
 	if state != nil && state.Info != nil {

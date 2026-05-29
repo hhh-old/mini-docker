@@ -67,3 +67,5 @@ func NewManager(config *configs.Resources, name string) (Manager, error) {
 }
 
 func IsCgroupV2() bool { return false }
+
+func RemoveCgroup(cgroupName string) {}

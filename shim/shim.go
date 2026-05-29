@@ -18,6 +18,7 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/libcontainer"
+	"mini-docker/libcontainer/cgroups"
 	"mini-docker/pty"
 	"mini-docker/spec"
 	"mini-docker/types"
@@ -494,20 +495,7 @@ func handleShimConn(conn net.Conn, ctx *shimContext) {
 			json.NewEncoder(conn).Encode(types.ShimResponse{Success: false, Message: err.Error()})
 			return
 		}
-		state := &libcontainer.ContainerState{
-			ID:     ctx.containerID,
-			Pid:    c.Pid(),
-			Status: libcontainer.StatusCreated,
-		}
-		if containerPID > 0 {
-			if utils.CheckProcessAlive(state.Pid) {
-				state.Status = libcontainer.StatusRunning
-			} else {
-				state.Status = libcontainer.StatusStopped
-			}
-		} else if state.Pid <= 0 {
-			state.Status = libcontainer.StatusStopped
-		}
+		state := c.State()
 		json.NewEncoder(conn).Encode(types.ShimResponse{Success: true, Data: state})
 
 	case "kill":
@@ -531,6 +519,14 @@ func handleShimConn(conn net.Conn, ctx *shimContext) {
 		}
 
 	case "exec":
+		//docker exec 是 Docker 提供的一个核心命令，用于在已运行的容器内部执行新的进程或命令
+		//最典型的场景是：当你用 docker run -d 启动了一个后台容器（比如一个 nginx 或 redis 容器）后，想查看容器内部的文件、安装软件、或者启动一个交互式 Shell 来调试，这时候 docker exec 就能派上用场。
+		//与 docker attach 的区别
+		//			docker exec	     				docker attach
+		//作用		在容器内启动一个新进程				连接到容器当前正在运行的主进程的终端
+		//交互性		可以同时运行多个 exec，彼此独立		只能有一个 attach 连接（通常）
+		//退出影响	exit 只退出 exec 的进程，容器继续	exit 可能导致容器主进程结束，容器退出
+		//适用场景	调试、执行临时命令、开启额外 Shell	查看主进程的输出、与主进程交互（不推荐）
 		if containerPID <= 0 {
 			json.NewEncoder(conn).Encode(types.ShimResponse{Success: false, Message: "容器进程尚未启动"})
 			return
@@ -553,12 +549,27 @@ func handleShimConn(conn net.Conn, ctx *shimContext) {
 		c, loadErr := libcontainer.Load(ctx.containerID)
 		if loadErr == nil {
 			cfg := c.Config()
+			//docker exec 实际上是向 Docker 守护进程（dockerd）发送一个 API 请求，要求它在指定的容器的命名空间（Namespace）中创建一个新的进程。
+			//因为容器本质上是一组被隔离的进程，所以 Docker 可以在同一个容器的 PID、网络、文件系统等命名空间下启动一个新进程，这个进程相对于容器内的其他进程来说是“同级”的。
+			//这个新创建的进程也要加入容器PID 1进程的进程组，这样才能限制其资源使用率，如下就是在将exec进程纳入cgroup中
 			if cfg.Cgroups != nil && cfg.Cgroups.CgroupName != "" {
-				cgroupPath := filepath.Join(constants.CgroupRootPath, cfg.Cgroups.CgroupName)
-				cgroupProcsPath := filepath.Join(cgroupPath, "cgroup.procs")
-				if _, statErr := os.Stat(cgroupPath); statErr == nil {
-					if err := os.WriteFile(cgroupProcsPath, []byte(fmt.Sprintf("%d", execPID)), 0644); err != nil {
-						log.Printf("写入文件 %s 失败: %v\n", cgroupProcsPath, err)
+				pidStr := fmt.Sprintf("%d", execPID)
+				if cgroups.IsCgroupV2() {
+					cgPath := filepath.Join(constants.CgroupRootPath, cfg.Cgroups.CgroupName)
+					if _, statErr := os.Stat(cgPath); statErr == nil {
+						if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), []byte(pidStr), 0644); err != nil {
+							log.Printf("写入 cgroup.procs 失败: %v\n", err)
+						}
+					}
+				} else {
+					subsystems := []string{"memory", "cpu", "pids", "freezer"}
+					for _, subsys := range subsystems {
+						cgPath := filepath.Join(constants.CgroupRootPath, subsys, cfg.Cgroups.CgroupName)
+						if _, statErr := os.Stat(cgPath); statErr == nil {
+							if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), []byte(pidStr), 0644); err != nil {
+								log.Printf("写入 %s/cgroup.procs 失败: %v\n", subsys, err)
+							}
+						}
 					}
 				}
 			}

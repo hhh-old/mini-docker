@@ -4,6 +4,7 @@ package cgroups
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -20,9 +21,17 @@ type managerV2 struct {
 }
 
 func newManagerV2(config *configs.Resources) (Manager, error) {
-	return &managerV2{
+	m := &managerV2{
 		config: config,
-	}, nil
+	}
+	name := config.CgroupName
+	if name != "" {
+		cgPath := filepath.Join(constants.CgroupRootPath, name)
+		if _, err := os.Stat(cgPath); err == nil {
+			m.path = cgPath
+		}
+	}
+	return m, nil
 }
 
 func (m *managerV2) Apply(pid int) error {

@@ -4,6 +4,7 @@ package configs
 
 // Config 容器完整配置（对标 OCI runtime-spec + libcontainer 扩展）
 type Config struct {
+	OCIVersion      string        `json:"oci_version,omitempty"`
 	BundlePath      string        `json:"bundle_path,omitempty"`
 	Rootfs          string        `json:"rootfs"`
 	ReadonlyRootfs  bool          `json:"readonly_rootfs,omitempty"`

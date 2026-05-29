@@ -27,6 +27,17 @@ const (
 	StatusStopped Status = "stopped"
 )
 
+// containerRunState 容器运行时状态（纯内存态，对标 runc 的 containerState 接口）
+// 仅包含 ID、Pid、Status 等运行时可变信息，不含配置字段
+// 与 ContainerState 的区别：ContainerState 用于序列化到 state.json（包含 Bundle/Rootfs 等配置快照）
+// containerRunState 仅用于内存中的快速读写，序列化时通过 toContainerState() 组装完整状态
+type containerRunState struct {
+	ID         string
+	Pid        int
+	Status     Status
+	OCIVersion string
+}
+
 // Container 容器接口（对标 libcontainer/container.go）
 type Container interface {
 	// ID 返回容器 ID
@@ -41,7 +52,10 @@ type Container interface {
 	// Start 启动容器进程（fork init 进程，设置 namespace、rootfs、cgroup）
 	Start(process *Process) error
 
-	// Run 创建并启动容器（Start 的便捷封装）
+	// ExecStart 启动已创建的容器（对标 runc start：发送 start 信号，从 created → running）
+	ExecStart() error
+
+	// Run 创建并启动容器（Start + ExecStart 的便捷封装）
 	Run(process *Process) error
 
 	// Destroy 销毁容器，清理所有资源
@@ -64,6 +78,9 @@ type Container interface {
 
 	// Pid 返回容器主进程 PID
 	Pid() int
+
+	// State 返回完整的容器状态（对标 OCI runtime-spec State）
+	State() *ContainerState
 
 	// Set 设置容器资源限制
 	Set(config configs.Resources) error
@@ -132,15 +149,6 @@ func New(id string, config *configs.Config) (Container, error) {
 // Load 加载已有容器
 func Load(id string) (Container, error) {
 	return loadLinuxContainer(id)
-}
-
-// State 容器状态信息（用于序列化）
-type State struct {
-	ID         string         `json:"id"`
-	Status     Status         `json:"status"`
-	Pid        int            `json:"pid"`
-	BundlePath string         `json:"bundle_path"`
-	Config     configs.Config `json:"config"`
 }
 
 // Validate 验证容器配置
