@@ -23,6 +23,7 @@ type Config struct {
 	ReadonlyPaths   []string          `json:"readonly_paths,omitempty"`
 	Seccomp         *Seccomp          `json:"seccomp,omitempty"`
 	NoNewPrivileges bool              `json:"no_new_privileges,omitempty"`
+	Hooks           *Hooks            `json:"hooks,omitempty"`
 	Annotations     map[string]string `json:"annotations,omitempty"`
 }
 

@@ -3,6 +3,7 @@ package libcontainer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -118,6 +119,7 @@ func ListContainerStates() ([]*ContainerState, error) {
 		}
 		state, err := loadContainerState(entry.Name())
 		if err != nil {
+			log.Printf("警告: 加载容器 %s 状态失败: %v\n", entry.Name(), err)
 			continue
 		}
 		states = append(states, state)

@@ -64,6 +64,9 @@ type Config struct {
 	// NoNewPrivileges 是否设置 PR_SET_NO_NEW_PRIVS
 	NoNewPrivileges bool `json:"no_new_privileges,omitempty"`
 
+	// Hooks 容器生命周期钩子（对标 OCI runtime-spec Hooks）
+	Hooks *Hooks `json:"hooks,omitempty"`
+
 	// Annotations 容器注解（来自 OCI Spec）
 	Annotations map[string]string `json:"annotations,omitempty"`
 }

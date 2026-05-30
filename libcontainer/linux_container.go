@@ -121,7 +121,9 @@ func loadLinuxContainer(id string) (*linuxContainer, error) {
 
 	if config.Cgroups != nil {
 		cgm, err := cgroups.NewManager(config.Cgroups, "mini-docker-"+id)
-		if err == nil {
+		if err != nil {
+			log.Printf("警告: 创建 cgroup 管理器失败: %v\n", err)
+		} else {
 			lc.cgm = cgm
 		}
 	}
@@ -161,10 +163,10 @@ func (c *linuxContainer) Pid() int {
 func (c *linuxContainer) Start(process *Process) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.startLocked(process)
+	return c.createLocked(process)
 }
 
-func (c *linuxContainer) startLocked(process *Process) error {
+func (c *linuxContainer) createLocked(process *Process) error {
 
 	if c.runState.Status != StatusCreated || c.runState.Pid != 0 {
 		return fmt.Errorf("容器只能在初始状态启动，当前: %s", c.runState.Status)
@@ -266,6 +268,21 @@ func (c *linuxContainer) startLocked(process *Process) error {
 		}
 	}
 
+	// CreateRuntime Hooks: 在宿主机命名空间执行，namespace/cgroup/rootfs 设置完成后
+	if c.config.Hooks != nil {
+		hookState := c.toHookState(StatusCreating)
+		if err := RunHooks(c.config.Hooks.CreateRuntime, hookState); err != nil {
+			//CreateRuntime Hooks失败后的回滚操作
+			cmd.Process.Kill()
+			cmd.Wait()
+			os.Remove(fifoPath)
+			if c.cgm != nil {
+				c.cgm.Destroy()
+			}
+			return fmt.Errorf("CreateRuntime hook 失败: %w", err)
+		}
+	}
+
 	if err := saveContainerState(c.toContainerState()); err != nil {
 		return fmt.Errorf("保存容器状态失败: %w", err)
 	}
@@ -277,10 +294,25 @@ func (c *linuxContainer) Run(process *Process) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.startLocked(process); err != nil {
+	if err := c.createLocked(process); err != nil {
 		return err
 	}
-	return c.execStartLocked()
+	if err := c.execStartLocked(); err != nil {
+		c.signalLocked(int(syscall.SIGKILL))
+		if c.runState.Pid > 0 {
+			WaitForProcessExit(c.runState.Pid, 10000)
+		}
+		if c.cgm != nil {
+			c.cgm.Destroy()
+			c.cgm = nil
+		}
+		fifoPath := filepath.Join(c.config.BundlePath, ".start-fifo")
+		os.Remove(fifoPath)
+		c.runState.Status = StatusStopped
+		_ = saveContainerState(c.toContainerState())
+		return err
+	}
+	return nil
 }
 
 // runtime start信号走的路径
@@ -321,7 +353,22 @@ func (c *linuxContainer) sendStartSignalLocked() error {
 
 	// 更新状态
 	c.runState.Status = StatusRunning
-	return saveContainerState(c.toContainerState())
+	if err := saveContainerState(c.toContainerState()); err != nil {
+		return err
+	}
+
+	// Poststart Hooks: 在宿主机命名空间异步执行，不阻塞容器启动
+	if c.config.Hooks != nil && len(c.config.Hooks.Poststart) > 0 {
+		hookState := c.toHookState(StatusRunning)
+		//异步执行，失败仅打日志 log.Printf 。完全符合 OCI 规范"仅记录警告，不中止"的要求
+		go func() {
+			if err := RunHooks(c.config.Hooks.Poststart, hookState); err != nil {
+				log.Printf("警告: Poststart hook 执行失败: %v\n", err)
+			}
+		}()
+	}
+
+	return nil
 }
 
 func (c *linuxContainer) Destroy() error {
@@ -329,17 +376,33 @@ func (c *linuxContainer) Destroy() error {
 	defer c.mu.Unlock()
 
 	if c.runState.Status == StatusRunning || c.runState.Status == StatusCreated || c.runState.Status == StatusPaused {
-		c.signalLocked(int(syscall.SIGKILL)) //给容器init进程发送一个杀死信号
+		c.signalLocked(int(syscall.SIGKILL))
 		if c.runState.Pid > 0 {
 			WaitForProcessExit(c.runState.Pid, 10000)
 		}
 	}
 
-	if c.cgm != nil {
-		c.cgm.Destroy()
+	// Poststop Hooks: 在宿主机命名空间执行，容器进程退出后
+	if c.config.Hooks != nil && len(c.config.Hooks.Poststop) > 0 {
+		hookState := c.toHookState(StatusStopped)
+		if err := RunHooks(c.config.Hooks.Poststop, hookState); err != nil {
+			//Poststop Hooks失败仅打日志 log.Printf 。完全符合 OCI 规范要求
+			log.Printf("警告: Poststop hook 执行失败: %v\n", err)
+		}
 	}
 
-	return removeContainerState(c.runState.ID)
+	var firstErr error
+	if c.cgm != nil {
+		if err := c.cgm.Destroy(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("销毁 cgroup 失败: %w", err)
+		}
+	}
+
+	if err := removeContainerState(c.runState.ID); err != nil && firstErr == nil {
+		firstErr = fmt.Errorf("删除容器状态失败: %w", err)
+	}
+
+	return firstErr
 }
 
 // WaitForProcessExit 轮询等待指定进程退出（对齐 runc 的 waitForExit）
@@ -402,14 +465,9 @@ func (c *linuxContainer) signalLocked(sig int) error {
 	if c.runState.Status == StatusStopped {
 		return fmt.Errorf("容器未在运行")
 	}
-	//kill 在 Linux 中不仅仅是"杀死"进程，它的本质是 向进程发送信号 。不同信号有不同效果：
-	//信号	    编号	效果
-	//SIGTERM	15	优雅终止（进程可以捕获并做清理）
-	//SIGKILL	9	强制杀死（进程无法捕获，立即终止）
-	//SIGHUP	1	挂起（常用于重载配置）
-	//SIGINT	2	中断（相当于 Ctrl+C）
-	//SIGSTOP	19	暂停进程
-	//SIGCONT	18	恢复暂停的进程
+	if c.runState.Status == StatusPaused && syscall.Signal(sig) != syscall.SIGKILL {
+		log.Printf("警告: 向暂停容器发送信号 %d，信号将在恢复后生效\n", sig)
+	}
 	return syscall.Kill(c.runState.Pid, syscall.Signal(sig))
 }
 
@@ -433,7 +491,17 @@ func (c *linuxContainer) Exec(process *Process) error {
 	cmd.Stdin = process.Stdin
 	cmd.Stdout = process.Stdout
 	cmd.Stderr = process.Stderr
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动 exec 进程失败: %w", err)
+	}
+
+	if c.cgm != nil {
+		if err := c.cgm.Apply(cmd.Process.Pid); err != nil {
+			log.Printf("警告: 将 exec 进程加入 cgroup 失败: %v\n", err)
+		}
+	}
+
+	return cmd.Wait()
 }
 
 func (c *linuxContainer) Stats() (*Stats, error) {
@@ -448,7 +516,10 @@ func (c *linuxContainer) Stats() (*Stats, error) {
 	return stats, nil
 }
 
-func (c *linuxContainer) Set(configs.Resources) error {
+func (c *linuxContainer) Set(r configs.Resources) error {
+	if c.cgm != nil {
+		return c.cgm.Set(&r)
+	}
 	return nil
 }
 
@@ -467,6 +538,7 @@ func isValidTransition(from, to Status) bool {
 		StatusCreated: {StatusRunning, StatusStopped},
 		StatusRunning: {StatusPaused, StatusStopped},
 		StatusPaused:  {StatusRunning, StatusStopped},
+		StatusStopped: {StatusCreated},
 	}
 	for _, allowed := range validTransitions[from] {
 		if allowed == to {

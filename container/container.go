@@ -134,6 +134,23 @@ func HandleOCIInit() {
 		os.Exit(1)
 	}
 
+	// CreateContainer Hooks: 在容器命名空间内、pivot_root 之前执行
+	// OCI 规范: "after the container has been created but before pivot_root or any equivalent operation has been called"
+	if ociSpec.Hooks != nil && len(ociSpec.Hooks.CreateContainer) > 0 {
+		hookState := &libcontainer.HookState{
+			OCIVersion:  ociSpec.OCIVersion,
+			ID:          filepath.Base(bundlePath),
+			Status:      "creating",
+			Pid:         os.Getpid(),
+			Bundle:      bundlePath,
+			Annotations: ociSpec.Annotations,
+		}
+		if err := libcontainer.RunHooks(ociSpec.Hooks.CreateContainer, hookState); err != nil {
+			fmt.Fprintf(os.Stderr, "CreateContainer hook 失败: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	if err := SetupRootFS(ociSpec.Root.Path, overlay); err != nil {
 		fmt.Fprintf(os.Stderr, "OCI init: 设置 rootfs 失败: %v\n", err)
 		os.Exit(1)
@@ -164,6 +181,21 @@ func HandleOCIInit() {
 	_, _ = io.ReadFull(fifo, make([]byte, 1)) // 阻塞！等 FIFO 里有数据,只有runtime start进程执行后,向".start-fifo"管道中写了数据,容器init进程才会向下执行容器中的cmd命令(容器第一条命令)
 	fifo.Close()
 
+	// StartContainer Hooks: 在容器命名空间内执行，用户进程 execve 之前
+	if ociSpec.Hooks != nil && len(ociSpec.Hooks.StartContainer) > 0 {
+		hookState := &libcontainer.HookState{
+			OCIVersion:  ociSpec.OCIVersion,
+			ID:          filepath.Base(bundlePath),
+			Status:      "created",
+			Pid:         os.Getpid(),
+			Bundle:      bundlePath,
+			Annotations: ociSpec.Annotations,
+		}
+		if err := libcontainer.RunHooks(ociSpec.Hooks.StartContainer, hookState); err != nil {
+			fmt.Fprintf(os.Stderr, "StartContainer hook 失败: %v\n", err)
+			os.Exit(1)
+		}
+	}
 	args := ociSpec.Process.Args
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "OCI init: process.args 为空\n")
@@ -318,7 +350,7 @@ func getContainerInfoPath(containerID string) string {
 	return filepath.Join(containerStoreDir, containerID+".json")
 }
 
-func SaveContainerInfo(info *ContainerInfo) error {
+func SaveContainerInfo(info *ContainerInfo) (retErr error) {
 	if err := os.MkdirAll(containerStoreDir, 0755); err != nil {
 		return err
 	}
@@ -328,7 +360,31 @@ func SaveContainerInfo(info *ContainerInfo) error {
 		return err
 	}
 
-	return os.WriteFile(getContainerInfoPath(info.ID), data, 0644)
+	infoPath := getContainerInfoPath(info.ID)
+	tmpFile, err := os.CreateTemp(containerStoreDir, "container-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+
+	defer func() {
+		if retErr != nil {
+			tmpFile.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		retErr = err
+		return retErr
+	}
+	if err := tmpFile.Close(); err != nil {
+		retErr = err
+		return retErr
+	}
+
+	retErr = os.Rename(tmpName, infoPath)
+	return retErr
 }
 
 func RemoveContainerInfo(containerID string) error {

@@ -4,6 +4,7 @@ package cgroups
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,7 +73,9 @@ func (m *managerV1) Apply(pid int) error {
 			if m.config.Memory.Swap != nil {
 				memswLimit = *m.config.Memory.Limit + *m.config.Memory.Swap
 			}
-			_ = WriteFile(memPath, "memory.memsw.limit_in_bytes", formatMemory(memswLimit))
+			if err := WriteFile(memPath, "memory.memsw.limit_in_bytes", formatMemory(memswLimit)); err != nil {
+				log.Printf("提示: 设置 swap 限制失败（可能未启用 swapaccount）: %v\n", err)
+			}
 		}
 		if err := WriteFile(memPath, "cgroup.procs", pidStr); err != nil {
 			return fmt.Errorf("添加进程到 memory cgroup 失败: %w", err)
@@ -135,8 +138,12 @@ func (m *managerV1) Apply(pid int) error {
 			cpus := *m.config.CPU.Cpus
 			cfsQuota := calculateCfsQuota(cpus, cfsPeriod)
 			if cfsQuota > 0 {
-				WriteFile(cpuPath, "cpu.cfs_period_us", strconv.FormatInt(cfsPeriod, 10))
-				WriteFile(cpuPath, "cpu.cfs_quota_us", strconv.FormatInt(cfsQuota, 10))
+				if err := WriteFile(cpuPath, "cpu.cfs_period_us", strconv.FormatInt(cfsPeriod, 10)); err != nil {
+					return fmt.Errorf("设置 cpu.cfs_period_us 失败: %w", err)
+				}
+				if err := WriteFile(cpuPath, "cpu.cfs_quota_us", strconv.FormatInt(cfsQuota, 10)); err != nil {
+					return fmt.Errorf("设置 cpu.cfs_quota_us 失败: %w", err)
+				}
 			}
 		}
 		if err := WriteFile(cpuPath, "cgroup.procs", pidStr); err != nil {
@@ -246,6 +253,45 @@ func (m *managerV1) Thaw() error {
 
 func (m *managerV1) Set(container *configs.Resources) error {
 	m.config = container
+
+	if m.config.Memory != nil {
+		if memPath, ok := m.paths["memory"]; ok {
+			if m.config.Memory.Limit != nil {
+				if err := WriteFile(memPath, "memory.limit_in_bytes", formatMemory(*m.config.Memory.Limit)); err != nil {
+					return fmt.Errorf("设置内存限制失败: %w", err)
+				}
+			}
+		}
+	}
+
+	if m.config.CPU != nil {
+		if cpuPath, ok := m.paths["cpu"]; ok {
+			if m.config.CPU.Shares != nil {
+				if err := WriteFile(cpuPath, "cpu.shares", strconv.FormatInt(*m.config.CPU.Shares, 10)); err != nil {
+					return fmt.Errorf("设置 CPU shares 失败: %w", err)
+				}
+			}
+			if m.config.CPU.Quota != nil {
+				if err := WriteFile(cpuPath, "cpu.cfs_quota_us", strconv.FormatInt(*m.config.CPU.Quota, 10)); err != nil {
+					return fmt.Errorf("设置 cpu.cfs_quota_us 失败: %w", err)
+				}
+			}
+			if m.config.CPU.Period != nil {
+				if err := WriteFile(cpuPath, "cpu.cfs_period_us", strconv.FormatInt(*m.config.CPU.Period, 10)); err != nil {
+					return fmt.Errorf("设置 cpu.cfs_period_us 失败: %w", err)
+				}
+			}
+		}
+	}
+
+	if m.config.Pids != nil && m.config.Pids.Limit != nil {
+		if pidsPath, ok := m.paths["pids"]; ok {
+			if err := WriteFile(pidsPath, "pids.max", strconv.FormatInt(*m.config.Pids.Limit, 10)); err != nil {
+				return fmt.Errorf("设置 PID 限制失败: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 

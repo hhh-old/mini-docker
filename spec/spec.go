@@ -20,6 +20,7 @@ type Spec struct {
 	Root        *Root             `json:"root"`       //指定容器根文件系统的路径
 	Hostname    string            `json:"hostname"`
 	Mounts      []configs.Mount   `json:"mounts"`
+	Hooks       *configs.Hooks    `json:"hooks,omitempty"`
 	Linux       *Linux            `json:"linux,omitempty"` //平台相关配置
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
@@ -283,6 +284,10 @@ func SpecToConfig(s *Spec, bundlePath string) *configs.Config {
 			Source:      m.Source,
 			Options:     m.Options,
 		})
+	}
+
+	if s.Hooks != nil {
+		config.Hooks = s.Hooks
 	}
 
 	return config

@@ -309,8 +309,8 @@ func convertToConfig(s *spec.Spec, bundlePath string) *configs.Config {
 // SIGCONT	18	恢复暂停的进程
 func parseSignal(s string) (syscall.Signal, error) {
 	if sig, err := strconv.Atoi(s); err == nil {
-		if sig < 1 || sig > 31 {
-			return 0, fmt.Errorf("信号编号 %d 超出有效范围 (1-31)", sig)
+		if sig < 1 || sig > 64 {
+			return 0, fmt.Errorf("信号编号 %d 超出有效范围 (1-64)", sig)
 		}
 		return syscall.Signal(sig), nil
 	}

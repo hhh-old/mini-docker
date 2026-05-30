@@ -21,10 +21,11 @@ import (
 type Status = string
 
 const (
-	StatusCreated Status = "created"
-	StatusRunning Status = "running"
-	StatusPaused  Status = "paused"
-	StatusStopped Status = "stopped"
+	StatusCreated  Status = "created"
+	StatusCreating Status = "creating"
+	StatusRunning  Status = "running"
+	StatusPaused   Status = "paused"
+	StatusStopped  Status = "stopped"
 )
 
 // containerRunState 容器运行时状态（纯内存态，对标 runc 的 containerState 接口）
