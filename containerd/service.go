@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"mini-docker/constants"
-	"mini-docker/container"
+	"mini-docker/containerstore"
 	"mini-docker/libcontainer"
 	"mini-docker/spec"
 	"mini-docker/types"
@@ -31,7 +31,7 @@ func NewService() *Service {
 	return &Service{}
 }
 
-func (s *Service) CreateTask(info *container.ContainerInfo) (shimPID int, err error) {
+func (s *Service) CreateTask(info *containerstore.ContainerInfo) (shimPID int, err error) {
 	if info.ID == "" {
 		return 0, fmt.Errorf("容器 ID 不能为空")
 	}
@@ -466,7 +466,7 @@ func waitForSocket(path string, timeout time.Duration) error {
 	return fmt.Errorf("等待 socket %s 超时", path)
 }
 
-func buildOCISpec(info *container.ContainerInfo) *spec.Spec {
+func buildOCISpec(info *containerstore.ContainerInfo) *spec.Spec {
 	return spec.DefaultSpec(&spec.SpecConfig{
 		Tty:           info.Tty,
 		Memory:        info.Memory,

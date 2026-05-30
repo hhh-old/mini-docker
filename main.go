@@ -13,9 +13,10 @@ import (
 	"time"
 
 	"mini-docker/constants"
-	"mini-docker/container"
+	"mini-docker/containerstore"
 	"mini-docker/daemon"
 	"mini-docker/image"
+	"mini-docker/libcontainer/containerinit"
 	"mini-docker/network"
 	"mini-docker/runtime"
 	"mini-docker/shim"
@@ -26,8 +27,8 @@ import (
 
 func main() {
 	// 容器 init 进程入口（不变）
-	if container.IsInitProcess() {
-		container.HandleInit()
+	if containerinit.IsInitProcess() {
+		containerinit.HandleInit()
 		return
 	}
 
@@ -525,7 +526,7 @@ func psCommand() {
 	execSimpleCmd(daemon.Request{Type: "ps", Args: map[string]string{}},
 		"列出容器", func(resp *daemon.Response) {
 			data, _ := json.Marshal(resp.Data)
-			var containers []*container.ContainerInfo
+			var containers []*containerstore.ContainerInfo
 			if err := json.Unmarshal(data, &containers); err != nil {
 				fmt.Printf("解析容器列表失败: %v\n", err)
 				os.Exit(1)

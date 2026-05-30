@@ -1,4 +1,4 @@
-package container
+package containerstore
 
 /*
 =======================================================================
@@ -34,12 +34,13 @@ package container
 
   本项目（mini-docker）的代码结构完全对应上述架构：
 
-  container/namespace.go  → Namespace 隔离
-  cgroup/cgroup.go       → Cgroup 资源限制
-  container/rootfs.go    → RootFS 文件系统
-  container/container.go → 容器生命周期管理
-  image/image.go         → 镜像管理
-  network/network.go     → 网络管理
+  container/container.go   → 容器元数据管理（ContainerInfo CRUD、Overlay、日志）
+  container/health.go      → 健康检查
+  libcontainer/init/       → 容器 init 进程逻辑（RootFS、Capability、pivot_root）
+  libcontainer/            → 容器运行时核心（Container 接口、状态机、cgroup 集成）
+  libcontainer/cgroups/    → Cgroup 资源限制
+  image/image.go           → 镜像管理
+  network/network.go       → 网络管理
 
 =======================================================================
   Docker vs 虚拟机
@@ -77,7 +78,7 @@ package container
      ↓
   4. 子进程进入 InitProcess():
      a. SetupRootFS() → pivot_root 切换根目录
-        → 对应 rootfs_linux.go: SetupRootFS()
+        → 对应 libcontainer/init/rootfs_linux.go: SetupRootFS()
      b. setHostname() → 设置主机名（UTS Namespace 生效）
      c. syscall.Exec() → 替换进程映像为用户命令
      ↓

@@ -38,7 +38,7 @@ import (
 
 	"mini-docker/builder"
 	"mini-docker/constants"
-	"mini-docker/container"
+	"mini-docker/containerstore"
 	"mini-docker/image"
 	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/cgroups"
@@ -56,7 +56,7 @@ func getBoolArg(args map[string]string, key string) bool {
 	return args[key] == "true"
 }
 
-func buildRunRequest(info *container.ContainerInfo) Request {
+func buildRunRequest(info *containerstore.ContainerInfo) Request {
 	volumesStr := ""
 	if len(info.Volumes) > 0 {
 		volumesStr = strings.Join(info.Volumes, "|")
@@ -216,7 +216,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		name = containerID
 	}
 
-	if existingContainers, err := container.ListContainers(); err == nil {
+	if existingContainers, err := containerstore.ListContainers(); err == nil {
 		for _, c := range existingContainers {
 			if c.Name == name && (c.Status == libcontainer.StatusRunning || c.Status == libcontainer.StatusCreated || c.Status == libcontainer.StatusPaused) {
 				return Response{Success: false, Message: fmt.Sprintf("容器名 %s 已被使用", name)}
@@ -224,14 +224,14 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		}
 	}
 
-	overlay, err := container.CreateOverlayDirs(containerID)
+	overlay, err := containerstore.CreateOverlayDirs(containerID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("创建 OverlayFS 目录失败: %v", err)}
 	}
 
 	// 先构建 ContainerInfo（持久化的真相来源）
 	// 运行时字段（Pid、网络信息）在后续步骤中补全
-	containerInfo := &container.ContainerInfo{
+	containerInfo := &containerstore.ContainerInfo{
 		ID:                containerID,
 		Name:              name,
 		Image:             imageName,
@@ -326,7 +326,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		containerInfo.ContainerIP = netMgr.GetContainerIP()
 	}
 
-	if err := container.SaveContainerInfo(containerInfo); err != nil {
+	if err := containerstore.SaveContainerInfo(containerInfo); err != nil {
 		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
 	}
@@ -354,7 +354,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 			return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
 		}
 		containerInfo.Status = libcontainer.StatusRunning
-		container.SaveContainerInfo(containerInfo)
+		containerstore.SaveContainerInfo(containerInfo)
 		streamReady := make(chan struct{})
 		go relayStream(conn, shimConn, streamReady)
 		return Response{Success: true, Data: containerInfo, Stream: true, StreamReady: streamReady}
@@ -367,7 +367,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
 	}
 	containerInfo.Status = libcontainer.StatusRunning
-	container.SaveContainerInfo(containerInfo)
+	containerstore.SaveContainerInfo(containerInfo)
 
 	d.eventBus.Publish(Event{
 		Type:      "container_start",
@@ -393,7 +393,7 @@ func (d *Daemon) handleStop(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	info, err := container.LoadContainerInfoByID(containerID)
+	info, err := containerstore.LoadContainerInfoByID(containerID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 不存在", containerID)}
 	}
@@ -422,7 +422,7 @@ func (d *Daemon) handleStop(req Request) Response {
 	info.ExitCode = exitCode
 	info.Pid = 0
 	info.FinishedAt = utils.NowFormatted()
-	container.SaveContainerInfo(info)
+	containerstore.SaveContainerInfo(info)
 
 	var state *ContainerLive
 	if s, ok := d.GetContainerLive(containerID); ok {
@@ -448,7 +448,7 @@ func (d *Daemon) handleStart(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	info, err := container.LoadContainerInfoByID(containerID)
+	info, err := containerstore.LoadContainerInfoByID(containerID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("查找容器失败: %v", err)}
 	}
@@ -478,8 +478,8 @@ func (d *Daemon) handleStart(req Request) Response {
 	savedInfo.OverlayUpper = savedOverlayUpper
 	savedInfo.OverlayWork = savedOverlayWork
 	savedInfo.CgroupName = savedCgroupName
-	container.SaveContainerInfo(&savedInfo)
-	container.CreateOverlayDirs(containerID)
+	containerstore.SaveContainerInfo(&savedInfo)
+	containerstore.CreateOverlayDirs(containerID)
 	if savedCgroupName != "" {
 		cgroups.RemoveCgroup(savedCgroupName)
 	}
@@ -496,9 +496,9 @@ func (d *Daemon) handlePause(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("暂停容器失败: %v", err)}
 	}
 
-	if info, err := container.LoadContainerInfoByID(containerID); err == nil {
+	if info, err := containerstore.LoadContainerInfoByID(containerID); err == nil {
 		info.Status = libcontainer.StatusPaused
-		container.SaveContainerInfo(info)
+		containerstore.SaveContainerInfo(info)
 	}
 
 	d.eventBus.Publish(Event{
@@ -520,9 +520,9 @@ func (d *Daemon) handleUnpause(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("恢复容器失败: %v", err)}
 	}
 
-	if info, err := container.LoadContainerInfoByID(containerID); err == nil {
+	if info, err := containerstore.LoadContainerInfoByID(containerID); err == nil {
 		info.Status = libcontainer.StatusRunning
-		container.SaveContainerInfo(info)
+		containerstore.SaveContainerInfo(info)
 	}
 
 	d.eventBus.Publish(Event{
@@ -545,7 +545,7 @@ func (d *Daemon) handleRm(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 正在运行，请先停止容器", containerID)}
 	}
 
-	info, err := container.LoadContainerInfoByID(containerID)
+	info, err := containerstore.LoadContainerInfoByID(containerID)
 	if err == nil && (info.Status == libcontainer.StatusRunning || info.Status == libcontainer.StatusPaused) && info.Pid > 0 {
 		if utils.CheckProcessAlive(info.Pid) {
 			return Response{Success: false, Message: fmt.Sprintf("容器 %s 进程仍在运行 (PID: %d)，请先停止容器", containerID, info.Pid)}
@@ -571,7 +571,7 @@ func (d *Daemon) handleRm(req Request) Response {
 }
 
 func (d *Daemon) handlePs(req Request) Response {
-	containers, err := container.ListContainers()
+	containers, err := containerstore.ListContainers()
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("列出容器失败: %v", err)}
 	}
@@ -626,7 +626,7 @@ func (d *Daemon) handleLogs(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	logData, err := container.ReadContainerLogs(containerID)
+	logData, err := containerstore.ReadContainerLogs(containerID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("读取日志失败: %v", err)}
 	}
