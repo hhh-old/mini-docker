@@ -471,6 +471,7 @@ func (c *linuxContainer) signalLocked(sig int) error {
 	return syscall.Kill(c.runState.Pid, syscall.Signal(sig))
 }
 
+// exec是在容器中启动了一个新的子进程
 func (c *linuxContainer) Exec(process *Process) error {
 	c.mu.Lock()
 	if c.runState.Status != StatusRunning {
@@ -488,9 +489,22 @@ func (c *linuxContainer) Exec(process *Process) error {
 	args = append(args, process.Args...)
 
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = process.Stdin
-	cmd.Stdout = process.Stdout
-	cmd.Stderr = process.Stderr
+
+	// 对齐 Docker/containerd: exec 的 PTY 由上层（shim）创建并管理
+	// libcontainer 只负责将 nsenter 的 stdin/stdout/stderr 绑定到正确的 fd
+	if process.Terminal && process.ConsoleFile != nil {
+		// TTY 模式：使用 shim 传递过来的 PTY Slave
+		//把这个cmd对应程序（进程）的标准输入、标准输出、标准错误接到这个PTY上，所以这个cmd程序的输入内容由pty提供，输出内容和输出错误丢到这个pty上去
+		cmd.Stdin = process.ConsoleFile
+		cmd.Stdout = process.ConsoleFile
+		cmd.Stderr = process.ConsoleFile
+	} else {
+		// 非 TTY 模式：使用标准 I/O
+		cmd.Stdin = process.Stdin
+		cmd.Stdout = process.Stdout
+		cmd.Stderr = process.Stderr
+	}
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 exec 进程失败: %w", err)
 	}
@@ -500,7 +514,10 @@ func (c *linuxContainer) Exec(process *Process) error {
 			log.Printf("警告: 将 exec 进程加入 cgroup 失败: %v\n", err)
 		}
 	}
-
+	// exec是在容器中启动了一个新的子进程
+	//要执行的命令结束就返回了，容器进程还是照常运行
+	//如果是使用了-it但是后面接着的cmd命令是一次性命令如ls -l，ls -l进程执行完毕之后也会直接返回，不会停留在容器内
+	//所以，非交互式的cmd命令，不要使用-it，因为是多余的
 	return cmd.Wait()
 }
 

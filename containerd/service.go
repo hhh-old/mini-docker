@@ -41,8 +41,12 @@ func (s *Service) CreateTask(info *containerstore.ContainerInfo) (shimPID int, e
 		return 0, fmt.Errorf("保存 config.json 失败: %w", err)
 	}
 	//启动shim进程
-	cmd := exec.Command("/proc/self/exe",
-		"shim", info.ID, bundlePath)
+	// 对齐 Docker/containerd: 将 TTY 信息通过命令行参数传递给 shim，避免 shim 直接解析 OCI Spec
+	shimArgs := []string{"shim", info.ID, bundlePath}
+	if info.Tty {
+		shimArgs = append(shimArgs, "--tty")
+	}
+	cmd := exec.Command("/proc/self/exe", shimArgs...)
 	cmd.SysProcAttr = newShimSysProcAttr()
 	logDir := filepath.Join(filepath.Dir(constants.DaemonLogPath), "shim")
 	if err := os.MkdirAll(logDir, 0755); err != nil {

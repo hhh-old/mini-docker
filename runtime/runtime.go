@@ -295,15 +295,39 @@ func State(args []string) {
 }
 
 // Exec 对标 runc exec：在已运行的容器内执行新进程
-// 参数: <containerID> <command> [args...]
+// 参数: <containerID> [--tty] [--console <pty_slave>] <command> [args...]
 func Exec(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime exec <id> <command> [args...]\n")
+		fmt.Fprintf(os.Stderr, "用法: mini-docker runtime exec <id> [--tty] [--console <pty_slave>] <command> [args...]\n")
 		os.Exit(1)
 	}
 
 	containerID := args[0]
 	validateContainerID(containerID)
+
+	// 解析可选参数
+	isTTY := false
+	consolePath := ""
+	cmdStart := 1
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--tty" {
+			isTTY = true
+			cmdStart = i + 1
+		} else if args[i] == "--console" && i+1 < len(args) {
+			consolePath = args[i+1]
+			isTTY = true
+			cmdStart = i + 2
+			i++
+		} else if args[i] != "" && !isTTY {
+			// 第一个非 --tty/--console 参数就是命令
+			break
+		}
+	}
+
+	if cmdStart >= len(args) {
+		fmt.Fprintf(os.Stderr, "错误: 需要指定命令\n")
+		os.Exit(1)
+	}
 
 	container, err := libcontainer.Load(containerID)
 	if err != nil {
@@ -312,14 +336,28 @@ func Exec(args []string) {
 	}
 
 	process := &libcontainer.Process{
-		Args: args[1:],
+		Args:     args[cmdStart:],
+		Terminal: isTTY,
 	}
 
+	// TTY 模式：打开 PTY Slave 并传递给 libcontainer
+	if isTTY && consolePath != "" {
+		//shim传过来的是pty slave的文件路径名称，打开这个文件即可使用终端
+		consoleFile, err := os.OpenFile(consolePath, os.O_RDWR, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: 打开 console %s 失败: %v\n", consolePath, err)
+			os.Exit(1)
+		}
+		process.ConsoleFile = consoleFile
+	}
+	//container.Exec(process)会阻塞等待容器空间内用户端指定执行的目标命令执行完成。
 	if err := container.Exec(process); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: 在容器内执行命令失败: %v\n", err)
 		os.Exit(1)
 	}
 
+	// 注意：TTY 模式下 PTY 由调用者（shim）管理生命周期
+	// runtime 只需要等待 nsenter 进程退出，不需要也不应该关闭 PTY
 	os.Exit(0)
 }
 

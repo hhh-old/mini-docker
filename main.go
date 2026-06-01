@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"mini-docker/constants"
@@ -495,7 +494,9 @@ func isTerminal() bool {
 
 func handleSIGWINCH(ctx context.Context, containerID string) {
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH)
+	// SIGWINCH 是 Linux 特有的信号，Windows 不支持
+	// 使用条件编译或运行时检查
+	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
 	for {
 		select {
