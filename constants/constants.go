@@ -45,6 +45,13 @@ const (
 
 	// DaemonLogPath 是 daemon 日志文件路径
 	DaemonLogPath = "/var/log/mini-docker/daemon.log"
+
+	// ContainerdSocketPath 是 containerd 独立进程的 Unix Socket 路径
+	// 对齐 Docker: containerd 通过 /run/containerd/containerd.sock 与 dockerd 通信
+	ContainerdSocketPath = MiniDockerRunRoot + "/containerd.sock"
+
+	// ContainerdLogPath 是 containerd 独立进程的日志文件路径
+	ContainerdLogPath = "/var/log/mini-docker/containerd.log"
 )
 
 // 缓冲区大小常量

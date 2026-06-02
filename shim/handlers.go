@@ -35,6 +35,10 @@ func sendError(conn net.Conn, msg string) {
 }
 
 func sendErrorf(conn net.Conn, format string, args ...interface{}) {
+	//args...：这是 Go 中展开切片或可变参数的语法。
+	//在函数内部，args 被声明为 ...interface{}，表示可以接收任意数量、任意类型的参数，并打包成一个切片。
+	//当你在调用 fmt.Sprintf 时写成 fmt.Sprintf(format, args...)，Go 会把 args 这个切片中的每个元素拆开，作为独立的参数传给 Sprintf。
+	//如果没有 ...，则整个 args 切片会被当作 Sprintf 的第二个参数（一个值），这通常不是我们想要的。
 	sendError(conn, fmt.Sprintf(format, args...))
 }
 

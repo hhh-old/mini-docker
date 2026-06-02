@@ -12,17 +12,18 @@ package daemon
   └──────────┘  docker.sock     └──────────┘          └──────────────┘
 
   mini-docker 的对齐架构：
-  ┌──────────┐    Unix Socket    ┌──────────────┐
-  │ mini-    │ ──────────────→  │ mini-docker   │
-  │ docker   │  /var/run/       │ daemon        │
-  │ CLI      │  mini-docker.sock│ (管理所有容器) │
-  └──────────┘                  └──────────────┘
+  ┌──────────┐    Unix Socket    ┌──────────────┐    API    ┌──────────────┐
+  │ mini-    │ ──────────────→  │ mini-docker   │ ──────→  │  containerd  │
+  │ docker   │  /var/run/       │ daemon        │  Socket  │  (独立进程)   │
+  │ CLI      │  mini-docker.sock│               │          │ → shim       │
+  └──────────┘                  └──────────────┘          └──────────────┘
 
   核心改进：
   1. CLI 与容器管理解耦 —— CLI 可退出，Daemon 持续管理
-  2. 后台容器 (-d) 可靠运行 —— Daemon 的 event loop 感知退出
-  3. 支持重启策略 —— Daemon 负责重启崩溃的容器
-  4. 统一事件源 —— 所有容器事件由 Daemon 收集和分发
+  2. containerd 独立进程 —— Daemon 崩溃不影响 containerd 和容器
+  3. 后台容器 (-d) 可靠运行 —— Daemon 的 event loop 感知退出
+  4. 支持重启策略 —— Daemon 负责重启崩溃的容器
+  5. 统一事件源 —— 所有容器事件由 Daemon 收集和分发
 
 =======================================================================
 */
@@ -61,7 +62,7 @@ type Daemon struct {
 	listener   net.Listener
 	eventBus   *EventBus
 	shutdown   chan struct{}
-	service    *containerd.Service
+	service    *containerd.Client // containerd 远程客户端（对齐 Docker: dockerd 通过 gRPC 客户端连接 containerd）
 }
 
 // ContainerLive 运行中容器的运行时状态（仅 Daemon 持有）
@@ -83,7 +84,7 @@ func NewDaemon() *Daemon {
 		containers: make(map[string]*ContainerLive),
 		eventBus:   NewEventBus(),
 		shutdown:   make(chan struct{}),
-		service:    containerd.NewService(),
+		service:    containerd.NewClient(),
 	}
 }
 
@@ -348,7 +349,7 @@ func (d *Daemon) WatchContainer(containerID string) {
 			break
 		}
 		// 如果 shim 不在线，等待容器进程退出
-		if !containerd.IsShimAlive(containerID) {
+		if !d.service.IsShimAlive(containerID) {
 			if state.Info.Pid > 0 && utils.CheckProcessAlive(state.Info.Pid) {
 				log.Printf("容器 %s 的 shim 已离线，直接等待进程退出\n", containerID)
 				for utils.CheckProcessAlive(state.Info.Pid) {
@@ -360,7 +361,7 @@ func (d *Daemon) WatchContainer(containerID string) {
 				}
 			}
 			//此时容器进程已经退出了
-			if info, err := containerd.ReadExitInfo(containerID); err == nil && info != nil {
+			if info, err := d.service.ReadExitInfo(containerID); err == nil && info != nil {
 				exitCode = info.ExitCode
 			} else {
 				exitCode = -1
@@ -582,7 +583,7 @@ func (d *Daemon) restoreContainers() {
 			continue
 		}
 
-		shimAlive := containerd.IsShimAlive(task.ID)
+		shimAlive := d.service.IsShimAlive(task.ID)
 		if !shimAlive {
 			log.Printf("容器 %s 的 shim 进程已离线，尝试降级恢复...\n", task.ID)
 			if d.handleDeadShim(task.ID) {
@@ -593,7 +594,7 @@ func (d *Daemon) restoreContainers() {
 			continue
 		}
 
-		shimPID := containerd.ReadShimPID(task.ID)
+		shimPID := d.service.ReadShimPID(task.ID)
 
 		info, err := containerstore.LoadContainerInfoByID(task.ID)
 		if err != nil {
@@ -633,7 +634,7 @@ func (d *Daemon) handleStoppedTask(taskID string) {
 
 	if info.Status == libcontainer.StatusRunning {
 		exitCode := info.ExitCode
-		if exitInfo, err := containerd.ReadExitInfo(taskID); err == nil && exitInfo != nil {
+		if exitInfo, err := d.service.ReadExitInfo(taskID); err == nil && exitInfo != nil {
 			exitCode = exitInfo.ExitCode
 		}
 		info.Status = libcontainer.StatusStopped

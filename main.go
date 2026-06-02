@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"mini-docker/constants"
+	"mini-docker/containerd"
 	"mini-docker/containerstore"
 	"mini-docker/daemon"
 	"mini-docker/image"
@@ -39,6 +42,8 @@ func main() {
 	switch os.Args[1] {
 	case "daemon":
 		daemonCommand()
+	case "containerd":
+		containerdCommand()
 	case "run":
 		runCommand()
 	case "exec":
@@ -71,7 +76,7 @@ func main() {
 		volumeCommand()
 	case "build":
 		buildCommand()
-	case "runtime":
+	case "runtime": //调用运行时
 		runtimeCommand()
 	case "shim":
 		shim.Run(os.Args[2:])
@@ -88,7 +93,8 @@ func printUsage() {
 	fmt.Println("mini-docker - 一个迷你版 Docker，用于学习容器原理")
 	fmt.Println()
 	fmt.Println("用法:")
-	fmt.Println("  mini-docker daemon                          启动守护进程")
+	fmt.Println("  mini-docker daemon                          启动守护进程（自动拉起 containerd）")
+	fmt.Println("  mini-docker containerd                      启动 containerd 独立进程")
 	fmt.Println("  mini-docker run      [选项] <镜像> <命令>   创建并运行一个新容器")
 	fmt.Println("  mini-docker exec     <容器ID> <命令>        在运行中的容器内执行命令")
 	fmt.Println("  mini-docker ps                              列出所有容器")
@@ -107,6 +113,7 @@ func printUsage() {
 	fmt.Println("  mini-docker build    -t <镜像名> <上下文>       构建镜像")
 	fmt.Println()
 	fmt.Println("内部命令（对齐 Docker 分层架构）:")
+	fmt.Println("  mini-docker containerd                                容器运行时守护进程 (对标 containerd)")
 	fmt.Println("  mini-docker runtime  <create|start|kill|delete|state>  OCI 运行时 (对标 runc)")
 	fmt.Println("  mini-docker shim     <id> <bundle>                    容器 shim 进程 (对标 containerd-shim)")
 	fmt.Println()
@@ -128,7 +135,25 @@ func printUsage() {
 }
 
 // daemonCommand 启动 Daemon 守护进程
+// 对齐 Docker: dockerd 启动时自动拉起 containerd 进程
 func daemonCommand() {
+	// 确保 containerd 进程已启动（对齐 Docker: dockerd 自动启动 containerd）
+	if !containerd.IsContainerdRunning() {
+		fmt.Println("containerd 未运行，正在启动...")
+		if err := startContainerdProcess(); err != nil {
+			fmt.Printf("启动 containerd 失败: %v\n", err)
+			os.Exit(1)
+		}
+		// 等待 containerd 就绪
+		if err := containerd.WaitForContainerd(10 * time.Second); err != nil {
+			fmt.Printf("等待 containerd 就绪超时: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("containerd 已就绪")
+	} else {
+		fmt.Println("containerd 已在运行")
+	}
+
 	d := daemon.NewDaemon()
 	if err := d.Start(); err != nil {
 		fmt.Printf("启动 Daemon 失败: %v\n", err)
@@ -137,6 +162,56 @@ func daemonCommand() {
 
 	// 阻塞等待 Daemon 退出
 	select {}
+}
+
+// containerdCommand 启动 containerd 独立进程
+// 对齐 Docker: containerd 可独立启动，监听自己的 Unix Socket
+func containerdCommand() {
+	c := containerd.NewContainerd()
+	if err := c.Start(); err != nil {
+		fmt.Printf("启动 containerd 失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 阻塞等待 containerd 退出
+	select {}
+}
+
+// startContainerdProcess 以子进程方式启动 containerd
+// 对齐 Docker: dockerd 通过 exec 启动 containerd 二进制
+//
+// 守护化关键步骤（对齐 Linux 守护进程规范）：
+//  1. Setsid: true — 创建新会话（session），脱离控制终端
+//     新会话的创建者自动成为新进程组领袖，无需额外 Setpgid
+//  2. 标准流重定向到日志文件 — 避免终端 I/O 阻塞或收到终端关闭事件
+//
+// 对比 Setpgid vs Setsid：
+//
+//	Setpgid: true → 仅创建新进程组，仍在同一会话中，终端关闭时子进程会收到 SIGHUP
+//	Setsid:  true → 创建新会话 + 新进程组，完全脱离控制终端，终端关闭不影响子进程
+func startContainerdProcess() error {
+	logDir := filepath.Dir(constants.ContainerdLogPath)
+	os.MkdirAll(logDir, 0755)
+
+	logFile, err := os.OpenFile(constants.ContainerdLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("创建 containerd 日志文件失败: %w", err)
+	}
+
+	cmd := exec.Command("/proc/self/exe", "containerd")
+	cmd.Stdin = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // 创建新会话（含新进程组），脱离控制终端,让containerd进程成为真正的守护进程，不能用Setpgid: true，否则终端关闭以后containerd进程还是会收到SIGHUP信号从而终止
+	}
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return err
+	}
+	// 父进程不持有日志文件句柄，交给子进程
+	logFile.Close()
+	return nil
 }
 
 // sendRequest 通过 Daemon 执行请求
