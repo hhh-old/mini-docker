@@ -186,6 +186,7 @@ func extractOverlayFromAnnotations(s *spec.Spec) *types.OverlayDirs {
 	merged := s.Annotations["mini-docker.overlay.merged"]
 	upper := s.Annotations["mini-docker.overlay.upper"]
 	work := s.Annotations["mini-docker.overlay.work"]
+	lower := s.Annotations["mini-docker.overlay.lower"]
 	if merged == "" {
 		return nil
 	}
@@ -193,6 +194,7 @@ func extractOverlayFromAnnotations(s *spec.Spec) *types.OverlayDirs {
 		Merged: merged,
 		Upper:  upper,
 		Work:   work,
+		Lower:  lower,
 	}
 }
 

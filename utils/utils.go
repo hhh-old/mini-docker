@@ -160,3 +160,19 @@ func CleanupPortMapping(portMap string, containerIP string) {
 		"-j", "MASQUERADE")
 	_ = cmd.Run()
 }
+
+// ParseImageTag 解析镜像引用为 name 和 tag
+// 格式: "name" → (name, ""), "name:tag" → (name, tag)
+// 正确处理含端口的 Registry 地址：myreg.com:5000/myapp:v1
+// 规则：如果冒号后包含 /，则该冒号是端口分隔符而非 tag 分隔符
+func ParseImageTag(ref string) (string, string) {
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon == -1 {
+		return ref, ""
+	}
+	afterColon := ref[lastColon+1:]
+	if strings.Contains(afterColon, "/") || strings.Contains(afterColon, ".") {
+		return ref, ""
+	}
+	return ref[:lastColon], afterColon
+}

@@ -40,6 +40,7 @@ type ContainerInfo struct {
 	OverlayMerged     string   `json:"overlay_merged"`
 	OverlayUpper      string   `json:"overlay_upper"`
 	OverlayWork       string   `json:"overlay_work"`
+	OverlayLower      string   `json:"overlay_lower"`       // OverlayFS lowerdir（多层用 ":" 分隔）
 	RestartPolicy     string   `json:"restart_policy"`      // no, always, on-failure
 	MaxRestartRetries int      `json:"max_restart_retries"` // on-failure 最大重启次数
 	Tty               bool     `json:"tty"`
@@ -97,20 +98,30 @@ func ListContainers() ([]*ContainerInfo, error) {
 	return containers, nil
 }
 
-// 宿主机上
+// CreateOverlayDirs 在 snapshots/overlay/ 下创建容器的 OverlayFS 目录
+// 对齐 containerd: 容器可写层由 Snapshotter 管理，与镜像层统一管理
+//
+// Deprecated: 此函数绕过 Snapshotter 直接创建目录，不写入 BoltDB 元数据，
+// 导致 GC 和 lowerDirs() 无法感知该快照。请使用 Snapshotter.Prepare() 替代。
+// 当前容器创建流程已通过 containerd.Client.PrepareSnapshot() 走 Snapshotter.Prepare()。
 func CreateOverlayDirs(containerID string) (*types.OverlayDirs, error) {
-	baseDir := filepath.Join(containerDataDir, containerID, "overlay")
+	// 容器可写层放在 snapshots/overlay/<container-id>/ 下（对齐 containerd）
+	baseDir := filepath.Join(constants.SnapshotterDir, containerID)
+	diffDir := filepath.Join(baseDir, "diff")
 	mergedDir := filepath.Join(baseDir, "merged")
 	upperDir := filepath.Join(baseDir, "upper")
 	workDir := filepath.Join(baseDir, "work")
 
 	os.RemoveAll(baseDir)
 
-	for _, dir := range []string{mergedDir, upperDir, workDir} {
+	for _, dir := range []string{diffDir, mergedDir, upperDir, workDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("创建目录 %s 失败: %w", dir, err)
 		}
 	}
+
+	// 创建 link 文件（对齐 containerd: 快照目录都有 link 文件）
+	os.WriteFile(filepath.Join(baseDir, "link"), []byte(containerID[:16]), 0644)
 
 	return &types.OverlayDirs{
 		Merged: mergedDir,
@@ -214,15 +225,15 @@ func CleanupContainerNetwork(info *ContainerInfo) {
 	nm.Disconnect()
 }
 
+// CleanupOverlay 卸载容器的 OverlayFS 挂载
+// 对齐 containerd: 目录删除由 Snapshotter.Remove 统一处理，此处只负责 umount
+// 原因：Snapshotter.Remove 会同时清理 boltdb 中的快照元数据和磁盘目录
 func CleanupOverlay(info *ContainerInfo) {
 	if info.OverlayMerged == "" {
 		return
 	}
 
 	exec.Command("umount", info.OverlayMerged).Run()
-
-	containerDir := filepath.Join(containerDataDir, info.ID)
-	os.RemoveAll(containerDir)
 }
 
 func CleanupCgroup(cgroupName string) {

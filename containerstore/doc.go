@@ -102,8 +102,8 @@ package containerstore
   docker stop            →  handler.handleStop()        →  shim(KillTask) → unix.Kill
   docker rm              →  handler.handleRm()          →  清理 网络/overlay/cgroup/shim
   docker ps              →  container.ListContainers()   →  读取 JSON 元数据
-  docker pull            →  image.Pull()                →  创建 rootfs 目录
-  docker images          →  image.ListImages()          →  读取 JSON 元数据
+  docker pull            →  images.Service.Pull()        →  创建 rootfs 目录 + 写入 boltdb
+  docker images          →  images.Service.List()        →  读取 boltdb 元数据
   docker network create  →  network.CreateNetwork()    →  ip link add bridge
   -m 100m                →  cgroup.setMemoryLimit()      →  memory.limit_in_bytes
   --cpu-shares 512       →  cgroup.setCpuShares()        →  cpu.shares

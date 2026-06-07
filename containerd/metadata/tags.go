@@ -73,27 +73,3 @@ func ListTags(tx *bolt.Tx) (map[string]map[string]string, error) {
 	}
 	return result, nil
 }
-
-// RemoveTagsByImageID 删除指向指定 imageID 的所有标签
-func RemoveTagsByImageID(tx *bolt.Tx, imageID string) error {
-	b := tx.Bucket(BucketTags)
-	if b == nil {
-		return fmt.Errorf("tags bucket 不存在")
-	}
-	target := []byte(imageID)
-	var keysToDelete [][]byte
-
-	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if string(v) == string(target) {
-			keysToDelete = append(keysToDelete, k)
-		}
-	}
-
-	for _, key := range keysToDelete {
-		if err := b.Delete(key); err != nil {
-			return err
-		}
-	}
-	return nil
-}

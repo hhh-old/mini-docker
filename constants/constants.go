@@ -22,8 +22,13 @@ const (
 	// ContainerDataDir 是容器数据存储目录
 	ContainerDataDir = MiniDockerRoot + "/containers"
 
-	// ImageStoreDir 是镜像存储目录
-	ImageStoreDir = MiniDockerRoot + "/images"
+	// ContentStoreDir 是 Content Store 的根目录（对齐 containerd: io.containerd.content.v1.content/blobs/sha256/）
+	// 存储所有 blob（manifest/config/layer 的原始压缩数据），以 digest 为文件名
+	ContentStoreDir = MiniDockerRoot + "/content/sha256"
+
+	// SnapshotterDir 是 OverlayFS Snapshotter 的根目录（对齐 containerd: io.containerd.snapshotter.v1.overlayfs/）
+	// 存储解压后的镜像层快照
+	SnapshotterDir = MiniDockerRoot + "/snapshots/overlay"
 
 	// NetworkStoreDir 是网络存储目录
 	NetworkStoreDir = MiniDockerRoot + "/networks"
@@ -49,6 +54,9 @@ const (
 	// ContainerdSocketPath 是 containerd 独立进程的 Unix Socket 路径
 	// 对齐 Docker: containerd 通过 /run/containerd/containerd.sock 与 dockerd 通信
 	ContainerdSocketPath = MiniDockerRunRoot + "/containerd.sock"
+
+	// DaemonConfigPath 是 daemon 配置文件路径（对齐 Docker: /etc/docker/daemon.json）
+	DaemonConfigPath = "/etc/mini-docker/daemon.json"
 
 	// ContainerdLogPath 是 containerd 独立进程的日志文件路径
 	ContainerdLogPath = "/var/log/mini-docker/containerd.log"
@@ -110,4 +118,21 @@ const (
 
 	// DefaultGateway 是默认网关
 	DefaultGateway = "172.33.0.1"
+)
+
+// Registry 相关常量
+const (
+	// DefaultRegistry 是默认的 Docker Registry 地址
+	DefaultRegistry = "registry-1.docker.io"
+
+	// DefaultRegistryHost 是 Docker Hub 的认证和 manifest 服务地址
+	// Docker Hub 将 registry-1.docker.io 用于实际 blob 存储，
+	// 而 index.docker.io 用于 manifest 和认证
+	DefaultRegistryHost = "index.docker.io"
+
+	// RegistryPullTimeout 是 Registry HTTP 请求超时时间
+	RegistryPullTimeout = 30 * time.Minute
+
+	// RegistryBlobChunkSize 是从 Registry 下载 blob 时的缓冲区大小 (1MB)
+	RegistryBlobChunkSize = 1024 * 1024
 )

@@ -31,4 +31,5 @@ type OverlayDirs struct {
 	Merged string `json:"merged"`
 	Upper  string `json:"upper"`
 	Work   string `json:"work"`
+	Lower  string `json:"lower"` // OverlayFS lowerdir（多层用 ":" 分隔，由 Snapshotter.Mounts() 构建）
 }

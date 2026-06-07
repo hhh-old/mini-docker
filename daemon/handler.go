@@ -29,7 +29,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,8 +37,10 @@ import (
 
 	"mini-docker/builder"
 	"mini-docker/constants"
+	"mini-docker/containerd"
+	"mini-docker/containerd/images"
+	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
-	"mini-docker/image"
 	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/cgroups"
 	"mini-docker/network"
@@ -203,9 +204,14 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		fmt.Sscanf(mrr, "%d", &maxRestartRetries)
 	}
 
-	rootFSPath := filepath.Join(constants.ImageStoreDir, imageName, "rootfs")
-	if _, err := os.Stat(rootFSPath); os.IsNotExist(err) {
-		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 不存在，请先使用 mini-docker pull 拉取", imageName)}
+	// 对齐 containerd: 通过 ResolveImageBoth 一次性获取 rootfs 路径和 snapshot key，
+	// 避免分别调用 ResolveImage 和 ResolveImageSnapshotKey 导致重复的 RPC 调用
+	rootFSPath, parentSnapKey, err := d.service.ResolveImageBoth(imageName)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 不存在，请先使用 mini-docker pull 拉取: %v", imageName, err)}
+	}
+	if rootFSPath == "" {
+		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 的 rootfs 路径为空", imageName)}
 	}
 
 	containerID := existingID
@@ -224,9 +230,28 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		}
 	}
 
-	overlay, err := containerstore.CreateOverlayDirs(containerID)
+	// 创建容器可写层快照（对齐 containerd: 通过 Snapshotter.Prepare 注册到 boltdb）
+	// parent 为镜像最顶层的 snapshotKey（cacheID），这样 Snapshotter 可以沿 parent 链递归构建多层 lowerdir
+	// GC 通过此关系跟踪容器的快照，删除镜像时不会误删容器正在使用的层
+	if parentSnapKey == "" {
+		log.Printf("警告: 获取镜像 snapshot key 失败: %v，尝试从 rootfs 路径解析", err)
+		// 回退：尝试从 rootfs 路径解析 snapshotKey（兼容旧版本镜像）
+		if strings.Contains(rootFSPath, "/") {
+			rel, err := filepath.Rel(constants.SnapshotterDir, rootFSPath)
+			if err == nil && !strings.HasPrefix(rel, "..") {
+				parts := strings.Split(rel, "/")
+				if len(parts) >= 1 {
+					parentSnapKey = parts[0]
+				}
+			}
+		} else {
+			parentSnapKey = rootFSPath
+		}
+	}
+
+	overlay, err := d.service.PrepareSnapshot(containerID, parentSnapKey)
 	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("创建 OverlayFS 目录失败: %v", err)}
+		return Response{Success: false, Message: fmt.Sprintf("创建容器快照失败: %v", err)}
 	}
 
 	// 先构建 ContainerInfo（持久化的真相来源）
@@ -242,6 +267,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		OverlayMerged:     overlay.Merged,
 		OverlayUpper:      overlay.Upper,
 		OverlayWork:       overlay.Work,
+		OverlayLower:      overlay.Lower,
 		RestartPolicy:     restartPolicy,
 		MaxRestartRetries: maxRestartRetries,
 		Volumes:           volumes,
@@ -257,9 +283,15 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		CPUShares:         cpuShares,
 	}
 
+	// 先保存容器信息到磁盘，containerd 的 handleCreateTask 需要从磁盘读取容器信息来构建 OCI Spec
+	if err := containerstore.SaveContainerInfo(containerInfo); err != nil {
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
+		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
+	}
+
 	shimPID, err := d.service.CreateTask(containerInfo)
 	if err != nil {
-		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true, RemoveInfo: true})
 		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
 	}
 
@@ -458,9 +490,6 @@ func (d *Daemon) handleStart(req Request) Response {
 	}
 
 	savedInfo := *info
-	savedOverlayMerged := info.OverlayMerged
-	savedOverlayUpper := info.OverlayUpper
-	savedOverlayWork := info.OverlayWork
 	savedCgroupName := info.CgroupName
 
 	newReq := buildRunRequest(info)
@@ -474,12 +503,11 @@ func (d *Daemon) handleStart(req Request) Response {
 
 	log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
 	savedInfo.Status = libcontainer.StatusStopped
-	savedInfo.OverlayMerged = savedOverlayMerged
-	savedInfo.OverlayUpper = savedOverlayUpper
-	savedInfo.OverlayWork = savedOverlayWork
+	savedInfo.OverlayMerged = ""
+	savedInfo.OverlayUpper = ""
+	savedInfo.OverlayWork = ""
 	savedInfo.CgroupName = savedCgroupName
 	containerstore.SaveContainerInfo(&savedInfo)
-	containerstore.CreateOverlayDirs(containerID)
 	if savedCgroupName != "" {
 		cgroups.RemoveCgroup(savedCgroupName)
 	}
@@ -666,25 +694,56 @@ func (d *Daemon) handleResize(req Request) Response {
 }
 
 func (d *Daemon) handleImages(req Request) Response {
-	images, err := image.ListImages()
+	images, err := d.service.ListImages()
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("列出镜像失败: %v", err)}
 	}
 	return Response{Success: true, Data: images}
 }
 
-func (d *Daemon) handlePull(req Request) Response {
+func (d *Daemon) handlePull(req Request, conn net.Conn) Response {
 	imageName := req.Args["image"]
 	if imageName == "" {
-		return Response{Success: false, Message: "需要指定镜像名"}
+		// 流式模式下，错误也需要通过连接发送
+		d.sendProgress(conn, ProgressFrameData{
+			Type:    ResultFrame,
+			Status:  StatusError,
+			Success: false,
+			Message: "需要指定镜像名",
+		})
+		return Response{}
 	}
 
-	err := image.Pull(imageName)
+	// 定义从 containerd 接收进度并转发给 CLI 连接的回调
+	// 所有帧（包括 result 帧）都通过此回调转发给 CLI
+	progressFn := func(frame containerd.ProgressFrameData) {
+		// 将进度帧转发为 Daemon 侧的 ProgressFrameData
+		// Type/Status 跨包转换：string-based enum 互转
+		daemonFrame := ProgressFrameData{
+			Type:    FrameType(frame.Type),
+			Status:  ProgressFrameStatus(frame.Status),
+			Message: frame.Message,
+		}
+		// result 帧需要传递 Success 标志和 Data
+		if frame.Type == containerd.ResultFrame {
+			daemonFrame.Success = frame.Status != images.StatusError
+			daemonFrame.Data = frame.Data
+		}
+		d.sendProgress(conn, daemonFrame)
+	}
+
+	_, err := d.service.PullImage(imageName, progressFn)
 	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("拉取镜像失败: %v", err)}
+		// PullImage 内部出错（比如连接 containerd 失败），发送错误结果帧给 CLI
+		d.sendProgress(conn, ProgressFrameData{
+			Type:    ResultFrame,
+			Status:  StatusError,
+			Success: false,
+			Message: fmt.Sprintf("拉取镜像失败: %v", err),
+		})
 	}
 
-	return Response{Success: true, Message: fmt.Sprintf("镜像 %s 拉取成功", imageName)}
+	return Response{}
 }
 
 func (d *Daemon) handleRmi(req Request) Response {
@@ -693,7 +752,7 @@ func (d *Daemon) handleRmi(req Request) Response {
 		return Response{Success: false, Message: "需要指定镜像名"}
 	}
 
-	err := image.RemoveImage(imageName)
+	err := d.service.RemoveImage(imageName)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("删除镜像失败: %v", err)}
 	}
@@ -798,12 +857,30 @@ func (d *Daemon) handleBuild(req Request) Response {
 		DockerfilePath: dockerfilePath,
 		ContextDir:     contextDir,
 		Tag:            tag,
+		Service:        &containerdBuildService{client: d.service},
 	}
 
 	result, err := builder.Build(config)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("构建镜像失败: %v", err)}
 	}
-
 	return Response{Success: true, Data: result}
+}
+
+// containerdBuildService 把 builder.BuildService 桥接到 containerd.Client
+// 让 builder 不直接依赖 containerd 进程通信细节
+type containerdBuildService struct {
+	client *containerd.Client
+}
+
+func (s *containerdBuildService) ResolveImage(imageRef string) (string, error) {
+	return s.client.ResolveImage(imageRef)
+}
+
+func (s *containerdBuildService) RegisterImage(info *images.ImageInfo) error {
+	return s.client.RegisterImage(info)
+}
+
+func (s *containerdBuildService) Snapshotter() snapshots.Snapshotter {
+	return s.client.Snapshotter()
 }

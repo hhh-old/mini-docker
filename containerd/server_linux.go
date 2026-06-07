@@ -261,12 +261,12 @@ func (c *Containerd) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 双向流（attach/exec）和单向进度流（pull_image）都由 routeRequest 自行管理连接生命周期
+	// 双向流（attach/exec）和单向进度流（pull_image）都由 routeRequest 自行管理连接生命周期，所以返回之前没有conn.Close()切断unix socket通信连接
 	if isBidirectionalStream(req.Type) || isProgressStream(req.Type) {
 		c.routeRequest(req, conn)
 		return
 	}
-
+	//非流式请求，一次性请求，写回response以后连接就关闭了
 	resp := c.routeRequest(req, conn)
 	WriteResponse(conn, resp)
 	conn.Close()

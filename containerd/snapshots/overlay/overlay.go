@@ -12,6 +12,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"mini-docker/constants"
+	"mini-docker/containerd/content"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 )
@@ -27,14 +28,22 @@ import (
       ├── diff/       ← 只读层内容 (Committed) 或可写层 (Active)
       ├── upper/      ← 可写层 (仅 Active)
       ├── work/       ← OverlayFS work 目录 (仅 Active)
-      ├── merged/     ← OverlayFS merged (仅 Active，挂载点)
-      └── info.json   ← 快照元数据 (备用，主存储在 boltdb)
+      └── merged/     ← OverlayFS merged (仅 Active，挂载点)
 
   OverlayFS 挂载原理：
   - lowerdir: 只读层，多个用 ":" 分隔，从左到右优先级递增
     （最远祖先在前，最近父在后）
   - upperdir: 可写层，所有修改写入此目录
   - workdir: OverlayFS 内部使用的工作目录
+
+  Commit 语义（对齐 containerd）：
+  - Commit(ctx, name, key) 创建一个新的 Committed 快照（name），
+    源 Active 快照（key）保持不变
+  - 调用方决定是否 Remove 源快照
+  - 这保证了：
+    1. 同一个 Active 快照可以 commit 多次
+    2. commit 失败不影响源快照
+    3. 支持快照分支（同一 parent 创建多个子快照）
 
 =======================================================================
 */
@@ -81,10 +90,10 @@ func (o *OverlaySnapshotter) Prepare(ctx context.Context, key, parent string) ([
 	}
 
 	now := time.Now().Format(constants.TimeFormat)
-	info := &metadata.SnapshotInfo{
+	info := &snapshots.Info{
 		Name:      key,
 		Parent:    parent,
-		Kind:      metadata.KindActive,
+		Kind:      snapshots.KindActive,
 		ReadWrite: true,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -100,42 +109,13 @@ func (o *OverlaySnapshotter) Prepare(ctx context.Context, key, parent string) ([
 	return o.mounts(key)
 }
 
-// View 创建一个只读视图 (用于 inspect)
-func (o *OverlaySnapshotter) View(ctx context.Context, key, parent string) ([]snapshots.Mount, error) {
-	snapDir := filepath.Join(o.root, key)
-	if err := os.MkdirAll(snapDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建快照目录失败: %w", err)
-	}
-
-	diffDir := filepath.Join(snapDir, "diff")
-	if err := os.MkdirAll(diffDir, 0755); err != nil {
-		os.RemoveAll(snapDir)
-		return nil, fmt.Errorf("创建 diff 目录失败: %w", err)
-	}
-
-	now := time.Now().Format(constants.TimeFormat)
-	info := &metadata.SnapshotInfo{
-		Name:      key,
-		Parent:    parent,
-		Kind:      metadata.KindActive,
-		ReadWrite: false,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-
-	if err := o.db.Update(func(tx *bolt.Tx) error {
-		return metadata.SaveSnapshot(tx, info)
-	}); err != nil {
-		os.RemoveAll(snapDir)
-		return nil, fmt.Errorf("保存快照元数据失败: %w", err)
-	}
-
-	return o.mounts(key)
-}
-
 // Commit 将可写快照提交为只读快照
+// 对齐 containerd: 创建新的 Committed 快照，源 Active 快照保持不变
+// name: 新快照的名称
+// key: 源 Active 快照的名称
+// 调用方决定是否 Remove 源快照（key）
 func (o *OverlaySnapshotter) Commit(ctx context.Context, name, key string) error {
-	var snapInfo *metadata.SnapshotInfo
+	var snapInfo *snapshots.Info
 	if err := o.db.View(func(tx *bolt.Tx) error {
 		var err error
 		snapInfo, err = metadata.LoadSnapshot(tx, key)
@@ -144,51 +124,50 @@ func (o *OverlaySnapshotter) Commit(ctx context.Context, name, key string) error
 		return fmt.Errorf("加载快照 %s 失败: %w", key, err)
 	}
 
-	if snapInfo.Kind != metadata.KindActive {
+	if snapInfo.Kind != snapshots.KindActive {
 		return fmt.Errorf("快照 %s 不是 Active 快照，无法 Commit", key)
 	}
 
-	snapDir := filepath.Join(o.root, key)
-	diffDir := filepath.Join(snapDir, "diff")
-	upperDir := filepath.Join(snapDir, "upper")
-
-	if _, err := os.Stat(upperDir); err == nil {
-		if err := mergeUpperToDiff(upperDir, diffDir); err != nil {
-			return fmt.Errorf("合并 upper 到 diff 失败: %w", err)
-		}
-		os.RemoveAll(upperDir)
+	// 创建新的 Committed 快照目录
+	newDir := filepath.Join(o.root, name)
+	newDiffDir := filepath.Join(newDir, "diff")
+	if err := os.MkdirAll(newDiffDir, 0755); err != nil {
+		return fmt.Errorf("创建 Committed 快照目录失败: %w", err)
 	}
 
-	workDir := filepath.Join(snapDir, "work")
-	os.RemoveAll(workDir)
+	// 将源快照的 diff/ 内容复制到新快照的 diff/
+	srcDiffDir := filepath.Join(o.root, key, "diff")
+	if err := mergeDir(srcDiffDir, newDiffDir, false); err != nil {
+		os.RemoveAll(newDir)
+		return fmt.Errorf("复制 diff 目录失败: %w", err)
+	}
 
-	mergedDir := filepath.Join(snapDir, "merged")
-	os.RemoveAll(mergedDir)
+	// 将源快照的 upper/ 内容合并到新快照的 diff/
+	srcUpperDir := filepath.Join(o.root, key, "upper")
+	if _, err := os.Stat(srcUpperDir); err == nil {
+		if err := MergeUpperToDiff(srcUpperDir, newDiffDir); err != nil {
+			os.RemoveAll(newDir)
+			return fmt.Errorf("合并 upper 到 diff 失败: %w", err)
+		}
+	}
 
+	// 保存新快照的元数据
 	now := time.Now().Format(constants.TimeFormat)
-	snapInfo.Kind = metadata.KindCommitted
-	snapInfo.ReadWrite = false
-	snapInfo.UpdatedAt = now
-	if name != key {
-		snapInfo.Name = name
+	committedInfo := &snapshots.Info{
+		Name:      name,
+		Parent:    snapInfo.Parent,
+		Kind:      snapshots.KindCommitted,
+		ReadWrite: false,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Labels:    snapInfo.Labels,
 	}
 
 	if err := o.db.Update(func(tx *bolt.Tx) error {
-		if name != key {
-			if err := metadata.DeleteSnapshot(tx, key); err != nil {
-				return err
-			}
-		}
-		return metadata.SaveSnapshot(tx, snapInfo)
+		return metadata.SaveSnapshot(tx, committedInfo)
 	}); err != nil {
-		return fmt.Errorf("更新快照元数据失败: %w", err)
-	}
-
-	if name != key {
-		newDir := filepath.Join(o.root, name)
-		if err := os.Rename(snapDir, newDir); err != nil {
-			return fmt.Errorf("重命名快照目录失败: %w", err)
-		}
+		os.RemoveAll(newDir)
+		return fmt.Errorf("保存 Committed 快照元数据失败: %w", err)
 	}
 
 	return nil
@@ -218,18 +197,16 @@ func (o *OverlaySnapshotter) Remove(ctx context.Context, key string) error {
 // Walk 遍历所有快照
 func (o *OverlaySnapshotter) Walk(ctx context.Context, fn func(snapshots.Info) error) error {
 	return o.db.View(func(tx *bolt.Tx) error {
-		return metadata.WalkSnapshots(tx, func(info *metadata.SnapshotInfo) error {
-			return fn(snapshots.Info{
-				Name:      info.Name,
-				Parent:    info.Parent,
-				Kind:      snapshots.Kind(info.Kind),
-				ReadWrite: info.ReadWrite,
-				CreatedAt: info.CreatedAt,
-				UpdatedAt: info.UpdatedAt,
-				Labels:    info.Labels,
-			})
+		return metadata.WalkSnapshots(tx, func(info *snapshots.Info) error {
+			return fn(*info)
 		})
 	})
+}
+
+// DiffPath 返回指定快照的 diff 目录路径
+// 对齐 containerd: 通过 Snapshotter 接口获取层路径，而非直接拼接常量路径
+func (o *OverlaySnapshotter) DiffPath(ctx context.Context, key string) (string, error) {
+	return filepath.Join(o.root, key, "diff"), nil
 }
 
 // Close 关闭 Snapshotter（目前为空操作）
@@ -237,9 +214,125 @@ func (o *OverlaySnapshotter) Close() error {
 	return nil
 }
 
+// RegisterCommitted 注册一个已存在的目录为 Committed 快照
+// 对齐 containerd: 镜像解压（Unpack）时，StoreLayer 已将层解压到 snapshots/overlay/<key>/diff/，
+// 但 boltdb 中没有对应的 SnapshotInfo。本方法补注册 SnapshotInfo，建立 parent 链，
+// 使 Snapshotter 的 lowerDirs() 能递归构建多层 lowerdir。
+// 注意：新代码应优先使用 UnpackLayer，RegisterCommitted 仅用于兼容已有 diff/ 目录的补注册场景
+// key: 快照名称（通常为层的 cacheID）
+// parent: 父快照名称（上一层的 cacheID，基础层为空）
+func (o *OverlaySnapshotter) RegisterCommitted(ctx context.Context, key, parent string) error {
+	// 验证 diff/ 目录存在
+	diffDir := filepath.Join(o.root, key, "diff")
+	if _, err := os.Stat(diffDir); err != nil {
+		return fmt.Errorf("快照 %s 的 diff 目录不存在: %w", key, err)
+	}
+
+	now := time.Now().Format(constants.TimeFormat)
+	info := &snapshots.Info{
+		Name:      key,
+		Parent:    parent,
+		Kind:      snapshots.KindCommitted,
+		ReadWrite: false,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := o.db.Update(func(tx *bolt.Tx) error {
+		return metadata.SaveSnapshot(tx, info)
+	}); err != nil {
+		return fmt.Errorf("注册 Committed 快照 %s 失败: %w", key, err)
+	}
+
+	return nil
+}
+
+// UnpackLayer 解压 tar.gz blob 到快照目录并注册为 Committed 快照
+// 对齐 containerd: 将"文件解压"和"元数据注册"合并为原子操作，
+// 避免分两步执行时崩溃导致"文件存在但元数据缺失"的不一致状态。
+// 替代之前的 LayerStore.StoreLayer + Snapshotter.RegisterCommitted 两步操作。
+// blobPath: tar.gz 文件的路径
+// digest: 该层的压缩 digest (sha256:...)，用于生成 cacheID
+// diffID: 该层的未压缩 digest (sha256:...)，用于校验解压后数据的完整性
+// parent: 父快照的 key（上一层的 cacheID，基础层为空）
+// 返回值: cacheID（层的快照标识），由调用方用于关联层 digest
+func (o *OverlaySnapshotter) UnpackLayer(ctx context.Context, blobPath, digest, diffID, parent string) (string, error) {
+	cacheID := content.DigestToCacheID(digest)
+	diffDir := filepath.Join(o.root, cacheID, "diff")
+
+	// 缓存命中：diff/ 目录已存在且元数据已注册
+	if _, err := os.Stat(diffDir); err == nil {
+		// 检查元数据是否也已存在（可能之前崩溃导致文件存在但元数据缺失）
+		var metaExists bool
+		o.db.View(func(tx *bolt.Tx) error {
+			_, err := metadata.LoadSnapshot(tx, cacheID)
+			metaExists = err == nil
+			return nil
+		})
+		if metaExists {
+			return cacheID, nil
+		}
+		// 文件存在但元数据缺失，补注册元数据
+		now := time.Now().Format(constants.TimeFormat)
+		info := &snapshots.Info{
+			Name:      cacheID,
+			Parent:    parent,
+			Kind:      snapshots.KindCommitted,
+			ReadWrite: false,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := o.db.Update(func(tx *bolt.Tx) error {
+			return metadata.SaveSnapshot(tx, info)
+		}); err != nil {
+			return "", fmt.Errorf("补注册 Committed 快照 %s 失败: %w", cacheID, err)
+		}
+		return cacheID, nil
+	}
+
+	// 创建 diff/ 目录
+	if err := os.MkdirAll(diffDir, 0755); err != nil {
+		return "", fmt.Errorf("创建层 diff 目录失败: %w", err)
+	}
+
+	// 解压 tar.gz 到 diff/，同时计算 DiffID 校验
+	actualDiffID, err := extractLayerBlob(blobPath, diffDir)
+	if err != nil {
+		os.RemoveAll(filepath.Join(o.root, cacheID))
+		return "", fmt.Errorf("解压层失败: %w", err)
+	}
+
+	// 对齐 containerd: 校验解压后的 DiffID，确保数据完整性
+	if diffID != "" && actualDiffID != diffID {
+		os.RemoveAll(filepath.Join(o.root, cacheID))
+		return "", fmt.Errorf("DiffID 校验失败: 期望 %s, 实际 %s", diffID, actualDiffID)
+	}
+
+	// 解压成功后立即注册元数据，保证文件与元数据的一致性
+	now := time.Now().Format(constants.TimeFormat)
+	info := &snapshots.Info{
+		Name:      cacheID,
+		Parent:    parent,
+		Kind:      snapshots.KindCommitted,
+		ReadWrite: false,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := o.db.Update(func(tx *bolt.Tx) error {
+		return metadata.SaveSnapshot(tx, info)
+	}); err != nil {
+		// 元数据注册失败，回滚文件以保持一致性
+		os.RemoveAll(filepath.Join(o.root, cacheID))
+		return "", fmt.Errorf("注册 Committed 快照 %s 失败: %w", cacheID, err)
+	}
+
+	return cacheID, nil
+}
+
 // mounts 构建快照的挂载信息
 func (o *OverlaySnapshotter) mounts(key string) ([]snapshots.Mount, error) {
-	var snapInfo *metadata.SnapshotInfo
+	var snapInfo *snapshots.Info
 	if err := o.db.View(func(tx *bolt.Tx) error {
 		var err error
 		snapInfo, err = metadata.LoadSnapshot(tx, key)
@@ -251,7 +344,7 @@ func (o *OverlaySnapshotter) mounts(key string) ([]snapshots.Mount, error) {
 	snapDir := filepath.Join(o.root, snapInfo.Name)
 	diffDir := filepath.Join(snapDir, "diff")
 
-	if snapInfo.Kind == metadata.KindCommitted {
+	if snapInfo.Kind == snapshots.KindCommitted {
 		return []snapshots.Mount{
 			{
 				Type:   "bind",
@@ -301,7 +394,7 @@ func (o *OverlaySnapshotter) lowerDirs(key string) ([]string, error) {
 	current := key
 
 	for current != "" {
-		var snapInfo *metadata.SnapshotInfo
+		var snapInfo *snapshots.Info
 		if err := o.db.View(func(tx *bolt.Tx) error {
 			var err error
 			snapInfo, err = metadata.LoadSnapshot(tx, current)
@@ -322,48 +415,59 @@ func (o *OverlaySnapshotter) lowerDirs(key string) ([]string, error) {
 	return dirs, nil
 }
 
-// mergeUpperToDiff 将 upper 层的文件合并到 diff 目录
-// 对齐 image.go 中的 mergeUpperToDiff 逻辑
-func mergeUpperToDiff(upperDir, diffDir string) error {
-	return filepath.Walk(upperDir, func(path string, info os.FileInfo, err error) error {
+// mergeDir 递归合并目录内容
+// 对齐 containerd: Commit 创建新快照时需要复制源快照的 diff/ 内容
+// continueOnError: true 时遇到错误静默跳过（用于 upper→diff 合并），false 时返回错误（用于快照复制）
+func mergeDir(srcDir, dstDir string, continueOnError bool) error {
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			if continueOnError {
+				return nil
+			}
+			return err
 		}
 
-		rel, relErr := filepath.Rel(upperDir, path)
+		rel, relErr := filepath.Rel(srcDir, path)
 		if relErr != nil || rel == "." {
 			return nil
 		}
 
-		targetPath := filepath.Join(diffDir, rel)
+		targetPath := filepath.Join(dstDir, rel)
 
 		if info.IsDir() {
-			os.MkdirAll(targetPath, info.Mode())
-			return nil
+			return os.MkdirAll(targetPath, info.Mode())
 		}
 
 		if info.Mode()&os.ModeSymlink != 0 {
 			linkTarget, readErr := os.Readlink(path)
 			if readErr != nil {
-				return nil
+				if continueOnError {
+					return nil
+				}
+				return readErr
 			}
 			os.MkdirAll(filepath.Dir(targetPath), 0755)
 			os.Remove(targetPath)
-			os.Symlink(linkTarget, targetPath)
-			return nil
+			return os.Symlink(linkTarget, targetPath)
 		}
 
 		os.MkdirAll(filepath.Dir(targetPath), 0755)
 
 		srcFile, srcErr := os.Open(path)
 		if srcErr != nil {
-			return nil
+			if continueOnError {
+				return nil
+			}
+			return srcErr
 		}
 		defer srcFile.Close()
 
 		dstFile, dstErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
 		if dstErr != nil {
-			return nil
+			if continueOnError {
+				return nil
+			}
+			return dstErr
 		}
 		defer dstFile.Close()
 
@@ -373,4 +477,11 @@ func mergeUpperToDiff(upperDir, diffDir string) error {
 
 		return nil
 	})
+}
+
+// MergeUpperToDiff 将 upper 层的文件合并到 diff 目录
+// 对齐 containerd: Commit 时将 Active 快照的 upper 层内容合并到新快照的 diff/
+// 导出此函数供 image 包的 CreateLayerFromDir 等场景复用，避免重复实现
+func MergeUpperToDiff(upperDir, diffDir string) error {
+	return mergeDir(upperDir, diffDir, true)
 }

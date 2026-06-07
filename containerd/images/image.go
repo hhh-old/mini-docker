@@ -111,7 +111,8 @@ type LayerInfo = metadata.LayerInfo
 */
 
 // ProgressFunc 进度回调函数类型
-type ProgressFunc func(status, message string)
+// status 取值见 progress.go 中定义的 StatusXxx 常量
+type ProgressFunc func(status ProgressFrameStatus, message string)
 
 // pull 拉取/构建镜像，返回 ImageInfo。失败时返回 error。
 // 注意：本函数不进行元数据持久化，调用方需自行注册到 boltdb。
@@ -122,16 +123,12 @@ func pull(imageRef string, progress ProgressFunc, contentStore content.Store, sn
 		return pullFromRegistry(imageRef, progress, contentStore, snap)
 	}
 
-	// 对齐 Docker: 先检查本地是否已有该镜像（通过 boltdb 元数据查询）
-	// 之前的实现通过 os.Stat 检查 snapshots/overlay/<name>/diff 目录，
-	// 但 Registry 拉取的镜像存储路径是 snapshots/overlay/<cacheID>/diff，
-	// 导致已拉取的镜像无法被识别，每次都重新拉取
 	localRootFS := filepath.Join(constants.SnapshotterDir, imageRef, "diff")
 	if _, err := os.Stat(localRootFS); os.IsNotExist(err) {
 		registryRef := "library/" + imageRef
 		return pullFromRegistry(registryRef, progress, contentStore, snap)
 	}
-
+	//TODO 镜像文件已存在，不用本地构建，这是遗留问题了
 	return pullLocal(imageRef, progress, snap)
 }
 
@@ -158,15 +155,15 @@ func pullFromRegistry(imageRef string, progress ProgressFunc, contentStore conte
 		mirrors := GetRegistryMirrors()
 		for _, mirror := range mirrors {
 			mirror = strings.TrimSuffix(mirror, "/")
-			progress("downloading", fmt.Sprintf("尝试从 mirror 拉取: %s/%s:%s", mirror, repository, tag))
+			progress(StatusDownloading, fmt.Sprintf("尝试从 mirror 拉取: %s/%s:%s", mirror, repository, tag))
 			info, err := doPullFromRegistry(mirror, repository, tag, progress, contentStore, snap)
 			if err == nil {
 				return info, nil
 			}
-			progress("error", fmt.Sprintf("mirror %s 拉取失败: %v", mirror, err))
+			progress(StatusError, fmt.Sprintf("mirror %s 拉取失败: %v", mirror, err))
 		}
 		if len(mirrors) > 0 {
-			progress("downloading", "所有 mirror 均失败，回退到原始 Registry...")
+			progress(StatusDownloading, "所有 mirror 均失败，回退到原始 Registry...")
 		}
 	}
 
@@ -175,23 +172,22 @@ func pullFromRegistry(imageRef string, progress ProgressFunc, contentStore conte
 
 // doPullFromRegistry 实际执行从指定 registry 拉取镜像的逻辑
 func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*ImageInfo, error) {
-	progress("downloading", fmt.Sprintf("从 Registry 拉取镜像: %s/%s:%s", registry, repository, tag))
+	progress(StatusDownloading, fmt.Sprintf("从 Registry 拉取镜像: %s/%s:%s", registry, repository, tag))
 
 	client := NewRegistryClient(registry, contentStore)
 
-	progress("downloading", "获取镜像 manifest...")
-	// 对齐 containerd: 使用 DownloadManifest 而非 GetManifest，确保 manifest blob 落盘到 Content Store
-	// 这样 content-addressable 存储完整（manifest/config/layer 全部持久化），支持 image push 和离线 inspect
+	progress(StatusDownloading, "获取镜像 manifest...")
+	// 对齐 containerd: 使用 DownloadManifest 确保 manifest blob 落盘到 Content Store
 	manifest, _, err := client.DownloadManifest(repository, tag)
 	if err != nil {
 		return nil, fmt.Errorf("获取 manifest 失败: %w", err)
 	}
-	progress("downloading", fmt.Sprintf("Manifest 获取成功, %d 层", len(manifest.Layers)))
+	progress(StatusDownloading, fmt.Sprintf("Manifest 获取成功, %d 层", len(manifest.Layers)))
 
-	progress("downloading", "获取镜像配置...")
+	progress(StatusDownloading, "获取镜像配置...")
 	ociConfig, err := client.GetImageConfig(repository, &manifest.Config)
 	if err != nil {
-		progress("warning", fmt.Sprintf("获取镜像配置失败: %v", err))
+		progress(StatusWarning, fmt.Sprintf("获取镜像配置失败: %v", err))
 		ociConfig = &OCIImageConfig{}
 	}
 
@@ -205,15 +201,15 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 		if len(digestShort) > 19 {
 			digestShort = digestShort[:19]
 		}
-		progress("downloading", fmt.Sprintf("下载层 %d/%d (%s, %d bytes)...", i+1, len(manifest.Layers), digestShort, layerDesc.Size))
+		progress(StatusDownloading, fmt.Sprintf("下载层 %d/%d (%s, %d bytes)...", i+1, len(manifest.Layers), digestShort, layerDesc.Size))
 
 		// blob 下载进度回调：将下载字节数转换为可读进度信息
 		blobProgress := func(total, completed int64) {
 			if total > 0 {
 				pct := completed * 100 / total
-				progress("downloading", fmt.Sprintf("下载层 %d/%d: %d/%d bytes (%d%%)", i+1, len(manifest.Layers), completed, total, pct))
+				progress(StatusDownloading, fmt.Sprintf("下载层 %d/%d: %d/%d bytes (%d%%)", i+1, len(manifest.Layers), completed, total, pct))
 			} else {
-				progress("downloading", fmt.Sprintf("下载层 %d/%d: %d bytes", i+1, len(manifest.Layers), completed))
+				progress(StatusDownloading, fmt.Sprintf("下载层 %d/%d: %d bytes", i+1, len(manifest.Layers), completed))
 			}
 		}
 		// 下载这个镜像的这一层 layer 的数据，使用 Digest 唯一标识（镜像中的唯一标识）去下载，返回存储路径
@@ -229,7 +225,7 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 			diffID = ociConfig.RootFS.DiffIDs[i] //解压后的每一层的 SHA-256 哈希值
 		}
 
-		progress("extracting", fmt.Sprintf("解压层 %d/%d...", i+1, len(manifest.Layers)))
+		progress(StatusExtracting, fmt.Sprintf("解压层 %d/%d...", i+1, len(manifest.Layers)))
 		// 对齐 containerd: 通过 Snapshotter.UnpackLayer 统一完成"解压+元数据注册"
 		// 替代之前的 LayerStore.StoreLayer + Snapshotter.RegisterCommitted 两步操作，
 		// 避免分两步执行时崩溃导致"文件存在但元数据缺失"的不一致状态
@@ -243,7 +239,7 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 
 		_ = cacheID // cacheID 已通过 content.DigestToCacheID 与 layerDesc.Digest 关联
 		layerDigests = append(layerDigests, layerDesc.Digest)
-		progress("downloading", fmt.Sprintf("层 %d/%d 完成", i+1, len(manifest.Layers)))
+		progress(StatusDownloading, fmt.Sprintf("层 %d/%d 完成", i+1, len(manifest.Layers)))
 	}
 
 	repoName := repository
@@ -277,7 +273,7 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 		Layers:      layerDigests,
 	}
 
-	progress("complete", fmt.Sprintf("镜像 %s:%s (%s) 拉取成功", repoName, tag, size))
+	progress(StatusComplete, fmt.Sprintf("镜像 %s:%s (%s) 拉取成功", repoName, tag, size))
 
 	return info, nil
 }
@@ -287,12 +283,8 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 func cleanupPullLayers(ctx context.Context, snap snapshots.Snapshotter, contentStore content.Store, layerDigests []string) {
 	for _, digest := range layerDigests {
 		cacheID := content.DigestToCacheID(digest)
-		if snap != nil {
-			snap.Remove(ctx, cacheID)
-		}
-		if contentStore != nil {
-			contentStore.Delete(ctx, digest)
-		}
+		snap.Remove(ctx, cacheID)
+		contentStore.Delete(ctx, digest)
 	}
 }
 
@@ -310,28 +302,28 @@ func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotte
 	snapDir := filepath.Join(constants.SnapshotterDir, name)
 	rootFSPath := filepath.Join(snapDir, "diff")
 
-	progress("building", fmt.Sprintf("构建镜像 %s:%s...", name, tag))
+	progress(StatusBuilding, fmt.Sprintf("构建镜像 %s:%s...", name, tag))
 
-	progress("building", "创建 rootfs 目录结构...")
+	progress(StatusBuilding, "创建 rootfs 目录结构...")
 	if err := createRootFSDirs(rootFSPath); err != nil {
 		os.RemoveAll(snapDir)
 		return nil, fmt.Errorf("创建目录失败: %w", err)
 	}
 
-	progress("building", "创建配置文件...")
+	progress(StatusBuilding, "创建配置文件...")
 	if err := createEtcFiles(rootFSPath); err != nil {
 		os.RemoveAll(snapDir)
 		return nil, fmt.Errorf("创建配置文件失败: %w", err)
 	}
 
 	if err := createDevNodes(rootFSPath); err != nil {
-		progress("warning", fmt.Sprintf("创建设备节点失败: %v", err))
+		progress(StatusWarning, fmt.Sprintf("创建设备节点失败: %v", err))
 	}
 
-	progress("building", "安装 busybox（提供基础命令）...")
+	progress(StatusBuilding, "安装 busybox（提供基础命令）...")
 	if err := setupBusybox(rootFSPath); err != nil {
-		progress("warning", fmt.Sprintf("busybox 安装失败: %v", err))
-		progress("warning", fmt.Sprintf("镜像已创建但缺少基础命令，请手动安装 busybox 到 %s/bin/", rootFSPath))
+		progress(StatusWarning, fmt.Sprintf("busybox 安装失败: %v", err))
+		progress(StatusWarning, fmt.Sprintf("镜像已创建但缺少基础命令，请手动安装 busybox 到 %s/bin/", rootFSPath))
 	}
 
 	size := CalculateRootFSSize(rootFSPath)
@@ -341,10 +333,8 @@ func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotte
 	// 对齐 containerd: 本地构建的镜像也需要注册快照元数据到 boltdb
 	// 这样 GC 能跟踪该快照，容器运行时 lowerDirs() 能沿 parent 链递归构建 lowerdir
 	// 本地构建的镜像使用 name 作为 snapshot key（与 Registry 拉取使用 cacheID 不同）
-	if snap != nil {
-		if err := snap.RegisterCommitted(context.Background(), name, ""); err != nil {
-			progress("warning", fmt.Sprintf("注册本地镜像快照失败: %v", err))
-		}
+	if err := snap.RegisterCommitted(context.Background(), name, ""); err != nil {
+		progress(StatusWarning, fmt.Sprintf("注册本地镜像快照失败: %v", err))
 	}
 
 	info := &ImageInfo{
@@ -358,7 +348,7 @@ func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotte
 		Layers:      []string{layerDigest},
 	}
 
-	progress("complete", fmt.Sprintf("镜像 %s:%s (%s) 构建成功", name, tag, size))
+	progress(StatusComplete, fmt.Sprintf("镜像 %s:%s (%s) 构建成功", name, tag, size))
 
 	return info, nil
 }
@@ -467,10 +457,8 @@ func calculateLayersSize(snap snapshots.Snapshotter, layerDigests []string) stri
 	for _, digest := range layerDigests {
 		var diffDir string
 		cacheID := content.DigestToCacheID(digest)
-		if snap != nil {
-			if path, err := snap.DiffPath(context.Background(), cacheID); err == nil {
-				diffDir = path
-			}
+		if path, err := snap.DiffPath(context.Background(), cacheID); err == nil {
+			diffDir = path
 		}
 		if diffDir == "" {
 			diffDir = LayerDiffDir(digest)

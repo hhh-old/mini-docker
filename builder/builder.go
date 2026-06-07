@@ -53,6 +53,8 @@ import (
 	"time"
 
 	"mini-docker/constants"
+	"mini-docker/containerd/images"
+	"mini-docker/containerd/snapshots"
 	"mini-docker/utils"
 )
 
@@ -60,6 +62,20 @@ type BuildConfig struct {
 	DockerfilePath string
 	ContextDir     string
 	Tag            string
+	Service        BuildService
+}
+
+// BuildService 提供构建过程中需要的镜像操作（与 containerd 解耦）
+// daemon/builder 调用方负责注入具体实现（通常包装 containerd.Client）。
+type BuildService interface {
+	// ResolveImage 通过 name[:tag] 解析已有镜像，返回 rootfs 路径
+	ResolveImage(imageRef string) (string, error)
+	// RegisterImage 注册一个已构建好的镜像（写入元数据 DB）
+	RegisterImage(info *images.ImageInfo) error
+	// Snapshotter 返回 Snapshotter 接口，用于注册构建层的快照元数据
+	// 对齐 containerd: 构建器通过 Snapshotter.RegisterCommitted 注册每层快照，
+	// 确保 GC 和 lowerDirs() 能正确感知构建镜像的层
+	Snapshotter() snapshots.Snapshotter
 }
 
 type BuildResult struct {
@@ -67,6 +83,7 @@ type BuildResult struct {
 	Tag       string
 	Layers    []string
 	ImageID   string
+	Info      *images.ImageInfo
 }
 
 type DockerfileInstruction struct {
@@ -204,6 +221,7 @@ func Build(config BuildConfig) (*BuildResult, error) {
 
 	// 构建上下文：追踪当前状态
 	buildCtx := &buildContext{
+		svc:        config.Service,
 		contextDir: config.ContextDir,
 		workDir:    "/",
 		envVars:    make(map[string]string),
@@ -238,7 +256,7 @@ func Build(config BuildConfig) (*BuildResult, error) {
 	}
 
 	// 4. 生成最终镜像
-	name, tag := parseImageTag(config.Tag)
+	name, tag := utils.ParseImageTag(config.Tag)
 	if name == "" {
 		name = "unnamed"
 	}
@@ -249,11 +267,14 @@ func Build(config BuildConfig) (*BuildResult, error) {
 	result.ImageName = name
 	result.Tag = tag
 	result.Layers = buildCtx.layers
-	result.ImageID = fmt.Sprintf("%x", time.Now().UnixNano())
 
 	// 保存镜像元数据
-	if err := buildCtx.saveFinalImage(name, tag); err != nil {
+	info, err := buildCtx.saveFinalImage(name, tag)
+	if err != nil {
 		fmt.Printf("  警告: 保存镜像元数据失败: %v\n", err)
+	} else {
+		result.ImageID = info.ImageID
+		result.Info = info
 	}
 
 	fmt.Printf("Successfully built %s:%s\n", name, tag)
@@ -262,6 +283,7 @@ func Build(config BuildConfig) (*BuildResult, error) {
 
 // buildContext 构建上下文（跟踪构建状态）
 type buildContext struct {
+	svc            BuildService
 	contextDir     string
 	workDir        string
 	envVars        map[string]string
@@ -275,13 +297,16 @@ type buildContext struct {
 
 func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 	ctx.imageName = inst.Arguments[0]
-	ctx.rootfsPath = filepath.Join(constants.ImageStoreDir, ctx.imageName, "rootfs")
-	ctx.baseRootfsPath = ctx.rootfsPath
 
-	// 检查基础镜像是否存在
-	if _, err := os.Stat(ctx.rootfsPath); os.IsNotExist(err) {
-		return fmt.Errorf("基础镜像 %s 不存在，请先 pull", ctx.imageName)
+	if ctx.svc == nil {
+		return fmt.Errorf("BuildService 未配置，无法解析基础镜像")
 	}
+	rootFS, err := ctx.svc.ResolveImage(ctx.imageName)
+	if err != nil {
+		return fmt.Errorf("基础镜像 %s 不存在，请先 pull: %w", ctx.imageName, err)
+	}
+	ctx.rootfsPath = rootFS
+	ctx.baseRootfsPath = rootFS
 
 	fmt.Printf("    → 基础镜像: %s\n", ctx.imageName)
 	return nil
@@ -292,7 +317,7 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 
 	fmt.Printf("    → 执行: %s\n", cmd)
 
-	buildLayerDir := filepath.Join(constants.ImageStoreDir, ".build-layers")
+	buildLayerDir := filepath.Join(constants.SnapshotterDir, ".build-layers")
 	os.MkdirAll(buildLayerDir, 0755)
 
 	layerID := fmt.Sprintf("run-%d-%x", len(ctx.layers), time.Now().UnixNano())
@@ -430,18 +455,59 @@ func (ctx *buildContext) handleExpose(inst DockerfileInstruction) error {
 	return nil
 }
 
-func (ctx *buildContext) saveFinalImage(name, tag string) error {
-	// 简化实现：保存为传统镜像格式（后续可切换到分层格式）
+func (ctx *buildContext) saveFinalImage(name, tag string) (*images.ImageInfo, error) {
 	fmt.Printf("    → 保存镜像 %s:%s\n", name, tag)
-	return nil
-}
 
-// ---- 辅助函数 ----
-
-func parseImageTag(tag string) (string, string) {
-	parts := strings.SplitN(tag, ":", 2)
-	if len(parts) == 1 {
-		return parts[0], "latest"
+	rootFSPath := ctx.rootfsPath
+	if rootFSPath == "" {
+		rootFSPath = filepath.Join(constants.SnapshotterDir, name, "diff")
 	}
-	return parts[0], parts[1]
+
+	// 获取 Snapshotter，用于注册快照元数据
+	var snap snapshots.Snapshotter
+	if ctx.svc != nil {
+		snap = ctx.svc.Snapshotter()
+	}
+
+	var layerDigests []string
+	var parentDigest string
+	for _, layerID := range ctx.layers {
+		upperDir := filepath.Join(constants.SnapshotterDir, ".build-layers", layerID, "upper")
+		if _, err := os.Stat(upperDir); err == nil {
+			// 对齐 containerd: 传入 Snapshotter 和 parentDigest，注册快照元数据并建立 parent 链
+			digest, err := images.CreateLayerFromDir(upperDir, parentDigest, snap)
+			if err != nil {
+				fmt.Printf("    警告: 创建层 %s 失败: %v\n", layerID, err)
+				continue
+			}
+			layerDigests = append(layerDigests, digest)
+			parentDigest = digest
+		}
+	}
+
+	// 最顶层 digest 作为 snapshotKey，用于容器运行时 PrepareSnapshot 的 parent
+	snapshotKey := ""
+	if len(layerDigests) > 0 {
+		snapshotKey = layerDigests[len(layerDigests)-1]
+	}
+
+	info := &images.ImageInfo{
+		Name:      name,
+		Tag:       tag,
+		ImageID:   fmt.Sprintf("%x", time.Now().UnixNano()),
+		Size:      images.CalculateRootFSSize(rootFSPath),
+		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
+		RootFS:    snapshotKey, // 对齐 Registry 拉取: RootFS 存储最顶层的 snapshotKey
+		Layers:    layerDigests,
+	}
+
+	if ctx.svc == nil {
+		fmt.Printf("    警告: BuildService 未配置，跳过元数据注册\n")
+		return info, nil
+	}
+	if err := ctx.svc.RegisterImage(info); err != nil {
+		return nil, fmt.Errorf("注册镜像元数据失败: %w", err)
+	}
+
+	return info, nil
 }

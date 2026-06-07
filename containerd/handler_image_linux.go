@@ -33,7 +33,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 		// 流式请求：直接通过连接发送错误结果帧
 		resultFrame := ProgressFrameData{
 			Type:    ResultFrame, //结束帧
-			Status:  "error",
+			Status:  images.StatusError,
 			Message: "需要指定镜像名",
 		}
 		data, _ := json.Marshal(resultFrame)
@@ -45,7 +45,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 	if c.imageService == nil {
 		resultFrame := ProgressFrameData{
 			Type:    ResultFrame, //结束帧
-			Status:  "error",
+			Status:  images.StatusError,
 			Message: "镜像服务未初始化",
 		}
 		data, _ := json.Marshal(resultFrame)
@@ -56,7 +56,9 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 	}
 
 	// 定义进度回调：将进度帧写入连接
-	progress := func(status, message string) {
+	// ProgressFunc 的 status 形参已为 images.ProgressFrameStatus 类型，
+	// 直接透传到协议层 ProgressFrameData.Status，无需边界 cast。
+	progress := func(status images.ProgressFrameStatus, message string) {
 		frame := ProgressFrameData{
 			Type:    ProgressFrame,
 			Status:  status,
@@ -74,7 +76,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 	if err != nil {
 		resultFrame := ProgressFrameData{
 			Type:    ResultFrame,
-			Status:  "error",
+			Status:  images.StatusError,
 			Message: fmt.Sprintf("拉取镜像失败: %v", err),
 		}
 		data, _ := json.Marshal(resultFrame)
@@ -86,7 +88,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 
 	resultFrame := ProgressFrameData{
 		Type:    ResultFrame,
-		Status:  "complete",
+		Status:  images.StatusComplete,
 		Message: fmt.Sprintf("镜像 %s 拉取成功", imageName),
 		Data:    info,
 	}

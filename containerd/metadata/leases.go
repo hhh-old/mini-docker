@@ -13,7 +13,23 @@ type LeaseInfo struct {
 	ID        string            `json:"id"`
 	CreatedAt string            `json:"created_at"`
 	Labels    map[string]string `json:"labels,omitempty"`
-	Objects   []string          `json:"objects,omitempty"` // 关联的 digest 列表
+	Objects   []LeaseObject     `json:"objects,omitempty"` // 关联的保护对象列表
+}
+
+// LeaseObjectType 保护对象类型（对齐 containerd: content 和 snapshot 两种资源类型）
+type LeaseObjectType string
+
+const (
+	// LeaseObjectContent 表示 content blob（digest 格式: sha256:abc...）
+	LeaseObjectContent LeaseObjectType = "content"
+	// LeaseObjectSnapshot 表示快照（key 格式: abc...，digest 的 hex 部分）
+	LeaseObjectSnapshot LeaseObjectType = "snapshot"
+)
+
+// LeaseObject 保护对象（对齐 containerd: 每个对象有类型和标识）
+type LeaseObject struct {
+	Type LeaseObjectType `json:"type"`
+	ID   string          `json:"id"`
 }
 
 // SaveLease 保存租约
@@ -56,37 +72,30 @@ func DeleteLease(tx *bolt.Tx, id string) error {
 }
 
 // AddLeaseObject 向租约添加保护对象
-func AddLeaseObject(tx *bolt.Tx, leaseID, digest string) error {
+// 对齐 containerd: 每个对象有类型（content 或 snapshot），GC 根据类型分别标记
+func AddLeaseObject(tx *bolt.Tx, leaseID string, objType LeaseObjectType, objID string) error {
 	info, err := LoadLease(tx, leaseID)
 	if err != nil {
 		return err
 	}
 	// 去重检查
 	for _, obj := range info.Objects {
-		if obj == digest {
+		if obj.Type == objType && obj.ID == objID {
 			return nil
 		}
 	}
-	info.Objects = append(info.Objects, digest)
+	info.Objects = append(info.Objects, LeaseObject{Type: objType, ID: objID})
 	return SaveLease(tx, info)
 }
 
-// ListLeases 列出所有租约
+// ListLeases 列出所有租约（通过 WalkLeases 实现，避免重复遍历逻辑）
 func ListLeases(tx *bolt.Tx) ([]*LeaseInfo, error) {
-	b := tx.Bucket(BucketLeases)
-	if b == nil {
-		return nil, fmt.Errorf("leases bucket 不存在")
-	}
 	var leases []*LeaseInfo
-	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
-		var info LeaseInfo
-		if err := json.Unmarshal(v, &info); err != nil {
-			continue
-		}
-		leases = append(leases, &info)
-	}
-	return leases, nil
+	err := WalkLeases(tx, func(info *LeaseInfo) error {
+		leases = append(leases, info)
+		return nil
+	})
+	return leases, err
 }
 
 // WalkLeases 遍历租约

@@ -77,38 +77,33 @@ func (s *Service) Pull(ctx context.Context, imageRef string, progress ProgressFu
 			tag = "latest"
 		}
 		if existing, err := s.Resolve(ctx, name+":"+tag); err == nil {
-			progress("complete", fmt.Sprintf("镜像 %s:%s 已存在本地", name, tag))
+			progress(StatusComplete, fmt.Sprintf("镜像 %s:%s 已存在本地", name, tag))
 			return existing, nil
 		}
 	}
+	//创建 Lease（GC 保护机制）
+	//为什么需要 Lease : 拉取过程中会创建 blob、写入快照、注册元数据。如果此时 GC 触发，可能把这些"半成品"误清理。Lease 用于告诉 GC: "这些对象正在被使用，不要清理"。
+	leaseID, err := s.leaseMgr.Create(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("创建 lease 失败: %w", err)
+	}
+	defer s.leaseMgr.Delete(ctx, leaseID) //defer Delete 保证流程结束（无论成功或失败）都会删除 lease，解除保护。
 
-	if s.leaseMgr != nil {
-		leaseID, err := s.leaseMgr.Create(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("创建 lease 失败: %w", err)
-		}
-		defer s.leaseMgr.Delete(ctx, leaseID)
-
-		info, err := pull(imageRef, progress, s.content, s.snapshotter)
-		if err != nil {
-			return nil, err
-		}
-
-		progress("registering", "注册镜像元数据...")
-
-		// 对齐 containerd: 层快照已在 pull 流程中通过 Snapshotter.UnpackLayer 原子注册
-		// （解压+元数据注册在同一操作中完成），不再需要事后补注册
-
-		progress("registering", "同步元数据到 boltdb...")
-		if err := s.register(ctx, info, leaseID); err != nil {
-			progress("warning", fmt.Sprintf("同步到 metadata.DB 失败: %v", err))
-		}
-		progress("registering", "元数据同步完成")
-
-		return info, nil
+	info, err := pull(imageRef, progress, s.content, s.snapshotter)
+	if err != nil {
+		return nil, err
 	}
 
-	return pull(imageRef, progress, s.content, s.snapshotter)
+	// 对齐 containerd: 层快照已在 pull 流程中通过 Snapshotter.UnpackLayer 原子注册
+	// （解压+元数据注册在同一操作中完成），不再需要事后补注册
+
+	progress(StatusRegistering, "同步元数据到 boltdb...")
+	if err := s.register(ctx, info, leaseID); err != nil {
+		progress(StatusWarning, fmt.Sprintf("同步到 metadata.DB 失败: %v", err))
+	}
+	progress(StatusRegistering, "元数据同步完成")
+
+	return info, nil
 }
 
 // Register 注册一个已构建好的镜像到 metadata.DB
@@ -159,7 +154,7 @@ func (s *Service) register(ctx context.Context, info *ImageInfo, leaseID string)
 				fmt.Printf("  警告: 保存层 %s 元数据失败: %v\n", layerDigest[:16], err)
 			}
 
-			if s.leaseMgr != nil && leaseID != "" {
+			if leaseID != "" {
 				// 对齐 containerd: lease 同时保护 content digest 和 snapshot key
 				// content digest 保护 blob 文件，snapshot key 保护快照目录和元数据
 				// 使用类型标识区分，避免 GC 启发式误判

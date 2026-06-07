@@ -3,6 +3,7 @@ package metadata
 import (
 	"os"
 	"path/filepath"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -15,6 +16,12 @@ type DB struct {
 }
 
 // Bucket 名称常量（对齐 containerd 的 boltdb schema）
+// bbolt 数据库只认 []byte 类型。
+// bbolt 是一个底层的键值存储引擎，它的 API 设计非常纯粹，所有的 Key（键）和 Bucket 的名字都必须是字节切片（[]byte）。
+// []byte("images")：字符串转字节切片（类型转换）
+// []byte{"images"}：切片字面量初始化
+// bbolt 这种键值数据库中，数据的存储层级是这样的：
+// 数据库 (DB) -> 桶 (Bucket) -> 键值对 (Key-Value)
 var (
 	BucketImages    = []byte("images")    // image_id → ImageManifest JSON
 	BucketLayers    = []byte("layers")    // digest → LayerInfo JSON
@@ -41,7 +48,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 
-	db, err := bolt.Open(path, 0600, nil)
+	// 设置 Timeout 避免 boltdb 在 WSL 等环境下因文件锁残留而永久阻塞
+	// 如果另一个进程持有锁，等待 5 秒后超时返回错误
+	opts := &bolt.Options{Timeout: 5 * time.Second}
+	db, err := bolt.Open(path, 0600, opts) //如果路径下的文件不存在，它会自动帮你创建一个新的数据库文件，程序不会报错。
 	if err != nil {
 		return nil, err
 	}

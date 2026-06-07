@@ -15,9 +15,9 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/containerd"
+	"mini-docker/containerd/images"
 	"mini-docker/containerstore"
 	"mini-docker/daemon"
-	"mini-docker/image"
 	"mini-docker/libcontainer/containerinit"
 	"mini-docker/network"
 	"mini-docker/runtime"
@@ -167,7 +167,11 @@ func daemonCommand() {
 // containerdCommand 启动 containerd 独立进程
 // 对齐 Docker: containerd 可独立启动，监听自己的 Unix Socket
 func containerdCommand() {
-	c := containerd.NewContainerd()
+	c, err := containerd.NewContainerd()
+	if err != nil {
+		fmt.Printf("初始化 containerd 失败: %v\n", err)
+		os.Exit(1)
+	}
 	if err := c.Start(); err != nil {
 		fmt.Printf("启动 containerd 失败: %v\n", err)
 		os.Exit(1)
@@ -363,8 +367,17 @@ parseLoop:
 	}
 
 	if resp.Data != nil {
-		data, _ := json.MarshalIndent(resp.Data, "", "  ")
-		fmt.Println(string(data))
+		// run -d 模式：只打印容器 ID（对齐 Docker 行为）
+		data, _ := json.Marshal(resp.Data)
+		var info struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &info); err == nil && info.ID != "" {
+			fmt.Println(info.ID)
+		} else {
+			data, _ := json.MarshalIndent(resp.Data, "", "  ")
+			fmt.Println(string(data))
+		}
 	}
 }
 
@@ -435,11 +448,11 @@ func runInteractive(reqArgs map[string]string) {
 	//这两条管道并行工作，就实现了用户在键盘上敲一个字母，容器里立刻做出响应并渲染到宿主机屏幕上的效果。
 	go func() {
 		defer close(stdinDone)
-		_, _ = io.Copy(conn, os.Stdin)
+		_, _ = io.Copy(conn, os.Stdin) // 阻塞点 A: os.Stdin.Read()
 	}()
 	go func() {
 		defer close(stdoutDone)
-		_, _ = io.Copy(os.Stdout, conn)
+		_, _ = io.Copy(os.Stdout, conn) // 阻塞点 B: conn.Read()
 	}()
 
 	//阻塞等待退出：
@@ -711,18 +724,26 @@ func imagesCommand() {
 	execSimpleCmd(daemon.Request{Type: "images", Args: map[string]string{}},
 		"列出镜像", func(resp *daemon.Response) {
 			data, _ := json.Marshal(resp.Data)
-			var images []image.ImageInfo
-			if err := json.Unmarshal(data, &images); err != nil {
+			var list []images.ImageInfo
+			if err := json.Unmarshal(data, &list); err != nil {
 				fmt.Printf("解析镜像列表失败: %v\n", err)
 				os.Exit(1)
 			}
-			if len(images) == 0 {
+			if len(list) == 0 {
 				fmt.Println("没有本地镜像，使用 mini-docker pull <镜像名> 拉取镜像")
 				return
 			}
-			fmt.Printf("%-30s %-15s %-20s\n", "镜像名", "大小", "创建时间")
-			for _, img := range images {
-				fmt.Printf("%-30s %-15s %-20s\n", img.Name, img.Size, img.CreatedAt)
+			fmt.Printf("%-20s %-10s %-16s %-10s %-20s\n", "镜像名", "标签", "镜像ID", "大小", "创建时间")
+			for _, img := range list {
+				imageID := img.ImageID
+				if len(imageID) > 12 {
+					imageID = imageID[:12]
+				}
+				tag := img.Tag
+				if tag == "" {
+					tag = "latest"
+				}
+				fmt.Printf("%-20s %-10s %-16s %-10s %-20s\n", img.Name, tag, imageID, img.Size, img.CreatedAt)
 			}
 		}, "")
 }
@@ -731,23 +752,58 @@ func pullCommand() {
 	args := os.Args[2:]
 	if len(args) < 1 {
 		fmt.Println("用法: mini-docker pull <镜像名>")
+		fmt.Println("示例:")
+		fmt.Println("  mini-docker pull alpine              # 从 Docker Hub 拉取")
+		fmt.Println("  mini-docker pull alpine:3.18         # 指定标签")
+		fmt.Println("  mini-docker pull library/nginx       # 指定仓库路径")
+		fmt.Println("  mini-docker pull myreg.com/myapp:v1  # 私有 Registry")
 		os.Exit(1)
 	}
 
 	client := daemon.NewClient().WithTimeout(constants.LongOperationTimeout)
-	resp, err := client.Send(daemon.Request{
-		Type: "pull",
-		Args: map[string]string{"image": args[0]},
-	})
+	conn, err := client.Dial()
 	if err != nil {
 		fmt.Printf("错误: %v\n", err)
 		os.Exit(1)
 	}
-	if !resp.Success {
-		fmt.Printf("拉取镜像失败: %s\n", resp.Message)
+	defer conn.Close()
+
+	// 设置写超时（发送请求）
+	conn.SetWriteDeadline(time.Now().Add(constants.DefaultConnectTimeout))
+
+	data, _ := json.Marshal(daemon.Request{
+		Type: "pull",
+		Args: map[string]string{"image": args[0]},
+	})
+	if _, err := conn.Write(data); err != nil {
+		fmt.Printf("错误: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println(resp.Message)
+
+	// 持续读取进度帧（拉取镜像可能需要较长时间，每次读取刷新超时）
+	decoder := json.NewDecoder(conn)
+	for {
+		conn.SetReadDeadline(time.Now().Add(constants.RegistryPullTimeout))
+		var frame daemon.ProgressFrameData
+		if err := decoder.Decode(&frame); err != nil { // 一帧一读
+			// 连接关闭且没有收到 result 帧，检查是否是正常结束
+			if e, ok := err.(*json.SyntaxError); ok {
+				_ = e
+			}
+			fmt.Printf("读取响应失败: %v\n", err)
+			os.Exit(1)
+		}
+		if frame.Type == daemon.ResultFrame { // 见到 result 帧代表已经拉取完成或失败
+			if !frame.Success {
+				fmt.Printf("拉取镜像失败: %s\n", frame.Message)
+				os.Exit(1)
+			}
+			fmt.Println(frame.Message)
+			break
+		}
+		// 显示进度信息
+		fmt.Println(frame.Message)
+	}
 }
 
 func rmiCommand() {
@@ -935,25 +991,31 @@ func runtimeCommand() {
 		os.Exit(1)
 	}
 
+	var err error
 	switch args[0] {
 	case "create":
-		runtime.Create(args[1:])
+		err = runtime.Create(args[1:])
 	case "start":
-		runtime.Start(args[1:])
+		err = runtime.Start(args[1:])
 	case "kill":
-		runtime.Kill(args[1:])
+		err = runtime.Kill(args[1:])
 	case "delete":
-		runtime.Delete(args[1:])
+		err = runtime.Delete(args[1:])
 	case "state":
-		runtime.State(args[1:])
+		err = runtime.State(args[1:])
 	case "exec":
-		runtime.Exec(args[1:])
+		err = runtime.Exec(args[1:])
 	case "pause":
-		runtime.Pause(args[1:])
+		err = runtime.Pause(args[1:])
 	case "resume":
-		runtime.Resume(args[1:])
+		err = runtime.Resume(args[1:])
 	default:
 		fmt.Printf("未知 runtime 子命令: %s\n", args[0])
+		os.Exit(1)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
 }

@@ -37,8 +37,15 @@ func SetupRootFS(rootFSPath string, overlay *types.OverlayDirs) error {
 
 	var targetPath string
 	if overlay != nil {
+		// 对齐 containerd: lowerdir 由 Snapshotter.Mounts() 构建，包含多层 diff/ 路径
+		// 如果 overlay.Lower 非空（来自 Snapshotter），优先使用它；
+		// 否则回退到 rootFSPath（兼容本地构建的镜像，只有单层 rootfs）
+		lowerDir := overlay.Lower
+		if lowerDir == "" {
+			lowerDir = rootFSPath
+		}
 		options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
-			rootFSPath, overlay.Upper, overlay.Work)
+			lowerDir, overlay.Upper, overlay.Work)
 		//挂载 OverlayFS
 		//unix.Mount("overlay", overlay.Merged, "overlay", 0, options)
 		//结合之前讲过的参数，翻译成大白话就是：

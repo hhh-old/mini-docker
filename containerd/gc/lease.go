@@ -43,9 +43,11 @@ func (lm *LeaseManager) Create(ctx context.Context) (string, error) {
 	return leaseID, nil
 }
 
-func (lm *LeaseManager) AddObject(ctx context.Context, leaseID, digest string) error {
+// AddObject 向租约添加保护对象
+// 对齐 containerd: 每个对象有类型（content 或 snapshot），GC 根据类型分别标记
+func (lm *LeaseManager) AddObject(ctx context.Context, leaseID string, objType metadata.LeaseObjectType, objID string) error {
 	return lm.db.Update(func(tx *bolt.Tx) error {
-		if err := metadata.AddLeaseObject(tx, leaseID, digest); err != nil {
+		if err := metadata.AddLeaseObject(tx, leaseID, objType, objID); err != nil {
 			return fmt.Errorf("添加保护对象失败: %w", err)
 		}
 		return nil

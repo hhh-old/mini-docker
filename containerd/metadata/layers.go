@@ -55,15 +55,6 @@ func DeleteLayer(tx *bolt.Tx, digest string) error {
 	return b.Delete([]byte(digest))
 }
 
-// LayerExists 检查层是否存在
-func LayerExists(tx *bolt.Tx, digest string) bool {
-	b := tx.Bucket(BucketLayers)
-	if b == nil {
-		return false
-	}
-	return b.Get([]byte(digest)) != nil
-}
-
 // HasOtherRefs 检查层是否还被其他镜像引用（除 excludingImageID 外）
 // 用于 GC: 如果某层只被当前要删除的镜像引用，则可以安全清理
 func HasOtherRefs(tx *bolt.Tx, digest string, excludingImageID string) bool {

@@ -85,12 +85,3 @@ func ListImages(tx *bolt.Tx) ([]*ImageManifest, error) {
 	}
 	return images, nil
 }
-
-// ImageExists 检查镜像是否存在
-func ImageExists(tx *bolt.Tx, imageID string) bool {
-	b := tx.Bucket(BucketImages)
-	if b == nil {
-		return false
-	}
-	return b.Get([]byte(imageID)) != nil
-}

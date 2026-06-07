@@ -1,6 +1,7 @@
 package content
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -31,32 +32,48 @@ func NewFilesystemStore(root string, db *metadata.DB) (Store, error) {
 	return &fsStore{root: root, db: db}, nil
 }
 
+// digestPath 将 digest 转换为文件系统路径
+// 对齐 containerd: blobs/sha256/<encoded-digest>，平铺格式，无前缀分桶
 func digestPath(root, digest string) string {
-	hash := digest
-	if strings.HasPrefix(hash, "sha256:") {
-		hash = strings.TrimPrefix(hash, "sha256:")
-	}
-	if len(hash) < 2 {
+	hash := DigestToCacheID(digest)
+	if hash == "" {
 		return ""
 	}
-	return filepath.Join(root, hash[:2], hash)
+	return filepath.Join(root, hash)
 }
 
 type contentWriter struct {
-	store      *fsStore
-	tmpPath    string
-	file       *os.File
-	hash       hash.Hash
-	written    int64
-	mediaType  string
-	committed  bool
+	store   *fsStore
+	tmpPath string
+	file    *os.File
+	//bufWriter的作用：
+	//### 减少 syscall，提升 I/O 吞吐
+	//content store 写的是 OCI blob（manifest/config/layer），单层 tar.gz 动辄几十～几百 MB。 os.File.Write 每次小写入都是一次 write() syscall，没 bufio 的话上层 DownloadBlob 那边一次 Read 几十 KB 就直接落盘，开销爆炸。256KB buffer 一次刷盘能聚合多次写入，对顺序写尤其友好。
+	bufWriter *bufio.Writer
+	hash      hash.Hash
+	written   int64
+	mediaType string
+	committed bool
 }
 
+// ### 写入流程（核心）
+// Writer → Write → Commit 的流程是关键：
+//
+// 1. Writer ：在 root 目录创建临时文件 .tmp-<timestamp>-<pid>
+// 2. Write ：数据同时写入临时文件和 SHA256 哈希计算器（边写边算摘要）
+// 3. Commit ：
+//   - 刷盘并关闭临时文件
+//   - 校验计算的 digest 与期望 digest 是否一致，不一致则删除临时文件并报错
+//   - 将临时文件 rename 为最终的 digest 文件名（幂等：若已存在则直接删除临时文件）
+//   - 将 Info 元信息写入 BoltDB
+//
+// 这种"先写临时文件，再 rename"的方式保证了 原子性 ——不会出现写到一半的不完整数据。
+// Writer也提供了校验写入的内容是否是预期内容的功能（使用sha256）
 func (s *fsStore) Writer(ctx context.Context, expected string, size int64, mediaType string) (Writer, error) {
 	if err := os.MkdirAll(s.root, 0755); err != nil {
 		return nil, err
 	}
-
+	//在 root 目录创建临时文件 .tmp-<timestamp>-<pid>
 	tmpName := fmt.Sprintf(".tmp-%d-%d", time.Now().UnixNano(), os.Getpid())
 	tmpPath := filepath.Join(s.root, tmpName)
 
@@ -69,15 +86,16 @@ func (s *fsStore) Writer(ctx context.Context, expected string, size int64, media
 		store:     s,
 		tmpPath:   tmpPath,
 		file:      f,
+		bufWriter: bufio.NewWriterSize(f, 256*1024),
 		hash:      sha256.New(),
 		mediaType: mediaType,
 	}, nil
 }
 
 func (w *contentWriter) Write(p []byte) (int, error) {
-	n, err := w.file.Write(p)
+	n, err := w.bufWriter.Write(p) // 数据先进 bufio 缓冲
 	if n > 0 {
-		w.hash.Write(p[:n])
+		w.hash.Write(p[:n]) // SHA256 边写边算
 		w.written += int64(n)
 	}
 	return n, err
@@ -87,9 +105,9 @@ func (w *contentWriter) Commit(ctx context.Context, expectedDigest string) error
 	if w.committed {
 		return fmt.Errorf("已经提交")
 	}
-
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("sync 失败: %w", err)
+	// ← 提交前必须 Flush
+	if err := w.bufWriter.Flush(); err != nil {
+		return fmt.Errorf("flush 失败: %w", err)
 	}
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("关闭文件失败: %w", err)
@@ -107,20 +125,16 @@ func (w *contentWriter) Commit(ctx context.Context, expectedDigest string) error
 		hash = strings.TrimPrefix(hash, "sha256:")
 	}
 
-	if len(hash) < 2 {
+	if hash == "" {
 		os.Remove(w.tmpPath)
 		return fmt.Errorf("无效的 digest: %s", calculated)
 	}
 
-	subDir := filepath.Join(w.store.root, hash[:2])
-	if err := os.MkdirAll(subDir, 0755); err != nil {
-		return fmt.Errorf("创建子目录失败: %w", err)
-	}
-
-	finalPath := filepath.Join(subDir, hash)
-	if _, err := os.Stat(finalPath); err == nil {
+	finalPath := filepath.Join(w.store.root, hash)
+	if _, err := os.Stat(finalPath); err == nil { //finalPath 已经存在 → 说明这个 digest 的内容之前已经写入过了（幂等），所以直接删除临时文件即可
 		os.Remove(w.tmpPath)
 	} else {
+		//finalPath 不存在 → 把临时文件 rename 为最终文件名，这就是 创建最终文件的时刻
 		if err := os.Rename(w.tmpPath, finalPath); err != nil {
 			return fmt.Errorf("重命名失败: %w", err)
 		}
@@ -159,6 +173,7 @@ func (w *contentWriter) Close() error {
 	if w.committed {
 		return nil
 	}
+	w.bufWriter.Flush()
 	w.file.Close()
 	os.Remove(w.tmpPath)
 	return nil

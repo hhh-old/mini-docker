@@ -90,6 +90,7 @@ type SpecConfig struct {
 	OverlayMerged string
 	OverlayUpper  string
 	OverlayWork   string
+	OverlayLower  string
 	PortMap       string
 	CgroupName    string
 }
@@ -174,6 +175,7 @@ func DefaultSpec(config *SpecConfig) *Spec {
 		s.Annotations["mini-docker.overlay.merged"] = config.OverlayMerged
 		s.Annotations["mini-docker.overlay.upper"] = config.OverlayUpper
 		s.Annotations["mini-docker.overlay.work"] = config.OverlayWork
+		s.Annotations["mini-docker.overlay.lower"] = config.OverlayLower
 	}
 
 	if config.PortMap != "" {

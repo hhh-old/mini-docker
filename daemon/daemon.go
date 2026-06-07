@@ -29,12 +29,10 @@ package daemon
 */
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"mini-docker/containerstore"
-	"mini-docker/libcontainer"
-	"mini-docker/network"
 	"net"
 	"os"
 	"os/signal"
@@ -45,6 +43,9 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/containerd"
+	"mini-docker/containerstore"
+	"mini-docker/libcontainer"
+	"mini-docker/network"
 	"mini-docker/utils"
 )
 
@@ -207,16 +208,23 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		return
 	}
 
-	resp := d.routeRequest(req, conn)
-
-	if resp.Stream {
-		d.sendResponse(conn, resp)
-		if resp.StreamReady != nil {
-			<-resp.StreamReady
-		}
+	// 路径 3: pull 请求使用流式进度推送模式
+	if req.Type == "pull" {
+		d.routeRequest(req, conn) // handler 内多次 sendProgress 发 JSON 帧
+		conn.Close()
 		return
 	}
 
+	resp := d.routeRequest(req, conn)
+	// 路径 2: 流式响应（run -it / exec），不关连接，让转发逻辑接管
+	if resp.Stream {
+		d.sendResponse(conn, resp) // 写 stream=true 的 JSON 握手
+		if resp.StreamReady != nil {
+			<-resp.StreamReady // 等转发协程就绪
+		}
+		return
+	}
+	// 路径 1: 普通 JSON 响应，短连接
 	d.sendResponse(conn, resp)
 	conn.Close()
 }
@@ -249,7 +257,7 @@ func (d *Daemon) routeRequest(req Request, conn net.Conn) Response {
 	case "images":
 		return d.handleImages(req)
 	case "pull":
-		return d.handlePull(req)
+		return d.handlePull(req, conn)
 	case "rmi":
 		return d.handleRmi(req)
 	case "network_create":
@@ -290,6 +298,17 @@ func (d *Daemon) sendResponse(conn net.Conn, resp Response) {
 		}
 		data = data[n:]
 	}
+}
+
+// sendProgress 向 CLI 连接发送进度帧
+func (d *Daemon) sendProgress(conn net.Conn, frame ProgressFrameData) {
+	data, err := json.Marshal(frame)
+	if err != nil {
+		log.Printf("序列化进度帧失败: %v\n", err)
+		return
+	}
+	data = append(data, '\n') //这一行对 Go 客户端的 decoder.Decode(&frame) 调用没任何作用,Decode() 内部用栈式扫描找 JSON 值的边界（匹配 { / [ / " 等），不需要任何分隔符。
+	conn.Write(data)
 }
 
 // RegisterContainer 注册运行中的容器到 Daemon
@@ -848,7 +867,11 @@ func (d *Daemon) cleanupContainerResources(containerID string, state *ContainerL
 	}
 
 	if opts.CleanupOverlay && info != nil {
+		// 先卸载 OverlayFS（如果已挂载）
 		containerstore.CleanupOverlay(info)
+		// 通过 Snapshotter.Remove 删除快照，同时清理 boltdb 中的元数据
+		// 对齐 containerd: 容器可写层由 Snapshotter 统一管理
+		d.service.Snapshotter().Remove(context.Background(), containerID)
 	}
 
 	if opts.RemoveInfo {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -58,14 +59,13 @@ import (
 
 // RegistryClient Docker Registry API V2 客户端
 type RegistryClient struct {
-	mu                 sync.Mutex // 保护 token/tokenScope 的并发访问
-	host               string
-	scheme             string //协议
-	token              string //当前缓存的 Bearer Token
-	tokenScope         string //及其适用范围（tokenScope）
-	client             *http.Client
-	contentStore       content.Store // blob 存储接口（对齐 containerd: 所有 blob 写入通过 contentStore 完成）
-	manifestRetryCount int
+	mu           sync.Mutex // 保护 token/tokenScope 的并发访问
+	host         string
+	scheme       string //协议
+	token        string //当前缓存的 Bearer Token
+	tokenScope   string //及其适用范围（tokenScope）
+	client       *http.Client
+	contentStore content.Store // blob 存储接口（对齐 containerd: 所有 blob 写入通过 contentStore 完成）
 }
 
 // OCIManifest OCI Image Manifest V2 格式（对齐 Docker）
@@ -111,6 +111,30 @@ type OCIDescriptor struct {
 	MediaType string `json:"mediaType"` // 数据块的类型（是压缩包还是 JSON）
 	Digest    string `json:"digest"`    // 该数据块的唯一 SHA-256 指纹,也是下载时的 Key,用来索引要下载的目标文件
 	Size      int64  `json:"size"`      // 数据块的实际大小（字节数）
+}
+
+// OCIPlatform 平台标识（OCI Image Index 规范）
+// 用于在多架构 manifest list 中选择目标平台的子 manifest
+type OCIPlatform struct {
+	Architecture string `json:"architecture"` // CPU 架构，如 amd64、arm64、arm
+	OS           string `json:"os"`           // 操作系统，如 linux、windows
+	// Variant / OSVersion 在绝大多数场景下用不到，按需扩展
+}
+
+// OCIManifestIndexEntry OCI Image Index（manifest list）中的单个条目
+type OCIManifestIndexEntry struct {
+	MediaType string      `json:"mediaType"` // 子 manifest 的媒体类型
+	Digest    string      `json:"digest"`    // 子 manifest 的 digest，content-addressable
+	Size      int64       `json:"size"`      // 子 manifest 大小
+	Platform  OCIPlatform `json:"platform"`  // 该子 manifest 适用的平台
+}
+
+// OCIManifestIndex OCI Image Index（又称 manifest list）
+// Registry 在按 tag 请求时通常返回这个，按 digest 请求才返回单架构 OCIManifest
+type OCIManifestIndex struct {
+	MediaType   string                  `json:"mediaType"`
+	Manifests   []OCIManifestIndexEntry `json:"manifests"`
+	Annotations map[string]string       `json:"annotations,omitempty"`
 }
 
 // OCIImageConfig OCI Image Config（镜像配置，存储在 blob 中）,是OCIManifest中Config文件解析出来的实体
@@ -241,86 +265,28 @@ func ResolveImageRef(imageRef string) (registry string, repository string, tag s
 }
 
 // DownloadManifest 下载镜像的 OCI Manifest 并落盘到 Content Store
-// 对齐 containerd: manifest 作为 blob 同样需要持久化到 content store，保证 content-addressable 的完整性
-// 与 GetManifest 的区别：本方法额外将 manifest 原始 JSON 落盘到 Content Store
-func (rc *RegistryClient) DownloadManifest(repository, ref string) (*OCIManifest, []byte, error) {
-	manifest, body, err := rc.fetchManifest(repository, ref)
+// reference 支持 tag（如 "latest"）和 digest（如 "sha256:abc..."）两种形式，对齐 Docker Registry API V2:
+//   - 按 tag 请求时，Registry 可能返回 OCI Image Index（多架构 manifest list），本函数自动按当前平台向下解析到单架构 manifest
+//   - 按 digest 请求时，Registry 直接返回单架构 manifest（content-addressable，不可变）
+//
+// 落盘策略：仅单架构 manifest 落盘到 Content Store，index 自身不落盘（content-addressable 模型下，index 可以从
+// 子 manifest 的关系里重建，存储它没意义）。
+func (rc *RegistryClient) DownloadManifest(repository, reference string) (*OCIManifest, []byte, error) {
+	body, err := rc.fetchManifestBlob(repository, reference)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// 对齐 containerd: 将 manifest 原始 JSON 落盘到 Content Store
-	if rc.contentStore != nil && len(body) > 0 {
-		if err := rc.storeManifestBlob(body); err != nil {
-			fmt.Printf("  警告: 保存 manifest blob 到 content store 失败: %v\n", err)
+	// OCI Image Index（多架构清单）时按平台选子 manifest 后重新拉取
+	// 实际场景嵌套深度通常 ≤ 2，循环即可，无递归
+	for isManifestIndex(body) {
+		digest, err := selectPlatformDigest(body)
+		if err != nil {
+			return nil, nil, err
 		}
-	}
-
-	return manifest, body, nil
-}
-
-// fetchManifest 获取 manifest 的通用 HTTP 逻辑（认证、请求、重试、解析，不含持久化）
-// DownloadManifest 和 GetManifest 共享此方法，消除重复的 HTTP 请求代码
-func (rc *RegistryClient) fetchManifest(repository, ref string) (*OCIManifest, []byte, error) {
-	if err := rc.ensureToken(repository); err != nil {
-		return nil, nil, fmt.Errorf("获取认证令牌失败: %w", err)
-	}
-
-	rc.mu.Lock()
-	token := rc.token
-	rc.mu.Unlock()
-
-	url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", rc.scheme, rc.host, repository, ref)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("创建请求失败: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
-	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
-
-	resp, err := rc.client.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("请求 manifest 失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		rc.mu.Lock()
-		rc.manifestRetryCount++
-		retryCount := rc.manifestRetryCount
-		rc.token = ""
-		rc.mu.Unlock()
-		if retryCount > 3 {
-			return nil, nil, fmt.Errorf("获取 manifest 失败: 认证重试次数超过限制 (可能 Token 无效)")
+		if body, err = rc.fetchManifestBlob(repository, digest); err != nil {
+			return nil, nil, err
 		}
-		if err := rc.ensureToken(repository); err != nil {
-			return nil, nil, fmt.Errorf("重新认证失败: %w", err)
-		}
-		return rc.fetchManifest(repository, ref)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		truncateLen := len(body)
-		if truncateLen > 200 {
-			truncateLen = 200
-		}
-		return nil, nil, fmt.Errorf("获取 manifest 失败 (HTTP %d): %s", resp.StatusCode, string(body[:truncateLen]))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("读取 manifest 失败: %w", err)
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	// 处理多架构 manifest list / OCI Image Index
-	if strings.Contains(contentType, "manifest.list.v2+json") ||
-		strings.Contains(contentType, "oci.image.index.v1+json") {
-		return rc.handleManifestList(repository, body)
 	}
 
 	var manifest OCIManifest
@@ -328,15 +294,120 @@ func (rc *RegistryClient) fetchManifest(repository, ref string) (*OCIManifest, [
 		return nil, nil, fmt.Errorf("解析 manifest 失败: %w", err)
 	}
 
-	rc.mu.Lock()
-	rc.manifestRetryCount = 0
-	rc.mu.Unlock()
+	// 对齐 containerd: 将单架构 manifest 原始 JSON 落盘到 Content Store
+	if rc.contentStore != nil && len(body) > 0 {
+		if err := rc.storeManifestBlob(body); err != nil {
+			fmt.Printf("  警告: 保存 manifest blob 到 content store 失败: %v\n", err)
+		}
+	}
+
 	return &manifest, body, nil
 }
 
-// storeManifestBlob 将 manifest 原始 JSON 写入 Content Store
-// 对齐 containerd: manifest 作为 content-addressable blob 存储，其 digest 就是存储 key
-// 与 DownloadBlob 的 downloadBlobViaContentStore 类似，但 manifest 数据已在内存中（无需从网络流读取）
+// fetchManifestBlob 纯 HTTP 拉取（认证 / 401 重试 / 读 body），不做任何解析
+// 从原 fetchManifest 抽出，专注于"拉字节流"这一件事，便于 DownloadManifest 在循环里复用
+// 401 走 ensureToken 重新认证后重试（最多 3 次），用循环而非递归，避免栈深度增长
+func (rc *RegistryClient) fetchManifestBlob(repository, reference string) ([]byte, error) {
+	const maxAuthRetries = 3
+
+	for authAttempt := 0; authAttempt < maxAuthRetries; authAttempt++ {
+		if err := rc.ensureToken(repository); err != nil {
+			return nil, fmt.Errorf("获取认证令牌失败: %w", err)
+		}
+
+		rc.mu.Lock()
+		token := rc.token
+		rc.mu.Unlock()
+
+		url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", rc.scheme, rc.host, repository, reference)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("创建请求失败: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+		req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.list.v2+json")
+		req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
+
+		resp, err := rc.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("请求 manifest 失败: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			// 清除无效 token，下一轮循环会重新获取
+			rc.mu.Lock()
+			rc.token = ""
+			rc.mu.Unlock()
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			truncateLen := len(errBody)
+			if truncateLen > 200 {
+				truncateLen = 200
+			}
+			return nil, fmt.Errorf("获取 manifest 失败 (HTTP %d): %s", resp.StatusCode, string(errBody[:truncateLen]))
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("读取 manifest 失败: %w", err)
+		}
+		return body, nil
+	}
+
+	return nil, fmt.Errorf("获取 manifest 失败: 认证重试 %d 次后仍返回 401（可能 Token 无效）", maxAuthRetries)
+}
+
+// isManifestIndex 判断 body 是否为 OCI Image Index（多架构 manifest list）
+// 用 schemaVersion + mediaType 联合判断，比单纯看 HTTP Content-Type 可靠（不同 Registry 实现 Content-Type 命名不统一）
+func isManifestIndex(body []byte) bool {
+	var head struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+	}
+	if err := json.Unmarshal(body, &head); err != nil {
+		return false
+	}
+	if head.SchemaVersion != 2 {
+		return false
+	}
+	return strings.Contains(head.MediaType, "manifest.list") ||
+		strings.Contains(head.MediaType, "image.index")
+}
+
+// selectPlatformDigest 从 OCI Image Index 中按当前平台选择最匹配的子 manifest，返回其 digest
+// 匹配优先级：1) 精确 GOOS+GOARCH  2) 同 OS 任意架构  3) 第一个
+func selectPlatformDigest(body []byte) (string, error) {
+	var index OCIManifestIndex
+	if err := json.Unmarshal(body, &index); err != nil {
+		return "", fmt.Errorf("解析 manifest index 失败: %w", err)
+	}
+	if len(index.Manifests) == 0 {
+		return "", fmt.Errorf("manifest index 为空")
+	}
+
+	for i := range index.Manifests {
+		if index.Manifests[i].Platform.OS == runtime.GOOS &&
+			index.Manifests[i].Platform.Architecture == runtime.GOARCH {
+			return index.Manifests[i].Digest, nil
+		}
+	}
+	for i := range index.Manifests {
+		if index.Manifests[i].Platform.OS == runtime.GOOS {
+			return index.Manifests[i].Digest, nil
+		}
+	}
+	return index.Manifests[0].Digest, nil
+}
+
+// storeManifestBlob 将字节流形式的 manifest 存入 contentStore（保存到文件系统的 content/sha256 路径）
 func (rc *RegistryClient) storeManifestBlob(body []byte) error {
 	ctx := context.Background()
 
@@ -368,46 +439,6 @@ func (rc *RegistryClient) storeManifestBlob(body []byte) error {
 	}
 
 	return nil
-}
-
-// handleManifestList 处理多架构 manifest list（选择 linux/amd64）
-// Docker Hub 上大多数镜像都有 manifest list，包含多架构支持
-// 对齐 containerd: 使用 DownloadManifest 确保架构特定 manifest 也落盘到 Content Store
-func (rc *RegistryClient) handleManifestList(repository string, body []byte) (*OCIManifest, []byte, error) {
-	var list struct {
-		Manifests []struct {
-			MediaType string `json:"mediaType"`
-			Digest    string `json:"digest"`
-			Platform  struct {
-				Architecture string `json:"architecture"`
-				OS           string `json:"os"`
-			} `json:"platform"`
-		} `json:"manifests"`
-	}
-
-	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, nil, fmt.Errorf("解析 manifest list 失败: %w", err)
-	}
-
-	for _, m := range list.Manifests {
-		if m.Platform.Architecture == "amd64" && m.Platform.OS == "linux" {
-			return rc.DownloadManifest(repository, m.Digest)
-		}
-	}
-
-	if len(list.Manifests) > 0 {
-		return rc.DownloadManifest(repository, list.Manifests[0].Digest)
-	}
-
-	return nil, nil, fmt.Errorf("manifest list 中没有可用的镜像")
-}
-
-// GetManifest 获取镜像的 OCI Manifest（不落盘）
-// 对齐 Docker: GET /v2/<name>/manifests/<ref>
-// 注意: 此方法仅解析返回，不落盘到 Content Store。如需落盘，请使用 DownloadManifest
-func (rc *RegistryClient) GetManifest(repository, tag string) (*OCIManifest, error) {
-	manifest, _, err := rc.fetchManifest(repository, tag)
-	return manifest, err
 }
 
 // BlobProgressFunc blob 下载进度回调

@@ -5,29 +5,12 @@ import (
 	"fmt"
 
 	bolt "go.etcd.io/bbolt"
+
+	"mini-docker/containerd/snapshots"
 )
-
-// Kind 快照类型
-type Kind int
-
-const (
-	KindActive   Kind = iota // 可写快照 (容器运行中)
-	KindCommitted            // 只读快照 (镜像层)
-)
-
-// SnapshotInfo 快照元数据
-type SnapshotInfo struct {
-	Name      string            `json:"name"`
-	Parent    string            `json:"parent,omitempty"`
-	Kind      Kind              `json:"kind"`
-	ReadWrite bool              `json:"read_write"`
-	CreatedAt string            `json:"created_at"`
-	UpdatedAt string            `json:"updated_at"`
-	Labels    map[string]string `json:"labels,omitempty"`
-}
 
 // SaveSnapshot 保存快照元数据
-func SaveSnapshot(tx *bolt.Tx, info *SnapshotInfo) error {
+func SaveSnapshot(tx *bolt.Tx, info *snapshots.Info) error {
 	b := tx.Bucket(BucketSnapshots)
 	if b == nil {
 		return fmt.Errorf("snapshots bucket 不存在")
@@ -40,7 +23,7 @@ func SaveSnapshot(tx *bolt.Tx, info *SnapshotInfo) error {
 }
 
 // LoadSnapshot 加载快照元数据
-func LoadSnapshot(tx *bolt.Tx, key string) (*SnapshotInfo, error) {
+func LoadSnapshot(tx *bolt.Tx, key string) (*snapshots.Info, error) {
 	b := tx.Bucket(BucketSnapshots)
 	if b == nil {
 		return nil, fmt.Errorf("snapshots bucket 不存在")
@@ -49,7 +32,7 @@ func LoadSnapshot(tx *bolt.Tx, key string) (*SnapshotInfo, error) {
 	if data == nil {
 		return nil, fmt.Errorf("快照 %s 不存在", key)
 	}
-	var info SnapshotInfo
+	var info snapshots.Info
 	if err := json.Unmarshal(data, &info); err != nil {
 		return nil, fmt.Errorf("反序列化快照元数据失败: %w", err)
 	}
@@ -65,33 +48,15 @@ func DeleteSnapshot(tx *bolt.Tx, key string) error {
 	return b.Delete([]byte(key))
 }
 
-// ListSnapshots 列出所有快照
-func ListSnapshots(tx *bolt.Tx) ([]*SnapshotInfo, error) {
-	b := tx.Bucket(BucketSnapshots)
-	if b == nil {
-		return nil, fmt.Errorf("snapshots bucket 不存在")
-	}
-	var snapshots []*SnapshotInfo
-	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
-		var info SnapshotInfo
-		if err := json.Unmarshal(v, &info); err != nil {
-			continue
-		}
-		snapshots = append(snapshots, &info)
-	}
-	return snapshots, nil
-}
-
 // WalkSnapshots 遍历快照
-func WalkSnapshots(tx *bolt.Tx, fn func(*SnapshotInfo) error) error {
+func WalkSnapshots(tx *bolt.Tx, fn func(*snapshots.Info) error) error {
 	b := tx.Bucket(BucketSnapshots)
 	if b == nil {
 		return fmt.Errorf("snapshots bucket 不存在")
 	}
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
-		var info SnapshotInfo
+		var info snapshots.Info
 		if err := json.Unmarshal(v, &info); err != nil {
 			continue
 		}
