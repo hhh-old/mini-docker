@@ -1,4 +1,4 @@
-package image
+package images
 
 import (
 	"context"
@@ -23,7 +23,7 @@ import (
 =======================================================================
 
   本文件只负责镜像的 OCI 下载/解压。
-  元数据（manifest / tag / layer 注册）由 image.Service 通过 boltdb 维护。
+  元数据（manifest / tag / layer 注册）由 images.Service 通过 boltdb 维护。
 
   镜像存储结构（对齐 containerd）：
   /var/lib/mini-docker/
@@ -106,7 +106,7 @@ type LayerInfo = metadata.LayerInfo
   - "docker.io/alpine"    → Registry 拉取（含 .）
   - "myreg.com/myapp:v1"  → Registry 拉取（含 . 和 /）
 
-  注意：本函数不写任何元数据。调用方（image.Service）负责把结果同步到 boltdb。
+  注意：本函数不写任何元数据。调用方（images.Service）负责把结果同步到 boltdb。
 =======================================================================
 */
 

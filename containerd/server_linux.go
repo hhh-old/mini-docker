@@ -37,6 +37,15 @@ package containerd
   4. 代理 Daemon 对 shim 的所有操作
   5. 维护 Task 列表和状态
 
+  文件拆分：
+  - server_linux.go          ← 核心结构体、初始化、启动/停止、连接处理、路由
+  - handler_task_linux.go    ← Task 生命周期处理器
+  - handler_image_linux.go   ← 镜像管理处理器
+  - handler_snapshot_linux.go← 快照管理处理器（Prepare/Remove/RegisterCommitted/DiffPath）
+  - handler_gc_linux.go      ← GC 处理器
+  - shim_manager_linux.go    ← Shim 进程管理函数
+  - containerd/gc/adapter.go ← GC 适配器类型（ContentStoreAdapter/SnapshotterAdapter）
+
 =======================================================================
 */
 
@@ -46,45 +55,92 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"mini-docker/constants"
-	"mini-docker/containerstore"
-	"mini-docker/libcontainer"
-	"mini-docker/spec"
-	"mini-docker/types"
-	"mini-docker/utils"
+	"mini-docker/containerd/content"
+	"mini-docker/containerd/gc"
+	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
+	"mini-docker/containerd/snapshots"
+	"mini-docker/containerd/snapshots/overlay"
 )
 
 // ---------------------------------------------------------------------------
 // containerd 进程主体
 // ---------------------------------------------------------------------------
 
-const (
-	runtimeDir = constants.RuntimeDir
-	shimDir    = constants.ShimDir
-)
-
 // Containerd containerd 独立进程主体
 // 对齐 Docker: containerd 作为一个独立守护进程运行，有自己的事件循环和状态管理
+//
+// 字段类型说明：
+//   - snapshotter  使用接口 snapshots.Snapshotter（可插拔：overlay/btrfs/native）
+//   - contentStore 使用接口 content.Store（同上：file/blob/s3 等）
+//   - metaDB/imageService/gcCollector  使用具体类型（当前项目唯一实现，未来如需可插拔再升级为接口）
+//
+// 混用接口/具体类型是有意为之：依赖反转原则（"对扩展开放"）仅在确实存在多种实现的边界处
+// 才有价值。snapshotter 和 contentStore 是真实 containerd 中已存在多实现的标准扩展点，
+// 而其他组件（boltdb 元数据库、image 服务、gc 收集器）目前只有单一实现。
 type Containerd struct {
-	mu       sync.RWMutex
-	listener net.Listener
-	shutdown chan struct{}
+	listener     net.Listener
+	shutdown     chan struct{}
+	metaDB       *metadata.DB
+	contentStore content.Store
+	snapshotter  snapshots.Snapshotter // 对齐 containerd: 依赖接口而非具体类型，支持可插拔 Snapshotter
+	imageService *images.Service
+	gcCollector  *gc.Collector
 }
 
 // NewContainerd 创建 containerd 实例
-func NewContainerd() *Containerd {
-	return &Containerd{
+// 关键组件（metadata.DB）初始化失败时返回 error，避免返回不可用的实例
+func NewContainerd() (*Containerd, error) {
+	c := &Containerd{
 		shutdown: make(chan struct{}),
 	}
+	log.Printf("containerd 进程启动")
+
+	// 初始化 metadata.DB（关键组件，失败则直接返回错误）
+	metaDB, err := metadata.Open(constants.MiniDockerRoot + "/metadata.db")
+	if err != nil {
+		return nil, fmt.Errorf("初始化 metadata.DB 失败: %w", err)
+	}
+	c.metaDB = metaDB
+
+	// 初始化 Content Store（关键组件，镜像拉取/删除依赖此存储）
+	contentRoot := constants.ContentStoreDir
+	contentStore, err := content.NewFilesystemStore(contentRoot, metaDB)
+	if err != nil {
+		c.metaDB.Close()
+		return nil, fmt.Errorf("初始化 Content Store 失败: %w", err)
+	}
+	c.contentStore = contentStore
+
+	// 初始化 Snapshotter（关键组件，镜像层解压和容器运行时依赖此存储）
+	snapRoot := constants.SnapshotterDir
+	snap, err := overlay.NewSnapshotter(snapRoot, metaDB)
+	if err != nil {
+		c.metaDB.Close()
+		return nil, fmt.Errorf("初始化 Snapshotter 失败: %w", err)
+	}
+	c.snapshotter = snap
+
+	// 初始化 Image Service
+	leaseMgr := gc.NewLeaseManager(metaDB)
+	c.imageService = images.NewService(metaDB, contentStore, snap, leaseMgr)
+
+	// 初始化 GC (5分钟周期)
+	// 适配器（ContentDeleter/SnapshotDeleter）已迁移到 containerd/gc/adapter.go，
+	// 这里直接调用包导出的构造函数，避免在 containerd 顶层包内自定义适配器类型
+	gcCollector := gc.NewCollector(metaDB,
+		gc.NewContentStoreAdapter(contentStore),
+		gc.NewSnapshotterAdapter(snap),
+		5*time.Minute)
+	c.gcCollector = gcCollector
+
+	return c, nil
 }
 
 // Start 启动 containerd 独立进程
@@ -97,24 +153,24 @@ func (c *Containerd) Start() error {
 	for _, dir := range []string{
 		constants.MiniDockerRunRoot,
 		filepath.Dir(constants.ContainerdLogPath),
-		runtimeDir,
-		shimDir,
+		constants.RuntimeDir,
+		constants.ShimDir,
 	} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("创建目录 %s 失败: %w", dir, err)
 		}
 	}
 
-	os.Remove(ContainerdSocketPath)
+	os.Remove(constants.ContainerdSocketPath)
 
-	l, err := net.Listen("unix", ContainerdSocketPath)
+	l, err := net.Listen("unix", constants.ContainerdSocketPath)
 	if err != nil {
 		return fmt.Errorf("监听 Unix Socket 失败: %w", err)
 	}
 	c.listener = l
-	os.Chmod(ContainerdSocketPath, 0666)
+	os.Chmod(constants.ContainerdSocketPath, 0666)
 
-	log.Printf("containerd 启动成功，监听 %s (PID: %d)\n", ContainerdSocketPath, os.Getpid())
+	log.Printf("containerd 启动成功，监听 %s (PID: %d)\n", constants.ContainerdSocketPath, os.Getpid())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -127,16 +183,30 @@ func (c *Containerd) Start() error {
 
 	go c.acceptLoop()
 
+	if c.gcCollector != nil {
+		c.gcCollector.Start()
+		log.Println("GC 守护进程已启动 (周期: 5分钟)")
+	}
+
 	return nil
 }
 
 // Stop 优雅关闭 containerd
 func (c *Containerd) Stop() {
 	close(c.shutdown)
+	if c.gcCollector != nil {
+		c.gcCollector.Stop()
+	}
+	if c.metaDB != nil {
+		c.metaDB.Close()
+	}
+	if c.snapshotter != nil {
+		c.snapshotter.Close()
+	}
 	if c.listener != nil {
 		c.listener.Close()
 	}
-	os.Remove(ContainerdSocketPath)
+	os.Remove(constants.ContainerdSocketPath)
 	log.Println("containerd 已停止")
 }
 
@@ -165,15 +235,24 @@ func (c *Containerd) acceptLoop() {
 	}
 }
 
-// isStreamRequest 判断请求是否为流式请求
-// 流式请求在 routeRequest 内部自行管理连接生命周期，不需要外部关闭
-func isStreamRequest(reqType string) bool {
+// isBidirectionalStream 判断请求是否为双向流式请求
+// 双向流式：attach/exec，客户端和服务端在 JSON 握手后切换为原始字节流双向转发
+// 转发过程中连接由转发逻辑自行管理（不调用 conn.Close()）
+func isBidirectionalStream(reqType string) bool {
 	return reqType == ReqAttachTask || reqType == ReqExecTaskStream
+}
+
+// isProgressStream 判断请求是否为单向进度推送流式请求
+// 单向进度流：pull_image，服务端在 JSON 帧中持续推送下载进度
+// 客户端在 ResultFrame 收到后断开连接，不需要双向转发
+func isProgressStream(reqType string) bool {
+	return reqType == ReqPullImage
 }
 
 // handleConnection 处理单个 Daemon 连接
 // 对齐 Docker: containerd 的每个 gRPC 请求都是独立的
-// 流式请求（attach/exec）在发送响应后进入双向转发，连接由转发逻辑管理
+// 流式请求（attach/exec/pull_image）在发送响应后进入转发逻辑，
+// 连接生命周期由转发逻辑管理（attach/exec 双向转发，pull_image 单向进度推送）
 func (c *Containerd) handleConnection(conn net.Conn) {
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -182,8 +261,8 @@ func (c *Containerd) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 流式请求在 routeRequest 内部完成响应发送和双向转发
-	if isStreamRequest(req.Type) {
+	// 双向流（attach/exec）和单向进度流（pull_image）都由 routeRequest 自行管理连接生命周期
+	if isBidirectionalStream(req.Type) || isProgressStream(req.Type) {
 		c.routeRequest(req, conn)
 		return
 	}
@@ -232,6 +311,28 @@ func (c *Containerd) routeRequest(req Request, conn net.Conn) Response {
 		return c.handleReadShimPID(req)
 	case ReqReadExitInfo:
 		return c.handleReadExitInfo(req)
+	case ReqPullImage:
+		return c.handlePullImage(req, conn)
+	case ReqListImages:
+		return c.handleListImages(req)
+	case ReqRemoveImage:
+		return c.handleRemoveImage(req)
+	case ReqInspectImage:
+		return c.handleInspectImage(req)
+	case ReqResolveImage:
+		return c.handleResolveImage(req)
+	case ReqRegisterImage:
+		return c.handleRegisterImage(req)
+	case ReqGC:
+		return c.handleGC(req)
+	case ReqPrepareSnapshot:
+		return c.handlePrepareSnapshot(req)
+	case ReqRemoveSnapshot:
+		return c.handleRemoveSnapshot(req)
+	case ReqRegisterCommitted:
+		return c.handleRegisterCommitted(req)
+	case ReqDiffPath:
+		return c.handleDiffPath(req)
 	case ReqPing:
 		return Response{Success: true, Message: "pong"}
 	default:
@@ -240,740 +341,12 @@ func (c *Containerd) routeRequest(req Request, conn net.Conn) Response {
 }
 
 // ---------------------------------------------------------------------------
-// Task 生命周期处理器
-// ---------------------------------------------------------------------------
-
-// handleCreateTask 处理创建容器任务请求
-// 对齐 Docker: dockerd → containerd.CreateTask → 启动 shim + runtime create
-func (c *Containerd) handleCreateTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-
-	info, err := containerstore.LoadContainerInfoByID(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("加载容器信息失败: %v", err)}
-	}
-
-	bundlePath := filepath.Join(runtimeDir, info.ID, "bundle")
-	ociSpec := buildOCISpec(info)
-	if err := spec.SaveSpec(ociSpec, bundlePath); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("保存 config.json 失败: %v", err)}
-	}
-
-	shimArgs := []string{"shim", info.ID, bundlePath}
-	if info.Tty {
-		shimArgs = append(shimArgs, "--tty")
-	}
-	cmd := newShimCommand(shimArgs)
-
-	logDir := filepath.Join(filepath.Dir(constants.DaemonLogPath), "shim")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("创建 shim 日志目录失败: %v", err)}
-	}
-	logPath := filepath.Join(logDir, info.ID+".log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err == nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-	}
-
-	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			logFile.Close()
-		}
-		return Response{Success: false, Message: fmt.Sprintf("启动 shim 失败: %v", err)}
-	}
-
-	if logFile != nil {
-		logFile.Close()
-	}
-
-	shimPID := cmd.Process.Pid
-
-	socketPath := filepath.Join(shimDir, info.ID, "shim.sock")
-	if err := waitForSocket(socketPath, constants.SocketWaitTimeout); err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		return Response{Success: false, Message: fmt.Sprintf("shim socket 未就绪: %v", err)}
-	}
-
-	return Response{Success: true, Data: map[string]interface{}{"shim_pid": shimPID}}
-}
-
-// handleStartTask 处理启动容器任务请求
-func (c *Containerd) handleStartTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	if err := shimCall(containerID, types.ShimRequest{Type: "start"}); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("启动任务失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleKillTask 处理发送信号请求
-func (c *Containerd) handleKillTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	signalStr := req.Args["signal"]
-	if containerID == "" || signalStr == "" {
-		return Response{Success: false, Message: "需要指定容器 ID 和信号"}
-	}
-	sig, err := strconv.Atoi(signalStr)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("无效信号: %s", signalStr)}
-	}
-	if err := shimCall(containerID, types.ShimRequest{Type: "kill", Signal: sig}); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("发送信号失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleDeleteTask 处理删除容器任务请求
-func (c *Containerd) handleDeleteTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	if err := deleteTask(containerID); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("删除任务失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleShutdownShim 处理关闭 shim 请求
-func (c *Containerd) handleShutdownShim(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	shutdownShim(containerID)
-	return Response{Success: true}
-}
-
-// handleRestartShim 处理重启 shim 请求
-func (c *Containerd) handleRestartShim(req Request) Response {
-	containerID := req.Args["container_id"]
-	pidStr := req.Args["container_pid"]
-	if containerID == "" || pidStr == "" {
-		return Response{Success: false, Message: "需要指定容器 ID 和容器 PID"}
-	}
-	containerPID, err := strconv.Atoi(pidStr)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("无效 PID: %s", pidStr)}
-	}
-	shimPID, err := restartShim(containerID, containerPID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("重启 shim 失败: %v", err)}
-	}
-	return Response{Success: true, Data: map[string]interface{}{"shim_pid": shimPID}}
-}
-
-// handleGetTaskState 处理获取任务状态请求
-func (c *Containerd) handleGetTaskState(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-
-	conn, err := connectShim(containerID)
-	if err != nil {
-		state, loadErr := libcontainer.LoadContainerState(containerID)
-		if loadErr != nil {
-			return Response{Success: false, Message: fmt.Sprintf("获取任务状态失败: %v", loadErr)}
-		}
-		return Response{Success: true, Data: state}
-	}
-	conn.Close()
-
-	var state libcontainer.ContainerState
-	if err := shimCallWithData(containerID, types.ShimRequest{Type: "state"}, &state); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("获取任务状态失败: %v", err)}
-	}
-	return Response{Success: true, Data: state}
-}
-
-// handleGetExitInfo 处理获取退出信息请求
-func (c *Containerd) handleGetExitInfo(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-
-	conn, err := connectShim(containerID)
-	if err != nil {
-		info, readErr := readExitInfoFromFile(containerID)
-		if readErr != nil {
-			return Response{Success: false, Message: fmt.Sprintf("获取退出信息失败: %v", readErr)}
-		}
-		return Response{Success: true, Data: info}
-	}
-	conn.Close()
-
-	var info ExitInfo
-	if err := shimCallWithData(containerID, types.ShimRequest{Type: "exit_info"}, &info); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("获取退出信息失败: %v", err)}
-	}
-	return Response{Success: true, Data: &info}
-}
-
-// handleWaitForCreate 处理等待容器创建完成请求
-func (c *Containerd) handleWaitForCreate(req Request) Response {
-	containerID := req.Args["container_id"]
-	timeoutStr := req.Args["timeout"]
-	if containerID == "" || timeoutStr == "" {
-		return Response{Success: false, Message: "需要指定容器 ID 和超时时间"}
-	}
-	timeoutMs, _ := strconv.Atoi(timeoutStr)
-	timeout := time.Duration(timeoutMs) * time.Millisecond
-
-	pid, err := waitForCreate(containerID, timeout)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("等待容器创建失败: %v", err)}
-	}
-	return Response{Success: true, Data: map[string]interface{}{"pid": pid}}
-}
-
-// handleListTasks 处理列出所有任务请求
-func (c *Containerd) handleListTasks(req Request) Response {
-	states, err := libcontainer.ListContainerStates()
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("列出任务失败: %v", err)}
-	}
-
-	for _, state := range states {
-		if state.Status == libcontainer.StatusRunning || state.Status == libcontainer.StatusCreated {
-			proc, err := os.FindProcess(state.Pid)
-			if err != nil || proc.Signal(syscall.Signal(0)) != nil {
-				state.Status = libcontainer.StatusStopped
-			}
-		}
-	}
-	return Response{Success: true, Data: states}
-}
-
-// handlePauseTask 处理暂停任务请求
-func (c *Containerd) handlePauseTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	if err := shimCall(containerID, types.ShimRequest{Type: "pause"}); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("暂停容器失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleResumeTask 处理恢复任务请求
-func (c *Containerd) handleResumeTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	if err := shimCall(containerID, types.ShimRequest{Type: "unpause"}); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("恢复容器失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleAttachTask 处理 attach 请求（流式连接）
-// 对齐 Docker: dockerd → containerd → shim 的流式 I/O 通道
-// 流式请求处理流程：
-//  1. containerd 连接到 shim 的 attach 接口，获取 shimConn
-//  2. containerd 向 daemon 发送 JSON 响应（stream=true）
-//  3. containerd 在 conn 和 shimConn 之间双向转发字节流
-//  4. 任意一侧断开，转发结束
-func (c *Containerd) handleAttachTask(req Request, conn net.Conn) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-
-	shimConn, err := attachToShim(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("attach 到容器失败: %v", err)}
-	}
-
-	// 先发送响应，然后进入流式转发
-	WriteResponse(conn, Response{Success: true, Stream: true})
-
-	// 双向转发: daemon conn ←→ shim conn
-	var once sync.Once
-	done := make(chan struct{})
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = ioCopy(shimConn, conn)
-	}()
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = ioCopy(conn, shimConn)
-	}()
-	<-done
-	conn.Close()
-	shimConn.Close()
-
-	// 返回空响应表示已处理完毕（流式请求不走常规返回路径）
-	return Response{}
-}
-
-// handleExecTaskStream 处理 exec 流式请求
-func (c *Containerd) handleExecTaskStream(req Request, conn net.Conn) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-
-	tty := req.Args["tty"] == "true"
-	var args []string
-	if argsJSON := req.Args["args_json"]; argsJSON != "" {
-		json.Unmarshal([]byte(argsJSON), &args)
-	}
-
-	shimConn, err := execTaskStream(containerID, args, tty)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("执行命令失败: %v", err)}
-	}
-
-	// 先发送响应，然后进入流式转发
-	WriteResponse(conn, Response{Success: true, Stream: true})
-
-	// 双向转发: daemon conn ←→ shim conn
-	var once sync.Once
-	done := make(chan struct{})
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = ioCopy(shimConn, conn)
-	}()
-	go func() {
-		defer once.Do(func() { close(done) })
-		_, _ = ioCopy(conn, shimConn)
-	}()
-	<-done
-	conn.Close()
-	shimConn.Close()
-
-	return Response{}
-}
-
-// ioCopy 是 io.Copy 的别名，避免导入 io 包与本地变量冲突
-func ioCopy(dst net.Conn, src net.Conn) (int64, error) {
-	buf := make([]byte, 32768)
-	var total int64
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			_, werr := dst.Write(buf[:n])
-			if werr != nil {
-				return total, werr
-			}
-			total += int64(n)
-		}
-		if err != nil {
-			return total, err
-		}
-	}
-}
-
-// handleResizeTask 处理调整终端大小请求
-func (c *Containerd) handleResizeTask(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	var rows, cols uint16
-	fmt.Sscanf(req.Args["rows"], "%d", &rows)
-	fmt.Sscanf(req.Args["cols"], "%d", &cols)
-	if err := shimCall(containerID, types.ShimRequest{Type: "resize", Rows: rows, Cols: cols}); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("调整窗口大小失败: %v", err)}
-	}
-	return Response{Success: true}
-}
-
-// handleIsShimAlive 处理检查 shim 是否存活请求
-func (c *Containerd) handleIsShimAlive(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	alive := isShimAlive(containerID)
-	return Response{Success: true, Data: map[string]interface{}{"alive": alive}}
-}
-
-// handleReadShimPID 处理读取 shim PID 请求
-func (c *Containerd) handleReadShimPID(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	pid := readShimPID(containerID)
-	return Response{Success: true, Data: map[string]interface{}{"pid": pid}}
-}
-
-// handleReadExitInfo 处理读取退出信息请求
-func (c *Containerd) handleReadExitInfo(req Request) Response {
-	containerID := req.Args["container_id"]
-	if containerID == "" {
-		return Response{Success: false, Message: "容器 ID 不能为空"}
-	}
-	info, err := readExitInfoFromFile(containerID)
-	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("读取退出信息失败: %v", err)}
-	}
-	return Response{Success: true, Data: info}
-}
-
-// ---------------------------------------------------------------------------
-// 内部实现函数（从原 service.go 迁移）
-// ---------------------------------------------------------------------------
-
-// ExitInfo 退出信息类型别名
-type ExitInfo = types.ExitInfo
-
-func resolveShimDir(containerID string) string {
-	return filepath.Join(shimDir, containerID)
-}
-
-func connectShim(containerID string) (net.Conn, error) {
-	shimContainerDir := resolveShimDir(containerID)
-	socketPath := filepath.Join(shimContainerDir, "shim.sock")
-	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("连接 shim 失败: %w", err)
-	}
-	return conn, nil
-}
-
-func shimCall(containerID string, req types.ShimRequest) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送%s请求失败: %w", req.Type, err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取%s响应失败: %w", req.Type, err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("%s失败: %s", req.Type, resp.Message)
-	}
-	return nil
-}
-
-func shimCallWithData(containerID string, req types.ShimRequest, result any) error {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("发送%s请求失败: %w", req.Type, err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return fmt.Errorf("读取%s响应失败: %w", req.Type, err)
-	}
-	if !resp.Success {
-		return fmt.Errorf("%s失败: %s", req.Type, resp.Message)
-	}
-
-	data, _ := json.Marshal(resp.Data)
-	if err := json.Unmarshal(data, result); err != nil {
-		return fmt.Errorf("解析%s数据失败: %w", req.Type, err)
-	}
-	return nil
-}
-
-func readExitInfoFromFile(containerID string) (*ExitInfo, error) {
-	shimContainerDir := resolveShimDir(containerID)
-	exitPath := filepath.Join(shimContainerDir, "exit.json")
-	data, err := os.ReadFile(exitPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取退出信息失败: %w", err)
-	}
-	var info ExitInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("解析退出信息失败: %w", err)
-	}
-	return &info, nil
-}
-
-func waitForSocket(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("unix", path, constants.ShimConnectTimeout)
-		if err == nil {
-			conn.Close()
-			return nil
-		}
-		time.Sleep(constants.PollInterval)
-	}
-	return fmt.Errorf("等待 socket %s 超时", path)
-}
-
-func buildOCISpec(info *containerstore.ContainerInfo) *spec.Spec {
-	return spec.DefaultSpec(&spec.SpecConfig{
-		Tty:           info.Tty,
-		Memory:        info.Memory,
-		CPUShares:     info.CPUShares,
-		Image:         info.Image,
-		RootFS:        info.RootFS,
-		Cmd:           info.Cmd,
-		Volumes:       info.Volumes,
-		Hostname:      info.Name,
-		Network:       info.Network,
-		RestartPolicy: info.RestartPolicy,
-		OverlayMerged: info.OverlayMerged,
-		OverlayUpper:  info.OverlayUpper,
-		OverlayWork:   info.OverlayWork,
-		PortMap:       info.PortMap,
-		CgroupName:    info.CgroupName,
-	})
-}
-
-func isShimAlive(containerID string) bool {
-	shimContainerDir := resolveShimDir(containerID)
-	socketPath := filepath.Join(shimContainerDir, "shim.sock")
-	conn, err := net.DialTimeout("unix", socketPath, constants.ShimConnectTimeout)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
-
-func readShimPID(containerID string) int {
-	pidPath := filepath.Join(resolveShimDir(containerID), "shim.pid")
-	data, err := os.ReadFile(pidPath)
-	if err != nil {
-		return 0
-	}
-	var pid int
-	fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
-	return pid
-}
-
-func deleteTask(containerID string) error {
-	conn, err := connectShim(containerID)
-	if err == nil {
-		json.NewEncoder(conn).Encode(types.ShimRequest{Type: "shutdown"})
-		conn.Close()
-		shimPID := readShimPID(containerID)
-		if shimPID > 0 {
-			exited := false
-			for i := 0; i < 30; i++ {
-				if proc, e := os.FindProcess(shimPID); e == nil {
-					if proc.Signal(syscall.Signal(0)) != nil {
-						exited = true
-						break
-					}
-				} else {
-					exited = true
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			if !exited {
-				if proc, e := os.FindProcess(shimPID); e == nil {
-					proc.Signal(syscall.SIGKILL)
-					for i := 0; i < 50; i++ {
-						if proc.Signal(syscall.Signal(0)) != nil {
-							break
-						}
-						time.Sleep(100 * time.Millisecond)
-					}
-				}
-			}
-		} else {
-			time.Sleep(2 * time.Second)
-		}
-	} else {
-		shimPID := readShimPID(containerID)
-		if shimPID > 0 {
-			if proc, e := os.FindProcess(shimPID); e == nil {
-				proc.Signal(syscall.SIGKILL)
-				for i := 0; i < 50; i++ {
-					if proc.Signal(syscall.Signal(0)) != nil {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
-		}
-	}
-
-	containerPID := 0
-	if info, err := readExitInfoFromFile(containerID); err != nil || info == nil {
-		createdPath := filepath.Join(resolveShimDir(containerID), "created")
-		if data, err := os.ReadFile(createdPath); err == nil {
-			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &containerPID)
-		}
-	}
-
-	if containerPID > 0 && utils.CheckProcessAlive(containerPID) {
-		if proc, err := os.FindProcess(containerPID); err == nil {
-			proc.Signal(syscall.SIGKILL)
-			for i := 0; i < 50; i++ {
-				if !utils.CheckProcessAlive(containerPID) {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-	}
-
-	stateDir := filepath.Join(runtimeDir, containerID)
-	os.RemoveAll(stateDir)
-
-	shimContainerDir := resolveShimDir(containerID)
-	os.RemoveAll(shimContainerDir)
-
-	return nil
-}
-
-func shutdownShim(containerID string) {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return
-	}
-	json.NewEncoder(conn).Encode(types.ShimRequest{Type: "shutdown"})
-	conn.Close()
-	time.Sleep(constants.ShutdownWaitTime)
-}
-
-func restartShim(containerID string, containerPID int) (int, error) {
-	bundlePath := filepath.Join(runtimeDir, containerID, "bundle")
-	if _, err := os.Stat(bundlePath); err != nil {
-		return 0, fmt.Errorf("bundle 目录不存在: %w", err)
-	}
-
-	shimContainerDir := resolveShimDir(containerID)
-	os.Remove(filepath.Join(shimContainerDir, "shim.sock"))
-	os.Remove(filepath.Join(shimContainerDir, "shim.pid"))
-	os.Remove(filepath.Join(shimContainerDir, "created"))
-	os.Remove(filepath.Join(shimContainerDir, "exit.json"))
-
-	cmd := newShimCommand([]string{"shim", containerID, bundlePath, "--takeover", fmt.Sprintf("%d", containerPID)})
-
-	logDir := filepath.Join(filepath.Dir(constants.DaemonLogPath), "shim")
-	logPath := filepath.Join(logDir, containerID+".log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err == nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-	}
-	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			logFile.Close()
-		}
-		return 0, fmt.Errorf("启动 shim 失败: %w", err)
-	}
-	if logFile != nil {
-		logFile.Close()
-	}
-
-	shimPID := cmd.Process.Pid
-
-	socketPath := filepath.Join(shimContainerDir, "shim.sock")
-	if err := waitForSocket(socketPath, constants.SocketWaitTimeout); err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		return 0, fmt.Errorf("shim socket 未就绪: %w", err)
-	}
-
-	return shimPID, nil
-}
-
-func waitForCreate(containerID string, timeout time.Duration) (int, error) {
-	shimContainerDir := resolveShimDir(containerID)
-	createdPath := filepath.Join(shimContainerDir, "created")
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(createdPath)
-		if err == nil {
-			pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-			if pid > 0 {
-				return pid, nil
-			}
-		}
-		time.Sleep(constants.PollInterval)
-	}
-	return 0, fmt.Errorf("等待容器 %s 创建超时", containerID)
-}
-
-func attachToShim(containerID string) (net.Conn, error) {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return nil, err
-	}
-
-	req := types.ShimRequest{Type: "attach"}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("发送 attach 请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("读取 attach 响应失败: %w", err)
-	}
-	if !resp.Success {
-		conn.Close()
-		return nil, fmt.Errorf("attach 失败: %s", resp.Message)
-	}
-	return conn, nil
-}
-
-func execTaskStream(containerID string, args []string, tty bool) (net.Conn, error) {
-	conn, err := connectShim(containerID)
-	if err != nil {
-		return nil, err
-	}
-
-	req := types.ShimRequest{Type: "exec", Args: args, Tty: tty}
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("发送请求失败: %w", err)
-	}
-
-	var resp types.ShimResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	if !resp.Success {
-		conn.Close()
-		return nil, fmt.Errorf("%s", resp.Message)
-	}
-
-	return conn, nil
-}
-
-// newShimCommand 创建 shim 进程命令
-// containerd 独立进程后，使用 /proc/self/exe 仍然可行（同一个二进制）
-func newShimCommand(args []string) *exec.Cmd {
-	cmd := exec.Command("/proc/self/exe", args...)
-	cmd.SysProcAttr = newShimSysProcAttr()
-	return cmd
-}
-
-// ---------------------------------------------------------------------------
 // containerd 进程管理（供 Daemon 调用的包级函数）
 // ---------------------------------------------------------------------------
 
 // IsContainerdRunning 检查 containerd 是否已在运行
 func IsContainerdRunning() bool {
-	conn, err := net.DialTimeout("unix", ContainerdSocketPath, time.Second)
+	conn, err := net.DialTimeout("unix", constants.ContainerdSocketPath, time.Second)
 	if err != nil {
 		return false
 	}
@@ -985,7 +358,7 @@ func IsContainerdRunning() bool {
 func WaitForContainerd(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("unix", ContainerdSocketPath, time.Second)
+		conn, err := net.DialTimeout("unix", constants.ContainerdSocketPath, time.Second)
 		if err == nil {
 			conn.Close()
 			return nil
