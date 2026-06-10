@@ -200,11 +200,11 @@ func (s *fsStore) Delete(ctx context.Context, digest string) error {
 	if p == "" {
 		return fmt.Errorf("无效的 digest: %s", digest)
 	}
-
+	//先删除磁盘上的blob目录内容
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除内容文件失败: %w", err)
 	}
-
+	//再删除boltdb中的元数据
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(metadata.BucketContent)
 		return b.Delete([]byte(digest))
@@ -222,6 +222,14 @@ func (s *fsStore) Info(ctx context.Context, digest string) (Info, error) {
 		return json.Unmarshal(data, &info)
 	})
 	return info, err
+}
+
+func (s *fsStore) Path(ctx context.Context, digest string) (string, error) {
+	p := digestPath(s.root, digest)
+	if p == "" {
+		return "", fmt.Errorf("无效的 digest: %s", digest)
+	}
+	return p, nil
 }
 
 func (s *fsStore) Walk(ctx context.Context, fn func(Info) error) error {

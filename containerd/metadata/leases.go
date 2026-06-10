@@ -7,30 +7,25 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// LeaseInfo 租约信息（对齐 containerd 的 lease 机制）
-// 用于保护正在使用的内容不被 GC 回收
+// LeaseInfo 租约信息
+// 用于保护正在拉取的内容不被 GC 回收：
+// 创建时 Status 默认为 "in-progress"，GC 的 preflight 检测到后会整轮跳过；
+// Pull 完成后立即 Delete lease，此时 Tags/Layers 引用链已建立，无需额外保护。
 type LeaseInfo struct {
 	ID        string            `json:"id"`
 	CreatedAt string            `json:"created_at"`
 	Labels    map[string]string `json:"labels,omitempty"`
-	Objects   []LeaseObject     `json:"objects,omitempty"` // 关联的保护对象列表
+	// Status 租约状态。
+	//   - "in-progress": 拉取/构建中,GC 看到应整轮跳过(防误删半成品)
+	// 进程崩溃残留的 in-progress 会被 GC 当作僵尸清理(见 Collector.preflight)。
+	Status string `json:"status,omitempty"`
 }
 
-// LeaseObjectType 保护对象类型（对齐 containerd: content 和 snapshot 两种资源类型）
-type LeaseObjectType string
-
+// LeaseStatus 租约状态常量
 const (
-	// LeaseObjectContent 表示 content blob（digest 格式: sha256:abc...）
-	LeaseObjectContent LeaseObjectType = "content"
-	// LeaseObjectSnapshot 表示快照（key 格式: abc...，digest 的 hex 部分）
-	LeaseObjectSnapshot LeaseObjectType = "snapshot"
+	// LeaseStatusInProgress 拉取/构建中,GC 必须整轮跳过
+	LeaseStatusInProgress = "in-progress"
 )
-
-// LeaseObject 保护对象（对齐 containerd: 每个对象有类型和标识）
-type LeaseObject struct {
-	Type LeaseObjectType `json:"type"`
-	ID   string          `json:"id"`
-}
 
 // SaveLease 保存租约
 func SaveLease(tx *bolt.Tx, info *LeaseInfo) error {
@@ -69,23 +64,6 @@ func DeleteLease(tx *bolt.Tx, id string) error {
 		return fmt.Errorf("leases bucket 不存在")
 	}
 	return b.Delete([]byte(id))
-}
-
-// AddLeaseObject 向租约添加保护对象
-// 对齐 containerd: 每个对象有类型（content 或 snapshot），GC 根据类型分别标记
-func AddLeaseObject(tx *bolt.Tx, leaseID string, objType LeaseObjectType, objID string) error {
-	info, err := LoadLease(tx, leaseID)
-	if err != nil {
-		return err
-	}
-	// 去重检查
-	for _, obj := range info.Objects {
-		if obj.Type == objType && obj.ID == objID {
-			return nil
-		}
-	}
-	info.Objects = append(info.Objects, LeaseObject{Type: objType, ID: objID})
-	return SaveLease(tx, info)
 }
 
 // ListLeases 列出所有租约（通过 WalkLeases 实现，避免重复遍历逻辑）

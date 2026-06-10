@@ -140,10 +140,6 @@ func buildOCISpec(info *containerstore.ContainerInfo) *spec.Spec {
 		Hostname:      info.Name,
 		Network:       info.Network,
 		RestartPolicy: info.RestartPolicy,
-		OverlayMerged: info.OverlayMerged,
-		OverlayUpper:  info.OverlayUpper,
-		OverlayWork:   info.OverlayWork,
-		OverlayLower:  info.OverlayLower,
 		PortMap:       info.PortMap,
 		CgroupName:    info.CgroupName,
 	})

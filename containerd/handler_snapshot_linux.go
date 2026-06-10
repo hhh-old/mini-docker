@@ -31,8 +31,10 @@ import (
 // ---------------------------------------------------------------------------
 
 // handlePrepareSnapshot 创建容器可写层快照
-// 对齐 containerd: 通过 Snapshotter.Prepare() 创建可写快照，注册元数据到 boltdb
-// 这样 GC 可以正确跟踪容器的快照，删除镜像时不会误删容器正在使用的层
+// 它做两件事：
+// 1. 在 <root>/<containerID>/ 下创建 overlay 三件套 目录（diff/upper/work）
+// 2. 在 boltdb 里注册一条 SnapshotInfo （ Kind=KindActive , ReadWrite=true , Parent=<顶层镜像层 cacheID> ）
+// 3. 返回 []snapshots.Mount ，描述如何把上层可写 + 下层只读组合挂载成容器 rootfs
 func (c *Containerd) handlePrepareSnapshot(req Request) Response {
 	containerID := req.Args["key"]
 	parent := req.Args["parent"]
@@ -49,7 +51,7 @@ func (c *Containerd) handlePrepareSnapshot(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("创建快照失败: %v", err)}
 	}
 
-	// 返回挂载信息（包含 overlay 的 upperdir/workdir 路径）
+	// 返回挂载信息（包含 overlay 的 lowerdir、upperdir、workdir 路径）
 	mountData := make([]map[string]interface{}, len(mounts))
 	for i, m := range mounts {
 		mountData[i] = map[string]interface{}{

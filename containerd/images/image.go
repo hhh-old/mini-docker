@@ -49,31 +49,8 @@ import (
 // ---------------------------------------------------------------------------
 // 核心数据结构（对齐 containerd 的 content-addressable 模型）
 // ---------------------------------------------------------------------------
-
-// ImageInfo 镜像元数据（对外展示）
-// 对齐 containerd: containerd images list 输出的每行对应一个 ImageInfo
-type ImageInfo struct {
-	Name        string   `json:"name"`
-	Tag         string   `json:"tag"`
-	ImageID     string   `json:"image_id"`
-	Size        string   `json:"size"`
-	CreatedAt   string   `json:"created_at"`
-	RootFS      string   `json:"rootfs"`
-	SnapshotKey string   `json:"snapshot_key"` // 镜像最顶层的快照标识（cacheID），用于容器运行时 PrepareSnapshot 的 parent
-	Layers      []string `json:"layers"`
-}
-
-// ImageManifest 镜像清单（对齐 OCI Image Manifest）
-// 类型统一定义在 metadata 包，此处通过类型别名重导出，保持包级 API 兼容
-type ImageManifest = metadata.ImageManifest
-
-// ImageConfig 镜像配置（对齐 OCI Image Config）
-// 类型统一定义在 metadata 包，此处通过类型别名重导出，保持包级 API 兼容
-type ImageConfig = metadata.ImageConfig
-
-// LayerInfo 层元数据（对齐 containerd: 层信息存储在 boltdb 中）
-// 类型统一定义在 metadata 包，此处通过类型别名重导出，保持包级 API 兼容
-type LayerInfo = metadata.LayerInfo
+// 本包不再定义对外的镜像类型。统一使用 metadata.Image（元数据 + Size 衍生字段）。
+// Size 由调用方在响应时填充，boltdb 落盘时被 omitempty 跳过。
 
 /*
 =======================================================================
@@ -114,40 +91,16 @@ type LayerInfo = metadata.LayerInfo
 // status 取值见 progress.go 中定义的 StatusXxx 常量
 type ProgressFunc func(status ProgressFrameStatus, message string)
 
-// pull 拉取/构建镜像，返回 ImageInfo。失败时返回 error。
-// 注意：本函数不进行元数据持久化，调用方需自行注册到 boltdb。
+// pull 拉取/构建镜像，返回 *metadata.Image。失败时返回 error。
 // contentStore: blob 存储接口，传递给 RegistryClient 以确保 blob 写入通过 contentStore 完成
 // snap: Snapshotter 接口，通过 UnpackLayer 原子完成"解压+元数据注册"，避免分步操作导致不一致
-func pull(imageRef string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*ImageInfo, error) {
-	if isRegistryRef(imageRef) {
-		return pullFromRegistry(imageRef, progress, contentStore, snap)
-	}
-
-	localRootFS := filepath.Join(constants.SnapshotterDir, imageRef, "diff")
-	if _, err := os.Stat(localRootFS); os.IsNotExist(err) {
-		registryRef := "library/" + imageRef
-		return pullFromRegistry(registryRef, progress, contentStore, snap)
-	}
-	//TODO 镜像文件已存在，不用本地构建，这是遗留问题了
-	return pullLocal(imageRef, progress, snap)
-}
-
-// isRegistryRef 判断镜像引用是否指向 Registry
-// 对齐 Docker: 含有 / 或 . 的镜像名视为 Registry 引用
-func isRegistryRef(imageRef string) bool {
-	name := imageRef
-	if idx := strings.LastIndex(imageRef, ":"); idx > 0 {
-		name = imageRef[:idx]
-	}
-	if strings.Contains(name, "/") || strings.Contains(name, ".") {
-		return true
-	}
-	return false
+func pull(imageRef string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*metadata.Image, error) {
+	return pullFromRegistry(imageRef, progress, contentStore, snap)
 }
 
 // pullFromRegistry 从 Docker Registry 拉取镜像
 // 对齐 containerd: 当配置了 registry-mirrors 时，优先从 mirror 拉取，失败后回退到原始地址
-func pullFromRegistry(imageRef string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*ImageInfo, error) {
+func pullFromRegistry(imageRef string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*metadata.Image, error) {
 	registry, repository, tag := ResolveImageRef(imageRef)
 
 	// 对齐 Docker: 如果目标是 Docker Hub 且配置了 mirror，先尝试 mirror
@@ -171,7 +124,7 @@ func pullFromRegistry(imageRef string, progress ProgressFunc, contentStore conte
 }
 
 // doPullFromRegistry 实际执行从指定 registry 拉取镜像的逻辑
-func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*ImageInfo, error) {
+func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc, contentStore content.Store, snap snapshots.Snapshotter) (*metadata.Image, error) {
 	progress(StatusDownloading, fmt.Sprintf("从 Registry 拉取镜像: %s/%s:%s", registry, repository, tag))
 
 	client := NewRegistryClient(registry, contentStore)
@@ -187,8 +140,8 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 	progress(StatusDownloading, "获取镜像配置...")
 	ociConfig, err := client.GetImageConfig(repository, &manifest.Config)
 	if err != nil {
-		progress(StatusWarning, fmt.Sprintf("获取镜像配置失败: %v", err))
-		ociConfig = &OCIImageConfig{}
+		// manifest blob 仍在 contentStore 中（content-addressable，可由 GC 清理）
+		return nil, fmt.Errorf("获取镜像配置失败（OCI Config 不可降级，否则会关闭 DiffID 校验）: %w", err)
 	}
 
 	var layerDigests []string
@@ -227,8 +180,6 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 
 		progress(StatusExtracting, fmt.Sprintf("解压层 %d/%d...", i+1, len(manifest.Layers)))
 		// 对齐 containerd: 通过 Snapshotter.UnpackLayer 统一完成"解压+元数据注册"
-		// 替代之前的 LayerStore.StoreLayer + Snapshotter.RegisterCommitted 两步操作，
-		// 避免分两步执行时崩溃导致"文件存在但元数据缺失"的不一致状态
 		cacheID, err := snap.UnpackLayer(context.Background(), blobPath, layerDesc.Digest, diffID, parentSnapKey)
 		if err != nil {
 			// 解压失败时清理已下载的层快照和 blob，避免孤儿数据残留
@@ -261,16 +212,18 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 		imageID = computeImageID(repository, tag, "")
 	}
 
-	snapshotKey := content.DigestToCacheID(layerDigests[len(layerDigests)-1]) // 最顶层的 snapshotKey，用于容器运行时 PrepareSnapshot 的 parent
-	info := &ImageInfo{
-		Name:        repoName,
-		Tag:         tag,
-		ImageID:     imageID,
-		Size:        size,
-		CreatedAt:   time.Now().Format("2006-01-02 15:04:05"),
-		RootFS:      snapshotKey,
-		SnapshotKey: snapshotKey,
-		Layers:      layerDigests,
+	snapshotID := content.DigestToCacheID(layerDigests[len(layerDigests)-1]) // 最顶层的 snapshotID，用于容器运行时 PrepareSnapshot 的 parent
+	info := &metadata.Image{
+		Name:               repoName,
+		Tag:                tag,
+		ImageID:            imageID,
+		CreatedAt:          time.Now().Format("2006-01-02 15:04:05"),
+		TopLayerSnapshotID: snapshotID,
+		LayerDigests:       layerDigests,
+		Annotations:        manifest.Annotations,              // 透传 OCI Manifest Annotations
+		Config:             ociConfigToImageConfig(ociConfig), // 持久化 OCI 运行时配置
+		ConfigDigest:       manifest.Config.Digest,            // 对齐 containerd: GC 标记 config blob
+		Size:               size,
 	}
 
 	progress(StatusComplete, fmt.Sprintf("镜像 %s:%s (%s) 拉取成功", repoName, tag, size))
@@ -291,7 +244,7 @@ func cleanupPullLayers(ctx context.Context, snap snapshots.Snapshotter, contentS
 // pullLocal 本地构建镜像（创建 busybox rootfs）
 // 对齐 containerd: 构建完成后通过 Snapshotter.RegisterCommitted 注册快照元数据，
 // 确保 GC 和 lowerDirs() 能正确感知本地构建的镜像层
-func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotter) (*ImageInfo, error) {
+func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotter) (*metadata.Image, error) {
 	name, tag := utils.ParseImageTag(imageRef)
 
 	if tag == "" {
@@ -337,15 +290,14 @@ func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotte
 		progress(StatusWarning, fmt.Sprintf("注册本地镜像快照失败: %v", err))
 	}
 
-	info := &ImageInfo{
-		Name:        name,
-		Tag:         tag,
-		ImageID:     imageID,
-		Size:        size,
-		CreatedAt:   time.Now().Format("2006-01-02 15:04:05"),
-		RootFS:      name, // 本地构建镜像的 RootFS 使用 name 作为 snapshotKey
-		SnapshotKey: name, // 本地构建镜像的 snapshotKey 与 name 一致
-		Layers:      []string{layerDigest},
+	info := &metadata.Image{
+		Name:               name,
+		Tag:                tag,
+		ImageID:            imageID,
+		CreatedAt:          time.Now().Format("2006-01-02 15:04:05"),
+		TopLayerSnapshotID: name, // 本地构建镜像的 TopLayerSnapshotID 与 name 一致
+		LayerDigests:       []string{layerDigest},
+		Size:               size,
 	}
 
 	progress(StatusComplete, fmt.Sprintf("镜像 %s:%s (%s) 构建成功", name, tag, size))
@@ -466,6 +418,25 @@ func calculateLayersSize(snap snapshots.Snapshotter, layerDigests []string) stri
 		totalSize += calculateRootFSSizeBytes(diffDir)
 	}
 	return formatSize(totalSize)
+}
+
+// ociConfigToImageConfig 将 OCI Image Config 转换为持久化的 ImageConfig
+// 对齐 containerd: containerd 同样把 OCI Config 中的运行时字段（Cmd/Env/Entrypoint/WorkingDir/User/Labels）
+// 作为镜像的"image config"暴露给容器创建流程
+// ExposedPorts 在 OCI 规范中为 map[string]struct{}（Docker 风格），本项目 metadata 中简化为 []string；
+// 此处暂不转换 ExposedPorts，待后续按需扩展
+func ociConfigToImageConfig(oci *OCIImageConfig) metadata.ImageConfig {
+	if oci == nil {
+		return metadata.ImageConfig{}
+	}
+	return metadata.ImageConfig{
+		Cmd:        oci.Config.Cmd,
+		Env:        oci.Config.Env,
+		WorkingDir: oci.Config.WorkingDir,
+		Labels:     oci.Config.Labels,
+		Entrypoint: oci.Config.Entrypoint,
+		User:       oci.Config.User,
+	}
 }
 
 // CreateLayerFromDir 从 upper 目录创建一个镜像层

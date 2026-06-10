@@ -44,7 +44,6 @@ package containerd
   - handler_snapshot_linux.go← 快照管理处理器（Prepare/Remove/RegisterCommitted/DiffPath）
   - handler_gc_linux.go      ← GC 处理器
   - shim_manager_linux.go    ← Shim 进程管理函数
-  - containerd/gc/adapter.go ← GC 适配器类型（ContentStoreAdapter/SnapshotterAdapter）
 
 =======================================================================
 */
@@ -132,12 +131,9 @@ func NewContainerd() (*Containerd, error) {
 	c.imageService = images.NewService(metaDB, contentStore, snap, leaseMgr)
 
 	// 初始化 GC (5分钟周期)
-	// 适配器（ContentDeleter/SnapshotDeleter）已迁移到 containerd/gc/adapter.go，
-	// 这里直接调用包导出的构造函数，避免在 containerd 顶层包内自定义适配器类型
-	gcCollector := gc.NewCollector(metaDB,
-		gc.NewContentStoreAdapter(contentStore),
-		gc.NewSnapshotterAdapter(snap),
-		5*time.Minute)
+	// Collector 直接复用 content.Store / snapshots.Snapshotter 接口，
+	// 无需 adapter 层 —— 详见 gc/gc.go 中 Collector 的说明。
+	gcCollector := gc.NewCollector(metaDB, contentStore, snap, 5*time.Minute)
 	c.gcCollector = gcCollector
 
 	return c, nil

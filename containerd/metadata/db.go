@@ -24,7 +24,6 @@ type DB struct {
 // 数据库 (DB) -> 桶 (Bucket) -> 键值对 (Key-Value)
 var (
 	BucketImages    = []byte("images")    // image_id → ImageManifest JSON
-	BucketLayers    = []byte("layers")    // digest → LayerInfo JSON
 	BucketTags      = []byte("tags")      // "name:tag" → image_id
 	BucketSnapshots = []byte("snapshots") // snap_key → SnapshotInfo JSON
 	BucketLeases    = []byte("leases")    // lease_id → LeaseInfo JSON
@@ -34,7 +33,6 @@ var (
 // allBuckets 所有需要初始化的 Bucket 列表
 var allBuckets = [][]byte{
 	BucketImages,
-	BucketLayers,
 	BucketTags,
 	BucketSnapshots,
 	BucketLeases,

@@ -28,8 +28,8 @@ type LogEntry struct {
 }
 
 type OverlayDirs struct {
-	Merged string `json:"merged"`
-	Upper  string `json:"upper"`
-	Work   string `json:"work"`
-	Lower  string `json:"lower"` // OverlayFS lowerdir（多层用 ":" 分隔，由 Snapshotter.Mounts() 构建）
+	Merged string `json:"merged"` //挂载点（容器看到的最终文件系统）
+	Upper  string `json:"upper"`  //可写层目录（容器修改写入这里）
+	Work   string `json:"work"`   //OverlayFS 内部工作目录
+	Lower  string `json:"lower"`  //只读层目录链（镜像层）, OverlayFS lowerdir（多层用 ":" 分隔，由 Snapshotter.Mounts() 构建）
 }

@@ -15,7 +15,7 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/containerd"
-	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerstore"
 	"mini-docker/daemon"
 	"mini-docker/libcontainer/containerinit"
@@ -724,7 +724,7 @@ func imagesCommand() {
 	execSimpleCmd(daemon.Request{Type: "images", Args: map[string]string{}},
 		"列出镜像", func(resp *daemon.Response) {
 			data, _ := json.Marshal(resp.Data)
-			var list []images.ImageInfo
+			var list []*metadata.Image
 			if err := json.Unmarshal(data, &list); err != nil {
 				fmt.Printf("解析镜像列表失败: %v\n", err)
 				os.Exit(1)

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"mini-docker/libcontainer/cgroups"
+	"mini-docker/utils"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -13,7 +13,6 @@ import (
 	"mini-docker/libcontainer"
 	"mini-docker/network"
 	"mini-docker/types"
-	"mini-docker/utils"
 )
 
 const (
@@ -37,10 +36,7 @@ type ContainerInfo struct {
 	VethHost          string   `json:"veth_host"`
 	ContainerIP       string   `json:"container_ip"`
 	PortMap           string   `json:"port_map"`
-	OverlayMerged     string   `json:"overlay_merged"`
-	OverlayUpper      string   `json:"overlay_upper"`
-	OverlayWork       string   `json:"overlay_work"`
-	OverlayLower      string   `json:"overlay_lower"`       // OverlayFS lowerdir（多层用 ":" 分隔）
+	OverlayMerged     string   `json:"overlay_merged"`      // OverlayFS merged 挂载点（宿主机上已挂载的容器 rootfs）
 	RestartPolicy     string   `json:"restart_policy"`      // no, always, on-failure
 	MaxRestartRetries int      `json:"max_restart_retries"` // on-failure 最大重启次数
 	Tty               bool     `json:"tty"`
@@ -223,17 +219,6 @@ func CleanupContainerNetwork(info *ContainerInfo) {
 	}
 	nm := network.NewManagerFromInfo(info.Network, info.PortMap, info.ContainerIP, info.VethHost)
 	nm.Disconnect()
-}
-
-// CleanupOverlay 卸载容器的 OverlayFS 挂载
-// 对齐 containerd: 目录删除由 Snapshotter.Remove 统一处理，此处只负责 umount
-// 原因：Snapshotter.Remove 会同时清理 boltdb 中的快照元数据和磁盘目录
-func CleanupOverlay(info *ContainerInfo) {
-	if info.OverlayMerged == "" {
-		return
-	}
-
-	exec.Command("umount", info.OverlayMerged).Run()
 }
 
 func CleanupCgroup(cgroupName string) {

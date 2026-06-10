@@ -35,12 +35,14 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/containerd/gc"
-	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
 	"mini-docker/libcontainer"
 	"mini-docker/types"
 	"mini-docker/utils"
+
+	"golang.org/x/sys/unix"
 )
 
 // Client containerd 远程客户端（Daemon 侧使用）
@@ -406,7 +408,7 @@ func (c *Client) ReadExitInfo(containerID string) (*ExitInfo, error) {
 }
 
 // PullImage 拉取镜像（流式进度推送）
-func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData)) (*images.ImageInfo, error) {
+func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData)) (*metadata.Image, error) {
 	resp, err := SendStreamProgressRequest(Request{
 		Type: ReqPullImage,
 		Args: map[string]string{"image": imageName},
@@ -419,7 +421,7 @@ func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData))
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var info images.ImageInfo
+	var info metadata.Image
 	if err := json.Unmarshal(data, &info); err != nil {
 		return nil, fmt.Errorf("解析镜像信息失败: %w", err)
 	}
@@ -427,7 +429,7 @@ func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData))
 }
 
 // ListImages 列出所有镜像
-func (c *Client) ListImages() ([]*images.ImageInfo, error) {
+func (c *Client) ListImages() ([]*metadata.Image, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqListImages,
 		Args: map[string]string{},
@@ -440,7 +442,7 @@ func (c *Client) ListImages() ([]*images.ImageInfo, error) {
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var list []*images.ImageInfo
+	var list []*metadata.Image
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, fmt.Errorf("解析镜像列表失败: %w", err)
 	}
@@ -471,7 +473,7 @@ func (c *Client) RemoveImage(imageRef string) error {
 }
 
 // InspectImage 查看镜像详情
-func (c *Client) InspectImage(imageRef string) (*images.ImageManifest, error) {
+func (c *Client) InspectImage(imageRef string) (*metadata.Image, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqInspectImage,
 		Args: map[string]string{"image": imageRef},
@@ -484,64 +486,45 @@ func (c *Client) InspectImage(imageRef string) (*images.ImageManifest, error) {
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var manifest images.ImageManifest
+	var manifest metadata.Image
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("解析镜像清单失败: %w", err)
 	}
 	return &manifest, nil
 }
 
-// ResolveImage 解析镜像引用，返回 rootfs 路径
-// 内部调用 ResolveImageBoth，仅返回 rootfs 路径
+// ResolveImage 解析镜像引用，返回最顶层快照 ID（用于 PrepareSnapshot 的 parent）
 func (c *Client) ResolveImage(imageRef string) (string, error) {
-	rootfsPath, _, err := c.ResolveImageBoth(imageRef)
-	return rootfsPath, err
-}
-
-// ResolveImageSnapshotKey 解析镜像引用，返回 snapshot key（用于 PrepareSnapshot 的 parent）
-// 内部调用 ResolveImageBoth，仅返回 snapshot key
-func (c *Client) ResolveImageSnapshotKey(imageRef string) (string, error) {
-	_, snapshotKey, err := c.ResolveImageBoth(imageRef)
-	return snapshotKey, err
-}
-
-// ResolveImageBoth 解析镜像引用，一次性返回 rootfs 路径和 snapshot key
-// 对齐 containerd: 避免 ResolveImage 和 ResolveImageSnapshotKey 各自发起重复的 RPC 调用
-// daemon 层可直接调用此方法获取两个值，减少一次网络往返
-func (c *Client) ResolveImageBoth(imageRef string) (string, string, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqResolveImage,
 		Args: map[string]string{"image": imageRef},
 	})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if !resp.Success {
-		return "", "", fmt.Errorf("%s", resp.Message)
+		return "", fmt.Errorf("%s", resp.Message)
 	}
 
 	data, _ := json.Marshal(resp.Data)
 	var result struct {
-		RootFSPath  string `json:"rootfs_path"`
-		SnapshotKey string `json:"snapshot_key"`
+		TopLayerSnapshotID string `json:"top_layer_snapshot_id"`
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return "", "", fmt.Errorf("解析 rootfs 路径失败: %w", err)
+		return "", fmt.Errorf("解析镜像 snapshot ID 失败: %w", err)
 	}
-	return result.RootFSPath, result.SnapshotKey, nil
+	return result.TopLayerSnapshotID, nil
 }
 
 // RegisterImage 注册一个已构建好的镜像（builder 使用）
-func (c *Client) RegisterImage(info *images.ImageInfo) error {
+func (c *Client) RegisterImage(info *metadata.Image) error {
 	args := map[string]string{
-		"name":         info.Name,
-		"tag":          info.Tag,
-		"image_id":     info.ImageID,
-		"size":         info.Size,
-		"created_at":   info.CreatedAt,
-		"rootfs":       info.RootFS,
-		"snapshot_key": info.SnapshotKey,
-		"layers":       strings.Join(info.Layers, ","),
+		"name":                  info.Name,
+		"tag":                   info.Tag,
+		"image_id":              info.ImageID,
+		"created_at":            info.CreatedAt,
+		"top_layer_snapshot_id": info.TopLayerSnapshotID,
+		"layer_digests":         strings.Join(info.LayerDigests, ","),
 	}
 	resp, err := SendRequest(Request{
 		Type: ReqRegisterImage,
@@ -577,18 +560,17 @@ func (c *Client) GC() (*gc.GCStats, error) {
 	return &stats, nil
 }
 
-// PrepareSnapshot 创建容器可写层快照
-// 对齐 containerd: 通过 Snapshotter.Prepare() 创建可写快照，注册元数据到 boltdb
-// key: 容器 ID（作为快照 key）
-// parent: 父快照 key（镜像最顶层的 digest hex）
-// 返回 OverlayDirs 信息（merged/upper/work 路径）
+// PrepareSnapshot 创建容器可写层快照并在宿主机上挂载 OverlayFS
+// 对齐 containerd: 通过 Snapshotter.Prepare() 创建可写快照，注册元数据到 boltdb，
+// 然后在宿主机上执行 overlay mount，使 merged 目录成为真正的容器 rootfs。
+// containerID: 容器 ID（作为快照 key）
+// topLayerSnapshotID: 父快照 key（镜像最顶层快照的 cacheID）
+// 返回 OverlayDirs 信息（merged 路径已挂载为 overlay 文件系统）
 //
-// 内部实现：先调 sendPrepareSnapshotRPC 拿到标准 []snapshots.Mount，
-// 再从 mount options 中提取 upperdir/workdir/lowerdir。
-// 解析逻辑与 clientSnapshotter.Prepare 共享 RPC + JSON 解析代码，
-// 避免两条 API 路径在 RPC 协议变更时不同步
-func (c *Client) PrepareSnapshot(key, parent string) (*types.OverlayDirs, error) {
-	mounts, err := sendPrepareSnapshotRPC(key, parent)
+// 对齐真实 containerd 行为：overlay mount 在宿主机上完成（而非容器 init 进程内），
+// runc/容器 init 只需 pivot_root 到已挂载的 merged 目录即可。
+func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types.OverlayDirs, error) {
+	mounts, err := sendPrepareSnapshotRPC(containerID, topLayerSnapshotID)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +593,17 @@ func (c *Client) PrepareSnapshot(key, parent string) (*types.OverlayDirs, error)
 	// merged 目录在快照目录下
 	if overlayDirs.Upper != "" {
 		overlayDirs.Merged = filepath.Join(filepath.Dir(overlayDirs.Upper), "merged")
-		os.MkdirAll(overlayDirs.Merged, 0755)
+		if err := os.MkdirAll(overlayDirs.Merged, 0755); err != nil {
+			return nil, fmt.Errorf("创建 merged 目录失败: %w", err)
+		}
+
+		// 对齐 containerd: 在宿主机上执行 overlay mount
+		// merged 目录从空目录变为真正的 overlay 文件系统
+		options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+			overlayDirs.Lower, overlayDirs.Upper, overlayDirs.Work)
+		if err := unix.Mount("overlay", overlayDirs.Merged, "overlay", 0, options); err != nil {
+			return nil, fmt.Errorf("宿主机 overlay mount 失败: %w", err)
+		}
 	}
 
 	return overlayDirs, nil
@@ -650,12 +642,12 @@ func (cs *clientSnapshotter) Prepare(ctx context.Context, key, parent string) ([
 // 共用的 RPC 调用 + JSON 解析逻辑，避免两条 API 路径协议不同步
 // 对齐 containerd: SendRequest 返回的 Response.Data 是 map[string]interface{}，
 // 需要重新 marshal/unmarshal 到强类型结构
-func sendPrepareSnapshotRPC(key, parent string) ([]snapshots.Mount, error) {
+func sendPrepareSnapshotRPC(containerID, topLayerSnapshotID string) ([]snapshots.Mount, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqPrepareSnapshot,
 		Args: map[string]string{
-			"key":    key,
-			"parent": parent,
+			"key":    containerID,
+			"parent": topLayerSnapshotID,
 		},
 	})
 	if err != nil {
@@ -666,24 +658,9 @@ func sendPrepareSnapshotRPC(key, parent string) ([]snapshots.Mount, error) {
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var result struct {
-		Mounts []struct {
-			Type    string   `json:"type"`
-			Source  string   `json:"source"`
-			Options []string `json:"options"`
-		} `json:"mounts"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
+	var mounts []snapshots.Mount
+	if err := json.Unmarshal(data, &mounts); err != nil {
 		return nil, fmt.Errorf("解析挂载信息失败: %w", err)
-	}
-
-	mounts := make([]snapshots.Mount, len(result.Mounts))
-	for i, m := range result.Mounts {
-		mounts[i] = snapshots.Mount{
-			Type:    m.Type,
-			Source:  m.Source,
-			Options: m.Options,
-		}
 	}
 	return mounts, nil
 }

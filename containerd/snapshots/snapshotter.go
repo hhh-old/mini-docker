@@ -4,9 +4,9 @@ import "context"
 
 // Mount 挂载信息（对齐 containerd 的 mount.Mount）
 type Mount struct {
-	Type    string   // "overlay", "bind" 等
-	Source  string   // 挂载源
-	Options []string // 挂载选项 (如 lowerdir=...,upperdir=...,workdir=...)
+	Type    string   `json:"type"`    // "overlay", "bind" 等
+	Source  string   `json:"source"`  // 挂载源
+	Options []string `json:"options"` // 挂载选项 (如 lowerdir=...,upperdir=...,workdir=...)
 }
 
 // Kind 快照类型，go中定义枚举类型的方式
@@ -19,8 +19,8 @@ const (
 
 // Info 快照元信息
 type Info struct {
-	Name      string            `json:"name"`
-	Parent    string            `json:"parent,omitempty"`
+	Name      string            `json:"name"`             //这个其实就是 cacheID
+	Parent    string            `json:"parent,omitempty"` //上一层layer的 cacheID
 	Kind      Kind              `json:"kind"`
 	ReadWrite bool              `json:"read_write"`
 	CreatedAt string            `json:"created_at"`

@@ -29,7 +29,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +38,7 @@ import (
 	"mini-docker/constants"
 	"mini-docker/containerd"
 	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
 	"mini-docker/libcontainer"
@@ -204,14 +204,13 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		fmt.Sscanf(mrr, "%d", &maxRestartRetries)
 	}
 
-	// 对齐 containerd: 通过 ResolveImageBoth 一次性获取 rootfs 路径和 snapshot key，
-	// 避免分别调用 ResolveImage 和 ResolveImageSnapshotKey 导致重复的 RPC 调用
-	rootFSPath, parentSnapKey, err := d.service.ResolveImageBoth(imageName)
+	// 解析镜像引用，获取最顶层快照 ID 作为 PrepareSnapshot 的 parent
+	topLayerSnapshotID, err := d.service.ResolveImage(imageName)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 不存在，请先使用 mini-docker pull 拉取: %v", imageName, err)}
 	}
-	if rootFSPath == "" {
-		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 的 rootfs 路径为空", imageName)}
+	if topLayerSnapshotID == "" {
+		return Response{Success: false, Message: fmt.Sprintf("镜像 %s 的 snapshot ID 为空", imageName)}
 	}
 
 	containerID := existingID
@@ -231,25 +230,9 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 	}
 
 	// 创建容器可写层快照（对齐 containerd: 通过 Snapshotter.Prepare 注册到 boltdb）
-	// parent 为镜像最顶层的 snapshotKey（cacheID），这样 Snapshotter 可以沿 parent 链递归构建多层 lowerdir
+	// parent 为镜像最顶层的 TopLayerSnapshotID（cacheID），这样 Snapshotter 可以沿 parent 链递归构建多层 lowerdir
 	// GC 通过此关系跟踪容器的快照，删除镜像时不会误删容器正在使用的层
-	if parentSnapKey == "" {
-		log.Printf("警告: 获取镜像 snapshot key 失败: %v，尝试从 rootfs 路径解析", err)
-		// 回退：尝试从 rootfs 路径解析 snapshotKey（兼容旧版本镜像）
-		if strings.Contains(rootFSPath, "/") {
-			rel, err := filepath.Rel(constants.SnapshotterDir, rootFSPath)
-			if err == nil && !strings.HasPrefix(rel, "..") {
-				parts := strings.Split(rel, "/")
-				if len(parts) >= 1 {
-					parentSnapKey = parts[0]
-				}
-			}
-		} else {
-			parentSnapKey = rootFSPath
-		}
-	}
-
-	overlay, err := d.service.PrepareSnapshot(containerID, parentSnapKey)
+	overlay, err := d.service.PrepareSnapshot(containerID, topLayerSnapshotID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("创建容器快照失败: %v", err)}
 	}
@@ -263,11 +246,8 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		Cmd:               cmd,
 		Status:            libcontainer.StatusCreated,
 		CreatedAt:         time.Now().Format(constants.TimeFormat),
-		RootFS:            rootFSPath,
+		RootFS:            overlay.Merged,
 		OverlayMerged:     overlay.Merged,
-		OverlayUpper:      overlay.Upper,
-		OverlayWork:       overlay.Work,
-		OverlayLower:      overlay.Lower,
 		RestartPolicy:     restartPolicy,
 		MaxRestartRetries: maxRestartRetries,
 		Volumes:           volumes,
@@ -504,8 +484,6 @@ func (d *Daemon) handleStart(req Request) Response {
 	log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
 	savedInfo.Status = libcontainer.StatusStopped
 	savedInfo.OverlayMerged = ""
-	savedInfo.OverlayUpper = ""
-	savedInfo.OverlayWork = ""
 	savedInfo.CgroupName = savedCgroupName
 	containerstore.SaveContainerInfo(&savedInfo)
 	if savedCgroupName != "" {
@@ -877,7 +855,7 @@ func (s *containerdBuildService) ResolveImage(imageRef string) (string, error) {
 	return s.client.ResolveImage(imageRef)
 }
 
-func (s *containerdBuildService) RegisterImage(info *images.ImageInfo) error {
+func (s *containerdBuildService) RegisterImage(info *metadata.Image) error {
 	return s.client.RegisterImage(info)
 }
 

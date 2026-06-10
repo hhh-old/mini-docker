@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerstore"
 	"mini-docker/utils"
 )
@@ -66,6 +67,11 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 		}
 		data, _ := json.Marshal(frame)
 		data = append(data, '\n') // JSON 分帧分隔符
+		//data = append(data, '\n') 是多余的，对通信正确性没有任何作用。
+		//依据：
+		//1. 客户端用的是 json.Decoder （ api_linux.go#L121-L125 、 main.go#L784-L788 ），逐帧循环 decoder.Decode(&frame) 。
+		//2. json.Decoder 是栈式扫描 ：通过匹配 { } [ ] " \ 等定界符自行切分 JSON 值， 不依赖任何分隔符 ，多次 Decode 天然处理 TCP 粘包。
+		//3. 顺便，它也会自动跳过值之间的空白（包括 \n ），所以加不加这个换行结果完全一致
 		conn.Write(data)
 	}
 
@@ -172,7 +178,7 @@ func (c *Containerd) handleInspectImage(req Request) Response {
 	return Response{Success: true, Data: manifest}
 }
 
-// handleResolveImage 解析镜像引用，返回 rootfs 路径和 snapshot key
+// handleResolveImage 解析镜像引用，返回 snapshot ID（用于 PrepareSnapshot 的 parent）
 func (c *Containerd) handleResolveImage(req Request) Response {
 	imageRef := req.Args["image"]
 	if imageRef == "" {
@@ -185,19 +191,19 @@ func (c *Containerd) handleResolveImage(req Request) Response {
 	ctx := context.Background()
 	info, err := c.imageService.Resolve(ctx, imageRef)
 	if err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("解析镜像路径失败: %v", err)}
+		return Response{Success: false, Message: fmt.Sprintf("解析镜像失败: %v", err)}
 	}
-	return Response{Success: true, Data: map[string]interface{}{"rootfs_path": info.RootFS, "snapshot_key": info.SnapshotKey}}
+	return Response{Success: true, Data: map[string]interface{}{"top_layer_snapshot_id": info.TopLayerSnapshotID}}
 }
 
 // handleRegisterImage 注册一个已构建好的镜像（builder 通过 Daemon 调用）
-// args: name, tag, image_id, size, created_at, rootfs, layers(逗号分隔)
+// args: name, tag, image_id, size, created_at, top_layer_snapshot_id, layers(逗号分隔)
 func (c *Containerd) handleRegisterImage(req Request) Response {
 	if c.imageService == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
-	layersCSV := req.Args["layers"]
+	layersCSV := req.Args["layer_digests"]
 	var layers []string
 	if layersCSV != "" {
 		for _, l := range strings.Split(layersCSV, ",") {
@@ -207,15 +213,13 @@ func (c *Containerd) handleRegisterImage(req Request) Response {
 		}
 	}
 
-	info := &images.ImageInfo{
-		Name:        req.Args["name"],
-		Tag:         req.Args["tag"],
-		ImageID:     req.Args["image_id"],
-		Size:        req.Args["size"],
-		CreatedAt:   req.Args["created_at"],
-		RootFS:      req.Args["rootfs"],
-		SnapshotKey: req.Args["snapshot_key"],
-		Layers:      layers,
+	info := &metadata.Image{
+		Name:               req.Args["name"],
+		Tag:                req.Args["tag"],
+		ImageID:            req.Args["image_id"],
+		CreatedAt:          req.Args["created_at"],
+		TopLayerSnapshotID: req.Args["top_layer_snapshot_id"],
+		LayerDigests:       layers,
 	}
 
 	ctx := context.Background()

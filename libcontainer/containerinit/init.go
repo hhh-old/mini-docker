@@ -10,7 +10,6 @@ import (
 	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/configs"
 	"mini-docker/spec"
-	"mini-docker/types"
 	"mini-docker/utils"
 )
 
@@ -36,8 +35,6 @@ func HandleOCIInit() {
 		fmt.Fprintf(os.Stderr, "OCI init: 加载 Spec 失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	overlay := extractOverlayFromAnnotations(ociSpec)
 
 	// FIFO 在 bundle 目录中（宿主机文件系统），必须在 pivot_root 之前打开
 	// pivot_root 后根目录切换，bundle 路径将不可访问
@@ -65,7 +62,7 @@ func HandleOCIInit() {
 		}
 	}
 
-	if err := SetupRootFS(ociSpec.Root.Path, overlay); err != nil {
+	if err := SetupRootFS(ociSpec.Root.Path); err != nil {
 		fmt.Fprintf(os.Stderr, "OCI init: 设置 rootfs 失败: %v\n", err)
 		os.Exit(1)
 	}
@@ -177,25 +174,6 @@ func isExecutable(path string) error {
 		return fmt.Errorf("不可执行")
 	}
 	return nil
-}
-
-func extractOverlayFromAnnotations(s *spec.Spec) *types.OverlayDirs {
-	if s == nil || s.Annotations == nil {
-		return nil
-	}
-	merged := s.Annotations["mini-docker.overlay.merged"]
-	upper := s.Annotations["mini-docker.overlay.upper"]
-	work := s.Annotations["mini-docker.overlay.work"]
-	lower := s.Annotations["mini-docker.overlay.lower"]
-	if merged == "" {
-		return nil
-	}
-	return &types.OverlayDirs{
-		Merged: merged,
-		Upper:  upper,
-		Work:   work,
-		Lower:  lower,
-	}
 }
 
 func applyOCICapabilities(caps *configs.Capabilities) {

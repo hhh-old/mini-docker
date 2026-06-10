@@ -2,14 +2,13 @@ package images
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -196,24 +195,52 @@ type tokenResponse struct {
 }
 
 // NewRegistryClient 创建 Registry 客户端
-// contentStore: blob 存储接口，所有下载的 blob 通过 contentStore.Writer() 写入，确保元数据与文件一致
+// host 接受以下形式（用 url.Parse 解析，对多余路径/查询参数宽容地忽略）：
+//   - "index.docker.io"                  → scheme=https, host=index.docker.io
+//   - "my-registry:5000"                 → scheme=https, host=my-registry:5000
+//   - "https://ghcr.io"                  → scheme=https, host=ghcr.io
+//   - "http://192.168.1.10:5000"         → scheme=http,  host=192.168.1.10:5000
+//   - "https://my-registry/v2/"          → scheme=https, host=my-registry（路径被忽略，统一由客户端拼 /v2/...）
+//
+// 不接受：含 userinfo 或除 http/https 外 scheme 的输入（Registry V2 不支持）
 func NewRegistryClient(host string, contentStore content.Store) *RegistryClient {
-	scheme := "https"
-	if strings.HasPrefix(host, "http://") {
-		scheme = "http"
-		host = strings.TrimPrefix(host, "http://")
-	} else {
-		host = strings.TrimPrefix(host, "https://")
+	if host == "" {
+		panic("NewRegistryClient: host 不能为空")
+	}
+	if contentStore == nil {
+		panic("NewRegistryClient: contentStore 不能为 nil（blob 去重和元数据一致性的前提）")
+	}
+
+	// url.Parse 比手撸 TrimPrefix 稳健：自动处理 scheme / 路径 / 查询 / fragment 的边界
+	parsed, err := url.Parse(host)
+	if err != nil {
+		panic(fmt.Sprintf("NewRegistryClient: 解析 host 失败 %q: %v", host, err))
+	}
+
+	// 缺省 scheme → https（对齐 Docker 客户端默认行为）
+	scheme := parsed.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	if scheme != "http" && scheme != "https" {
+		panic(fmt.Sprintf("NewRegistryClient: 不支持的 scheme %q（仅支持 http/https）", scheme))
+	}
+
+	// url.Parse 把 "host" 同时支持 "host" 和 "scheme://host/path" 两种形式；
+	// 任何情况下 Host 字段都会是干净的 "host[:port]"
+	cleanHost := parsed.Host
+	if cleanHost == "" {
+		panic(fmt.Sprintf("NewRegistryClient: host 缺少主机部分 %q", host))
 	}
 
 	// Docker Hub 的 index.docker.io 仅用于认证和 manifest 查询
 	// 实际的 blob 下载需要访问 registry-1.docker.io
-	if host == "index.docker.io" {
-		host = "registry-1.docker.io"
+	if cleanHost == "index.docker.io" {
+		cleanHost = "registry-1.docker.io"
 	}
 
 	return &RegistryClient{
-		host:   host,
+		host:   cleanHost,
 		scheme: scheme,
 		client: &http.Client{
 			Timeout: constants.RegistryPullTimeout,
@@ -294,13 +321,11 @@ func (rc *RegistryClient) DownloadManifest(repository, reference string) (*OCIMa
 		return nil, nil, fmt.Errorf("解析 manifest 失败: %w", err)
 	}
 
-	// 对齐 containerd: 将单架构 manifest 原始 JSON 落盘到 Content Store
-	if rc.contentStore != nil && len(body) > 0 {
-		if err := rc.storeManifestBlob(body); err != nil {
-			fmt.Printf("  警告: 保存 manifest blob 到 content store 失败: %v\n", err)
-		}
-	}
-
+	// 对齐 containerd: 单架构 manifest 不再落盘到 Content Store
+	// 原因：当前没有"通过 manifest digest 反查 blob"的用例（image 记录已直接
+	// 保存 layer digest 数组），落盘只会写一份永远不会被读的死数据。
+	// 后续若需镜像签名/多架构 index 支持，可在此处重新启用 storeManifestBlob，
+	// 并在 metadata.Image 增加 Target 字段指向 manifest digest。
 	return &manifest, body, nil
 }
 
@@ -407,40 +432,6 @@ func selectPlatformDigest(body []byte) (string, error) {
 	return index.Manifests[0].Digest, nil
 }
 
-// storeManifestBlob 将字节流形式的 manifest 存入 contentStore（保存到文件系统的 content/sha256 路径）
-func (rc *RegistryClient) storeManifestBlob(body []byte) error {
-	ctx := context.Background()
-
-	// 计算 manifest 的 digest（与 Registry 端的 digest 一致）
-	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
-
-	// 如果已存在则跳过（幂等）
-	if rc.contentStore.Exists(ctx, digest) {
-		return nil
-	}
-
-	mediaType := "application/vnd.oci.image.manifest.v1+json"
-	writer, err := rc.contentStore.Writer(ctx, digest, int64(len(body)), mediaType)
-	if err != nil {
-		return fmt.Errorf("创建 content writer 失败: %w", err)
-	}
-	defer writer.Close()
-
-	if _, err := writer.Write(body); err != nil {
-		return fmt.Errorf("写入 manifest blob 失败: %w", err)
-	}
-
-	// 对齐 containerd: Commit 时 contentStore 内部会:
-	// 1. 校验计算的 digest 与期望 digest 是否一致
-	// 2. 将临时文件 rename 为最终文件（原子操作）
-	// 3. 将 Info 元数据写入 BoltDB
-	if err := writer.Commit(ctx, digest); err != nil {
-		return fmt.Errorf("提交 manifest blob 失败: %w", err)
-	}
-
-	return nil
-}
-
 // BlobProgressFunc blob 下载进度回调
 // total: 总字节数, completed: 已下载字节数
 type BlobProgressFunc func(total, completed int64)
@@ -450,52 +441,81 @@ type BlobProgressFunc func(total, completed int64)
 // 对齐 containerd: 所有 blob 写入通过 contentStore.Writer() → Commit() 完成，确保文件与 BoltDB 元数据一致
 // 返回下载的 blob 文件路径（content/sha256/<hex>）和 SHA256 校验结果
 // progressFn 可为 nil，表示不需要进度回调
+// 401 时自动重新认证并重试（与 fetchManifestBlob 行为对齐）
 func (rc *RegistryClient) DownloadBlob(repository, digest string, progressFn BlobProgressFunc) (string, error) {
-	if err := rc.ensureToken(repository); err != nil {
-		return "", fmt.Errorf("获取认证令牌失败: %w", err)
-	}
+	ctx := context.Background()
 
 	// 对齐 containerd: 通过 contentStore.Exists() 检查 blob 是否已存在
 	// 这是 Docker 镜像分层复用机制的基石——相同 digest 的层只下载一次
-	if rc.contentStore != nil {
-		ctx := context.Background()
-		if rc.contentStore.Exists(ctx, digest) {
-			if progressFn != nil {
-				progressFn(0, 0) // 通知 blob 已缓存
-			}
-			// 返回 blob 文件路径（content/sha256/<hex>）
-			return rc.blobFilePath(digest), nil
+	// 缓存命中走本地路径，无须重试
+	if rc.contentStore.Exists(ctx, digest) {
+		if progressFn != nil {
+			progressFn(0, 0) // 通知 blob 已缓存
 		}
+		// 通过 content.Store 接口拿路径，避免 RegistryClient 触碰存储后端内部布局
+		return rc.contentStore.Path(ctx, digest)
 	}
 
-	url := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", rc.scheme, rc.host, repository, digest)
-
-	req, err := http.NewRequest("GET", url, nil)
+	// HTTP 拉取（401 时循环重试，最多重试 maxAuthRetries 次）
+	resp, err := rc.fetchBlobResponse(repository, digest)
 	if err != nil {
-		return "", fmt.Errorf("创建下载请求失败: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+rc.token)
-	// 1. 发起网络请求，向服务器请求这个 digest 对应的真实数据
-	resp, err := rc.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("下载 blob 失败: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载 blob 失败 (HTTP %d)", resp.StatusCode)
-	}
-
-	// contentStore 未初始化时不能下载 blob，否则文件与元数据不一致，GC 无法正确工作
-	if rc.contentStore == nil {
-		resp.Body.Close()
-		return "", fmt.Errorf("contentStore 未初始化，无法下载 blob（元数据会缺失）")
-	}
-
-	// 对齐 containerd: 通过 contentStore.Writer() 创建写入器
-	// contentStore 内部会创建临时文件，边写边计算 SHA256，Commit 时校验 digest 并写入 BoltDB 元数据
-	// 这样保证了文件存储与元数据存储的一致性，GC 的 Walk/Info/Exists 才能正确工作
+	// 把流式字节写到 contentStore
 	return rc.downloadBlobViaContentStore(resp, digest, progressFn)
+}
+
+// fetchBlobResponse 纯 HTTP 拉 blob 响应，401 时重试（与 fetchManifestBlob 行为对齐）
+// 负责认证 / 401 重试 / 状态码校验，不做任何内容读取或存储
+func (rc *RegistryClient) fetchBlobResponse(repository, digest string) (*http.Response, error) {
+	const maxAuthRetries = 3
+	url := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", rc.scheme, rc.host, repository, digest)
+
+	for authAttempt := 0; authAttempt < maxAuthRetries; authAttempt++ {
+		if err := rc.ensureToken(repository); err != nil {
+			return nil, fmt.Errorf("获取认证令牌失败: %w", err)
+		}
+
+		rc.mu.Lock()
+		token := rc.token
+		rc.mu.Unlock()
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("创建下载请求失败: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := rc.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("下载 blob 失败: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			// 清除无效 token，下一轮循环会重新获取
+			rc.mu.Lock()
+			rc.token = ""
+			rc.mu.Unlock()
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			truncateLen := len(errBody)
+			if truncateLen > 200 {
+				truncateLen = 200
+			}
+			return nil, fmt.Errorf("下载 blob 失败 (HTTP %d): %s", resp.StatusCode, string(errBody[:truncateLen]))
+		}
+
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("下载 blob 失败: 认证重试 %d 次后仍返回 401（可能 Token 无效）", maxAuthRetries)
 }
 
 // downloadBlobViaContentStore 通过 contentStore.Writer() 下载 blob
@@ -558,17 +578,8 @@ func (rc *RegistryClient) downloadBlobViaContentStore(resp *http.Response, diges
 		return "", fmt.Errorf("提交 blob 失败: %w", err)
 	}
 
-	return rc.blobFilePath(digest), nil
-}
-
-// blobFilePath 根据 digest 计算 blob 文件路径
-// 对齐 containerd: content/sha256/<hex>，文件名为 digest 去掉 "sha256:" 前缀后的 hex 值
-func (rc *RegistryClient) blobFilePath(digest string) string {
-	blobHex := digest
-	if strings.HasPrefix(blobHex, "sha256:") {
-		blobHex = blobHex[7:]
-	}
-	return filepath.Join(constants.ContentStoreDir, blobHex)
+	// 通过 content.Store 接口拿路径，避免 RegistryClient 触碰存储后端内部布局
+	return rc.contentStore.Path(ctx, digest)
 }
 
 // GetImageConfig 下载并解析镜像配置

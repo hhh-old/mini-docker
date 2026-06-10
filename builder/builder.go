@@ -45,6 +45,7 @@ package builder
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,7 +54,9 @@ import (
 	"time"
 
 	"mini-docker/constants"
+	"mini-docker/containerd/content"
 	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/utils"
 )
@@ -68,10 +71,11 @@ type BuildConfig struct {
 // BuildService 提供构建过程中需要的镜像操作（与 containerd 解耦）
 // daemon/builder 调用方负责注入具体实现（通常包装 containerd.Client）。
 type BuildService interface {
-	// ResolveImage 通过 name[:tag] 解析已有镜像，返回 rootfs 路径
+	// ResolveImage 通过 name[:tag] 解析已有镜像，返回 snapshot ID
 	ResolveImage(imageRef string) (string, error)
 	// RegisterImage 注册一个已构建好的镜像（写入元数据 DB）
-	RegisterImage(info *images.ImageInfo) error
+	// 入参为 metadata.Image，Size 字段被 omitempty 忽略不入 boltdb
+	RegisterImage(info *metadata.Image) error
 	// Snapshotter 返回 Snapshotter 接口，用于注册构建层的快照元数据
 	// 对齐 containerd: 构建器通过 Snapshotter.RegisterCommitted 注册每层快照，
 	// 确保 GC 和 lowerDirs() 能正确感知构建镜像的层
@@ -83,7 +87,7 @@ type BuildResult struct {
 	Tag       string
 	Layers    []string
 	ImageID   string
-	Info      *images.ImageInfo
+	Info      *metadata.Image
 }
 
 type DockerfileInstruction struct {
@@ -301,12 +305,26 @@ func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 	if ctx.svc == nil {
 		return fmt.Errorf("BuildService 未配置，无法解析基础镜像")
 	}
-	rootFS, err := ctx.svc.ResolveImage(ctx.imageName)
+	snapshotID, err := ctx.svc.ResolveImage(ctx.imageName)
 	if err != nil {
 		return fmt.Errorf("基础镜像 %s 不存在，请先 pull: %w", ctx.imageName, err)
 	}
-	ctx.rootfsPath = rootFS
-	ctx.baseRootfsPath = rootFS
+
+	// 通过 Snapshotter 从 snapshot ID 获取实际的 diff 目录路径
+	var rootFSPath string
+	if snap := ctx.svc.Snapshotter(); snap != nil {
+		diffPath, err := snap.DiffPath(context.Background(), snapshotID)
+		if err != nil {
+			return fmt.Errorf("获取基础镜像 diff 路径失败: %w", err)
+		}
+		rootFSPath = diffPath
+	} else {
+		// 回退：直接拼接路径
+		rootFSPath = filepath.Join(constants.SnapshotterDir, snapshotID, "diff")
+	}
+
+	ctx.rootfsPath = rootFSPath
+	ctx.baseRootfsPath = rootFSPath
 
 	fmt.Printf("    → 基础镜像: %s\n", ctx.imageName)
 	return nil
@@ -455,7 +473,7 @@ func (ctx *buildContext) handleExpose(inst DockerfileInstruction) error {
 	return nil
 }
 
-func (ctx *buildContext) saveFinalImage(name, tag string) (*images.ImageInfo, error) {
+func (ctx *buildContext) saveFinalImage(name, tag string) (*metadata.Image, error) {
 	fmt.Printf("    → 保存镜像 %s:%s\n", name, tag)
 
 	rootFSPath := ctx.rootfsPath
@@ -485,20 +503,20 @@ func (ctx *buildContext) saveFinalImage(name, tag string) (*images.ImageInfo, er
 		}
 	}
 
-	// 最顶层 digest 作为 snapshotKey，用于容器运行时 PrepareSnapshot 的 parent
-	snapshotKey := ""
+	// 最顶层 digest 转为 cacheID 作为 TopLayerSnapshotID，用于容器运行时 PrepareSnapshot 的 parent
+	topLayerSnapshotID := ""
 	if len(layerDigests) > 0 {
-		snapshotKey = layerDigests[len(layerDigests)-1]
+		topLayerSnapshotID = content.DigestToCacheID(layerDigests[len(layerDigests)-1])
 	}
 
-	info := &images.ImageInfo{
-		Name:      name,
-		Tag:       tag,
-		ImageID:   fmt.Sprintf("%x", time.Now().UnixNano()),
-		Size:      images.CalculateRootFSSize(rootFSPath),
-		CreatedAt: time.Now().Format("2006-01-02 15:04:05"),
-		RootFS:    snapshotKey, // 对齐 Registry 拉取: RootFS 存储最顶层的 snapshotKey
-		Layers:    layerDigests,
+	info := &metadata.Image{
+		Name:               name,
+		Tag:                tag,
+		ImageID:            fmt.Sprintf("%x", time.Now().UnixNano()),
+		CreatedAt:          time.Now().Format("2006-01-02 15:04:05"),
+		TopLayerSnapshotID: topLayerSnapshotID, // 对齐 Registry 拉取：TopLayerSnapshotID 存储最顶层的 cacheID
+		LayerDigests:       layerDigests,
+		Size:               images.CalculateRootFSSize(rootFSPath),
 	}
 
 	if ctx.svc == nil {

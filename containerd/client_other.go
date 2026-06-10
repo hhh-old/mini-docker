@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"mini-docker/containerd/images"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
 	"mini-docker/libcontainer"
@@ -91,11 +91,11 @@ func (c *Client) ReadExitInfo(containerID string) (*ExitInfo, error) {
 	return nil, fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
-func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData)) (*images.ImageInfo, error) {
+func (c *Client) PullImage(imageName string, progressFn func(ProgressFrameData)) (*metadata.Image, error) {
 	return nil, fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
-func (c *Client) ListImages() ([]*images.ImageInfo, error) {
+func (c *Client) ListImages() ([]*metadata.Image, error) {
 	return nil, fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
@@ -103,7 +103,7 @@ func (c *Client) RemoveImage(imageRef string) error {
 	return fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
-func (c *Client) InspectImage(imageRef string) (*images.ImageManifest, error) {
+func (c *Client) InspectImage(imageRef string) (*metadata.Image, error) {
 	return nil, fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
@@ -111,19 +111,11 @@ func (c *Client) ResolveImage(imageRef string) (string, error) {
 	return "", fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
-func (c *Client) ResolveImageSnapshotKey(imageRef string) (string, error) {
-	return "", fmt.Errorf("containerd 仅支持 Linux 平台")
-}
-
-func (c *Client) ResolveImageBoth(imageRef string) (string, string, error) {
-	return "", "", fmt.Errorf("containerd 仅支持 Linux 平台")
-}
-
-func (c *Client) RegisterImage(info *images.ImageInfo) error {
+func (c *Client) RegisterImage(info *metadata.Image) error {
 	return fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 
-func (c *Client) PrepareSnapshot(key, parent string) (*types.OverlayDirs, error) {
+func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types.OverlayDirs, error) {
 	return nil, fmt.Errorf("containerd 仅支持 Linux 平台")
 }
 

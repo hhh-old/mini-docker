@@ -210,7 +210,7 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 
 	// 路径 3: pull 请求使用流式进度推送模式
 	if req.Type == "pull" {
-		d.routeRequest(req, conn) // handler 内多次 sendProgress 发 JSON 帧
+		d.routeRequest(req, conn) // handler 内多次 sendProgress 发 JSON 帧，用conn.Close()自己管理连接
 		conn.Close()
 		return
 	}

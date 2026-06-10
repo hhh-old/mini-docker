@@ -66,12 +66,13 @@ func NewSnapshotter(root string, db *metadata.DB) (*OverlaySnapshotter, error) {
 }
 
 // Prepare 创建一个可写快照 (用于容器运行或镜像解包)
+// 给定容器 ID + 镜像顶层层的 cacheID，在 overlay 上创建了三个目录（diff/upper/work）
 func (o *OverlaySnapshotter) Prepare(ctx context.Context, key, parent string) ([]snapshots.Mount, error) {
-	snapDir := filepath.Join(o.root, key)
+	snapDir := filepath.Join(o.root, key) //key是容器id
 	if err := os.MkdirAll(snapDir, 0755); err != nil {
 		return nil, fmt.Errorf("创建快照目录失败: %w", err)
 	}
-
+	//在 <root>/<containerID>/ 下创建 overlay 三件套 目录（diff/upper/work）
 	diffDir := filepath.Join(snapDir, "diff")
 	upperDir := filepath.Join(snapDir, "upper")
 	workDir := filepath.Join(snapDir, "work")
@@ -88,11 +89,15 @@ func (o *OverlaySnapshotter) Prepare(ctx context.Context, key, parent string) ([
 		os.RemoveAll(snapDir)
 		return nil, fmt.Errorf("创建 work 目录失败: %w", err)
 	}
-
+	//parent 参数的意义
+	//调用 Prepare(containerID, parent) 时传入的 parent 是 镜像最顶层的 cacheID （ content.DigestToCacheID(layerDigests[len-1]) ）。它至少承担三个职责：
+	//1. 构造 lowerdir 链 — Snapshotter.Mounts(ctx, containerID) 会沿 parent 链向上递归，把所有镜像层的 diff/ 路径拼起来作为 lowerdir=
+	//2. GC 跟踪 — GC 看到容器的 snapshot Parent=<顶层镜像层 cacheID> ，就知道"这个容器在用这条 layer 链，删镜像时这些层要保护"
+	//3. 关联回退路径 — markSnapshotParents 在 GC 时会沿 parent 链把所有祖先都标为可达
 	now := time.Now().Format(constants.TimeFormat)
 	info := &snapshots.Info{
-		Name:      key,
-		Parent:    parent,
+		Name:      key,    //key是容器id
+		Parent:    parent, //Parent=<顶层镜像层 cacheID>
 		Kind:      snapshots.KindActive,
 		ReadWrite: true,
 		CreatedAt: now,
@@ -276,7 +281,7 @@ func (o *OverlaySnapshotter) UnpackLayer(ctx context.Context, blobPath, digest, 
 		now := time.Now().Format(constants.TimeFormat)
 		info := &snapshots.Info{
 			Name:      cacheID,
-			Parent:    parent,
+			Parent:    parent, //这个层快照的父快照的cacheID（上一层的 cacheID，基础层为空）
 			Kind:      snapshots.KindCommitted,
 			ReadWrite: false,
 			CreatedAt: now,
@@ -303,7 +308,12 @@ func (o *OverlaySnapshotter) UnpackLayer(ctx context.Context, blobPath, digest, 
 	}
 
 	// 对齐 containerd: 校验解压后的 DiffID，确保数据完整性
-	if diffID != "" && actualDiffID != diffID {
+	// diffID 必传：上层调用方负责从 OCI Config 的 RootFS.DiffIDs 拿
+	if diffID == "" {
+		os.RemoveAll(filepath.Join(o.root, cacheID))
+		return "", fmt.Errorf("UnpackLayer: diffID 不能为空（必须从 OCI Config 的 RootFS.DiffIDs 提供，用于解压后完整性校验）")
+	}
+	if actualDiffID != diffID {
 		os.RemoveAll(filepath.Join(o.root, cacheID))
 		return "", fmt.Errorf("DiffID 校验失败: 期望 %s, 实际 %s", diffID, actualDiffID)
 	}
@@ -365,7 +375,7 @@ func (o *OverlaySnapshotter) mounts(key string) ([]snapshots.Mount, error) {
 			return nil, fmt.Errorf("收集 lowerdir 失败: %w", err)
 		}
 		if len(lowers) > 0 {
-			options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(lowers, ":")))
+			options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(lowers, ":"))) //把镜像层的目录用：拼接到了一起
 		}
 	}
 

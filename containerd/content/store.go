@@ -38,6 +38,11 @@ type Store interface {
 	Update(ctx context.Context, digest string, labels map[string]string) error //更新 blob 的标签
 
 	Exists(ctx context.Context, digest string) bool //检查 blob 是否存在
+
+	// Path 返回 blob 的本地存储路径
+	// 仅对基于文件系统的实现有意义；调用方应仅在确实需要直接路径访问
+	//（如流式 tar 解压）时使用。如能用 Reader 流式处理，请优先用 Reader。
+	Path(ctx context.Context, digest string) (string, error)
 }
 
 type Writer interface {

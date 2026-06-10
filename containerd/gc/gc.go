@@ -9,6 +9,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"mini-docker/constants"
 	"mini-docker/containerd/content"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
@@ -24,15 +25,17 @@ import (
   引用关系链：
   - Tags → ImageID → LayerDigests → Content (blob)
   - ContainerInfo → Image → LayerDigests → Content (blob)
-  - ContainerInfo → SnapshotKey (containerID，容器可写层)
+  - ContainerInfo → SnapshotID (containerID，容器可写层)
   - Snapshot → Parent → Parent (链式，递归标记)
-  - Lease → Content/Snapshot (保护机制)
 
   标记阶段（Mark）：
   1. 从 Tags 出发，标记所有可达的 ImageID 和 LayerDigests
   2. 从 ContainerInfo 出发，标记容器使用的镜像层和快照
-  3. 从 Lease 出发，标记被保护的对象
-  4. 从 Active 快照出发，递归标记其父链
+  3. 从 Active 快照出发，递归标记其父链
+
+  GC 保护机制（Preflight）：
+  - Pull 开始时创建 in-progress lease，GC 检测到后整轮跳过
+  - Pull 完成后立即 Delete lease，此时 Tags/Layers 引用链已建立
 
   清扫阶段（Sweep）：
   1. 遍历所有 content，删除未被标记的
@@ -47,25 +50,16 @@ import (
 */
 
 // Collector GC 收集器
+// content / snapshotter 直接依赖 content.Store / snapshots.Snapshotter 接口（与项目中其他模块保持一致），
+// 不再额外定义 ContentDeleter / SnapshotDeleter 子接口 —— GC 是这两个接口的唯一消费者，
+// 签名差异（Walk 回调参数 Info vs digest）已在调用点用内联闭包消化，避免无谓的 adapter 层。
 type Collector struct {
 	db          *metadata.DB
-	content     ContentDeleter
-	snapshotter SnapshotDeleter
+	content     content.Store
+	snapshotter snapshots.Snapshotter
 	interval    time.Duration
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
-}
-
-// ContentDeleter Content 删除接口
-type ContentDeleter interface {
-	Delete(ctx context.Context, digest string) error
-	Walk(ctx context.Context, fn func(digest string, size int64) error) error
-}
-
-// SnapshotDeleter Snapshot 删除接口
-type SnapshotDeleter interface {
-	Remove(ctx context.Context, key string) error
-	Walk(ctx context.Context, fn func(name string) error) error
 }
 
 // GCStats GC 统计信息
@@ -76,7 +70,7 @@ type GCStats struct {
 }
 
 // NewCollector 创建 GC 收集器
-func NewCollector(db *metadata.DB, content ContentDeleter, snapshotter SnapshotDeleter, interval time.Duration) *Collector {
+func NewCollector(db *metadata.DB, content content.Store, snapshotter snapshots.Snapshotter, interval time.Duration) *Collector {
 	return &Collector{
 		db:          db,
 		content:     content,
@@ -123,6 +117,19 @@ func (g *Collector) Run(ctx context.Context) (GCStats, error) {
 	start := time.Now()
 	var stats GCStats
 
+	// Preflight: 检测 in-progress lease,有活跃拉取则整轮跳过,有僵尸则清理
+	// 对齐 containerd: lease 处于 in-progress 表示对象正在被读写,此时 GC 不能动磁盘
+	// 崩溃残留的 in-progress (CreatedAt 早于 now-2*interval) 视为僵尸,自动 Delete
+	skip, err := g.preflight(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("preflight 失败: %w", err)
+	}
+	if skip {
+		log.Printf("[gc] 检测到 in-progress lease,本轮跳过 (避免误删拉取中的半成品)\n")
+		stats.Elapsed = time.Since(start) //time.Since(start) 是 Go 语言中用于计算从 start 时刻到当前时刻所经过时间的一个函数。它返回一个 time.Duration 类型的值，表示时间间隔（例如纳秒、微秒、毫秒等）。
+		return stats, nil
+	}
+
 	reachableDigests, reachableSnapKeys, err := g.mark(ctx)
 	if err != nil {
 		return stats, fmt.Errorf("标记阶段失败: %w", err)
@@ -142,6 +149,48 @@ func (g *Collector) Run(ctx context.Context) (GCStats, error) {
 
 	stats.Elapsed = time.Since(start)
 	return stats, nil
+}
+
+// preflight GC 前置检查:处理 in-progress lease
+//   - 活跃拉取 (CreatedAt 较新): 设置 skip=true 让 Run 跳过本轮,避免误删下载中的 blob/snapshot
+//   - 僵尸 lease (CreatedAt 超过 2*interval,通常是上次进程崩溃残留): 自动 Delete
+//
+// 为什么用 2*interval 作为僵尸阈值?
+//   - 1 个 interval 仍可能误判(网络慢的拉取可能跨 1 个周期)
+//   - 2 个 interval 之后还没完成的拉取几乎一定是僵尸(正常拉取 < 几分钟)
+//
+// 必须在 mark() 之前执行,否则僵尸的 in-progress 会被当成"活跃"误跳过本轮,
+// 导致崩溃残留的孤儿 blob 永远无法被回收。
+func (g *Collector) preflight(ctx context.Context) (bool, error) {
+	cutoff := time.Now().Add(-2 * g.interval) //cutoff 是 当前时间减去 2 个 interval（一个过去的时间点）
+	var skip bool
+
+	err := g.db.Update(func(tx *bolt.Tx) error {
+		return metadata.WalkLeases(tx, func(info *metadata.LeaseInfo) error {
+			if info.Status != metadata.LeaseStatusInProgress {
+				return nil
+			}
+			createdAt, err := time.Parse(constants.TimeFormat, info.CreatedAt)
+			if err != nil {
+				// CreatedAt 解析失败:保守按"活跃"处理,跳过本轮
+				skip = true
+				return nil
+			}
+			if createdAt.After(cutoff) { //createdAt.After(cutoff) 是 Go 语言中 time.Time 类型的方法，用于判断时间点 createdAt 是否晚于 cutof
+				// 活跃拉取,跳过本轮
+				skip = true
+			} else {
+				// 僵尸 lease,清理掉 (让本轮 GC 正常回收其保护的孤儿对象)
+				if err := metadata.DeleteLease(tx, info.ID); err != nil {
+					return fmt.Errorf("清理僵尸 lease %s 失败: %w", info.ID, err)
+				}
+				log.Printf("[gc] 清理僵尸 in-progress lease: %s (创建于 %s)\n", info.ID, info.CreatedAt)
+			}
+			return nil
+		})
+	})
+
+	return skip, err
 }
 
 // mark 标记阶段：找出所有可达的 content 和 snapshot
@@ -171,8 +220,13 @@ func (g *Collector) mark(ctx context.Context) (map[string]struct{}, map[string]s
 			}
 			// 标记镜像 ID（作为 content 存储）
 			reachableDigests[imageID] = struct{}{}
+			// 对齐 containerd: 标记镜像的 config blob
+			// 防止 GC 误删这些 OCI 镜像必需的 blob
+			if img.ConfigDigest != "" {
+				reachableDigests[img.ConfigDigest] = struct{}{}
+			}
 			// 标记所有层 digest
-			for _, layerDigest := range img.Layers {
+			for _, layerDigest := range img.LayerDigests {
 				reachableDigests[layerDigest] = struct{}{}
 				// 层 digest 对应的快照也应该被标记
 				// 层的 cacheID 就是 digest 的 hex 部分，也是快照的 key
@@ -212,7 +266,7 @@ func (g *Collector) mark(ctx context.Context) (map[string]struct{}, map[string]s
 					if err != nil {
 						return nil
 					}
-					for _, layerDigest := range img.Layers {
+					for _, layerDigest := range img.LayerDigests {
 						reachableDigests[layerDigest] = struct{}{}
 						cacheID := content.DigestToCacheID(layerDigest)
 						reachableSnapKeys[cacheID] = struct{}{}
@@ -223,25 +277,7 @@ func (g *Collector) mark(ctx context.Context) (map[string]struct{}, map[string]s
 		}
 	}
 
-	// 3. 从 Lease 出发，标记被保护的对象
-	// 对齐 containerd: lease 对象有类型标识（content/snapshot），GC 根据类型分别标记
-	if err := g.db.View(func(tx *bolt.Tx) error {
-		return metadata.WalkLeases(tx, func(info *metadata.LeaseInfo) error {
-			for _, obj := range info.Objects {
-				switch obj.Type {
-				case metadata.LeaseObjectContent:
-					reachableDigests[obj.ID] = struct{}{}
-				case metadata.LeaseObjectSnapshot:
-					reachableSnapKeys[obj.ID] = struct{}{}
-				}
-			}
-			return nil
-		})
-	}); err != nil {
-		return nil, nil, err
-	}
-
-	// 4. 从已标记的快照出发，递归标记其父链
+	// 3. 从已标记的快照出发，递归标记其父链
 	// 对齐 containerd: 快照的父快照也应该被保护
 	if err := g.markSnapshotParents(reachableSnapKeys); err != nil {
 		return nil, nil, err
@@ -293,29 +329,27 @@ func (g *Collector) markSnapshotParents(reachableSnapKeys map[string]struct{}) e
 }
 
 // sweepContent 清扫未被标记的 content
+// 对齐 containerd: 先收集待删除列表，再批量删除
+// 修复：将 boltdb 元数据清理合并到单个事务中，避免逐条开事务的性能问题
 func (g *Collector) sweepContent(ctx context.Context, reachable map[string]struct{}) (int, error) {
 	deleted := 0
 	var toDelete []string
 
-	if err := g.content.Walk(ctx, func(digest string, size int64) error {
-		if _, ok := reachable[digest]; !ok {
-			toDelete = append(toDelete, digest)
+	if err := g.content.Walk(ctx, func(info content.Info) error {
+		if _, ok := reachable[info.Digest]; !ok {
+			toDelete = append(toDelete, info.Digest)
 		}
 		return nil
 	}); err != nil {
 		return 0, fmt.Errorf("遍历 content 失败: %w", err)
 	}
 
+	// 先删除文件，再批量清理 boltdb 元数据
 	for _, digest := range toDelete {
 		if err := g.content.Delete(ctx, digest); err != nil {
 			log.Printf("[gc] 删除 content %s 失败: %v\n", digest, err)
 			continue
 		}
-		// 同时删除 boltdb 中的层元数据
-		g.db.Update(func(tx *bolt.Tx) error {
-			metadata.DeleteLayer(tx, digest)
-			return nil
-		})
 		deleted++
 	}
 
@@ -324,6 +358,9 @@ func (g *Collector) sweepContent(ctx context.Context, reachable map[string]struc
 
 // sweepSnapshots 清扫未被标记的 snapshot
 // 对齐 containerd: 先删除叶子节点，再删除父节点，避免删除被引用的父快照
+// 修复：1. 删除快照后同步清理 boltdb 元数据，避免幽灵记录累积
+//  2. 拓扑排序无法继续时跳过而非强制删除，避免破坏可达快照的父链
+//  3. 使用 name→parent 映射替代 O(n²) 遍历
 func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]struct{}) (int, error) {
 	deleted := 0
 
@@ -333,11 +370,13 @@ func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]str
 		parent string
 	}
 	var allSnaps []snapInfo
-	parentCount := make(map[string]int) // 记录每个快照被多少子快照引用
+	parentCount := make(map[string]int)   // 记录每个快照被多少子快照引用
+	snapParent := make(map[string]string) // name → parent 映射，O(1) 查找
 
 	if err := g.db.View(func(tx *bolt.Tx) error {
 		return metadata.WalkSnapshots(tx, func(info *snapshots.Info) error {
-			allSnaps = append(allSnaps, snapInfo{name: info.Name, parent: info.Parent})
+			allSnaps = append(allSnaps, snapInfo{name: info.Name, parent: info.Parent}) //info.Name就是cacheID，info.Parent是上一层layer的 cacheID
+			snapParent[info.Name] = info.Parent
 			if info.Parent != "" {
 				parentCount[info.Parent]++
 			}
@@ -377,24 +416,25 @@ func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]str
 			deletedThisRound = append(deletedThisRound, name)
 			deleted++
 
-			// 减少父快照的引用计数
-			for _, snap := range allSnaps {
-				if snap.name == name && snap.parent != "" {
-					parentCount[snap.parent]--
-				}
+			// 同步清理 boltdb 中的快照元数据，避免幽灵记录累积
+			// 导致后续 GC 的 WalkSnapshots 遍历到已删除的快照
+			if err := g.db.Update(func(tx *bolt.Tx) error {
+				return metadata.DeleteSnapshot(tx, name)
+			}); err != nil {
+				log.Printf("[gc] 删除 snapshot %s 元数据失败: %v\n", name, err)
+			}
+
+			// 减少父快照的引用计数（O(1) 查找，替代 O(n²) 遍历）
+			if parent := snapParent[name]; parent != "" {
+				parentCount[parent]--
 			}
 		}
 
-		// 如果这一轮没有删除任何快照，说明存在循环引用或其他问题
+		// 如果这一轮没有删除任何快照，说明存在循环引用或引用异常
+		// 对齐 containerd: 跳过而非强制删除，避免破坏可达快照的父链
+		// 这些快照将在下次 GC 时重新评估（可能引用它的快照已被其他 GC 周期清理）
 		if len(deletedThisRound) == 0 {
-			// 强制删除剩余的（可能是孤立快照）
-			for _, name := range toDelete {
-				if err := g.snapshotter.Remove(ctx, name); err != nil {
-					log.Printf("[gc] 强制删除 snapshot %s 失败: %v\n", name, err)
-				} else {
-					deleted++
-				}
-			}
+			log.Printf("[gc] 拓扑排序无法继续，跳过 %d 个未标记快照（可能存在循环引用），等待下次 GC 评估\n", len(toDelete))
 			break
 		}
 

@@ -65,7 +65,7 @@ const (
 	ReqRemoveImage = "remove_image"
 	// ReqInspectImage 查看镜像详情
 	ReqInspectImage = "inspect_image"
-	// ReqResolveImage 解析镜像 rootfs 路径
+	// ReqResolveImage 解析镜像引用，返回 snapshot ID
 	ReqResolveImage = "resolve_image"
 	// ReqRegisterImage 注册一个已构建好的镜像（builder 调用）
 	ReqRegisterImage = "register_image"

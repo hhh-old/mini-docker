@@ -46,8 +46,21 @@ type Service struct {
 	leaseMgr    *gc.LeaseManager
 }
 
-// NewService 创建镜像管理服务
+// 创建镜像管理服务
+// 4 个依赖均为必传；任一为 nil 立即 panic。
 func NewService(meta *metadata.DB, contentStore content.Store, snap snapshots.Snapshotter, leaseMgr *gc.LeaseManager) *Service {
+	if meta == nil {
+		panic("images.NewService: meta is required")
+	}
+	if contentStore == nil {
+		panic("images.NewService: contentStore is required")
+	}
+	if snap == nil {
+		panic("images.NewService: snap is required")
+	}
+	if leaseMgr == nil {
+		panic("images.NewService: leaseMgr is required")
+	}
 	return &Service{
 		meta:        meta,
 		content:     contentStore,
@@ -69,17 +82,15 @@ func (s *Service) Snapshotter() snapshots.Snapshotter {
 //  3. 解压后即时通过 Snapshotter 注册每层为 Committed 快照（建立 parent 链）
 //  4. 同步到 metadata.DB（写入 image/layer/tag）
 //  5. 删除 Lease
-func (s *Service) Pull(ctx context.Context, imageRef string, progress ProgressFunc) (*ImageInfo, error) {
+func (s *Service) Pull(ctx context.Context, imageRef string, progress ProgressFunc) (*metadata.Image, error) {
 	// 对齐 Docker: 先检查本地是否已有该镜像，已有则直接返回
-	if s.meta != nil {
-		name, tag := utils.ParseImageTag(imageRef)
-		if tag == "" {
-			tag = "latest"
-		}
-		if existing, err := s.Resolve(ctx, name+":"+tag); err == nil {
-			progress(StatusComplete, fmt.Sprintf("镜像 %s:%s 已存在本地", name, tag))
-			return existing, nil
-		}
+	name, tag := utils.ParseImageTag(imageRef)
+	if tag == "" {
+		tag = "latest"
+	}
+	if existing, err := s.Resolve(ctx, name+":"+tag); err == nil {
+		progress(StatusComplete, fmt.Sprintf("镜像 %s:%s 已存在本地", name, tag))
+		return existing, nil
 	}
 	//创建 Lease（GC 保护机制）
 	//为什么需要 Lease : 拉取过程中会创建 blob、写入快照、注册元数据。如果此时 GC 触发，可能把这些"半成品"误清理。Lease 用于告诉 GC: "这些对象正在被使用，不要清理"。
@@ -94,11 +105,8 @@ func (s *Service) Pull(ctx context.Context, imageRef string, progress ProgressFu
 		return nil, err
 	}
 
-	// 对齐 containerd: 层快照已在 pull 流程中通过 Snapshotter.UnpackLayer 原子注册
-	// （解压+元数据注册在同一操作中完成），不再需要事后补注册
-
 	progress(StatusRegistering, "同步元数据到 boltdb...")
-	if err := s.register(ctx, info, leaseID); err != nil {
+	if err := s.Register(ctx, info); err != nil {
 		progress(StatusWarning, fmt.Sprintf("同步到 metadata.DB 失败: %v", err))
 	}
 	progress(StatusRegistering, "元数据同步完成")
@@ -106,69 +114,12 @@ func (s *Service) Pull(ctx context.Context, imageRef string, progress ProgressFu
 	return info, nil
 }
 
-// Register 注册一个已构建好的镜像到 metadata.DB
-// 供 builder 使用：builder 在本地完成 rootfs/layers 组装后，通过本方法写入元数据。
-// leaseID 可为空字符串。
-func (s *Service) Register(ctx context.Context, info *ImageInfo) error {
-	return s.register(ctx, info, "")
-}
-
-// register 把 ImageInfo 同步到 boltdb
-// 如果 leaseID 非空，会把每个层 digest 注册到 lease（GC 保护）
-func (s *Service) register(ctx context.Context, info *ImageInfo, leaseID string) error {
-	if s.meta == nil {
-		return nil
-	}
-
-	manifest := &metadata.ImageManifest{
-		ImageID:    info.ImageID,
-		Name:       info.Name,
-		Tag:        info.Tag,
-		CreatedAt:  info.CreatedAt,
-		RootFSPath: info.RootFS,
-		Layers:     info.Layers,
-		Config:     metadata.ImageConfig{},
-	}
-
-	// 收集需要注册到 lease 的对象，在事务外批量注册，避免 boltdb 死锁
-	// （boltdb 同一时刻只允许一个读写事务，事务内再开 Update 会死锁）
-	var leaseObjects []struct {
-		objType metadata.LeaseObjectType
-		objID   string
-	}
-
-	if err := s.meta.Update(func(tx *bolt.Tx) error {
-		if err := metadata.SaveImage(tx, manifest); err != nil {
+// Register 把 metadata.Image 同步到 boltdb。
+// Size 字段因 omitempty 不会被写入。
+func (s *Service) Register(ctx context.Context, info *metadata.Image) error {
+	return s.meta.Update(func(tx *bolt.Tx) error {
+		if err := metadata.SaveImage(tx, info); err != nil {
 			return fmt.Errorf("保存镜像元数据失败: %w", err)
-		}
-
-		for _, layerDigest := range manifest.Layers {
-			// 对齐 containerd: CacheID 是层的快照标识（digest 的 hex 部分），
-			// 与 Snapshotter 中的 key 格式一致，而非完整的 digest（sha256:...）
-			cacheID := content.DigestToCacheID(layerDigest)
-			layerInfo := &metadata.LayerInfo{
-				Digest:  layerDigest,
-				CacheID: cacheID,
-			}
-			if err := metadata.SaveLayer(tx, layerInfo); err != nil {
-				fmt.Printf("  警告: 保存层 %s 元数据失败: %v\n", layerDigest[:16], err)
-			}
-
-			if leaseID != "" {
-				// 对齐 containerd: lease 同时保护 content digest 和 snapshot key
-				// content digest 保护 blob 文件，snapshot key 保护快照目录和元数据
-				// 使用类型标识区分，避免 GC 启发式误判
-				leaseObjects = append(leaseObjects,
-					struct {
-						objType metadata.LeaseObjectType
-						objID   string
-					}{metadata.LeaseObjectContent, layerDigest},
-					struct {
-						objType metadata.LeaseObjectType
-						objID   string
-					}{metadata.LeaseObjectSnapshot, cacheID},
-				)
-			}
 		}
 
 		if err := metadata.SaveTag(tx, info.Name, info.Tag, info.ImageID); err != nil {
@@ -176,45 +127,23 @@ func (s *Service) register(ctx context.Context, info *ImageInfo, leaseID string)
 		}
 
 		return nil
-	}); err != nil {
-		return err
-	}
-
-	// 在事务外批量注册 lease 对象，避免 boltdb 死锁
-	for _, obj := range leaseObjects {
-		if err := s.leaseMgr.AddObject(ctx, leaseID, obj.objType, obj.objID); err != nil {
-			fmt.Printf("  警告: 添加 lease 对象失败: %v\n", err)
-		}
-	}
-
-	return nil
+	})
 }
 
 // List 列出本地镜像
-// 仅从 metadata.DB 读取
-func (s *Service) List(ctx context.Context) ([]*ImageInfo, error) {
-	if s.meta == nil {
-		return nil, nil
-	}
-
-	var images []*ImageInfo
+// 仅从 metadata.DB 读取，Size 通过 Snapshotter.DiffPath() 实时计算后写入 Image.Size
+// （不写回 boltdb，仅响应时填充）
+func (s *Service) List(ctx context.Context) ([]*metadata.Image, error) {
+	var images []*metadata.Image
 	err := s.meta.View(func(tx *bolt.Tx) error {
 		manifests, err := metadata.ListImages(tx)
 		if err != nil {
 			return err
 		}
 		for _, m := range manifests {
-			// 镜像大小通过 Snapshotter.DiffPath() 获取层路径后计算，不再直接拼接路径
-			size := s.CalculateLayersSize(context.Background(), m.Layers)
-			images = append(images, &ImageInfo{
-				Name:      m.Name,
-				Tag:       m.Tag,
-				ImageID:   m.ImageID,
-				Size:      size,
-				CreatedAt: m.CreatedAt,
-				RootFS:    m.RootFSPath,
-				Layers:    m.Layers,
-			})
+			// 镜像大小通过 Snapshotter.DiffPath() 获取层路径后计算
+			m.Size = s.CalculateLayersSize(context.Background(), m.LayerDigests)
+			images = append(images, m)
 		}
 		return nil
 	})
@@ -229,10 +158,6 @@ func (s *Service) List(ctx context.Context) ([]*ImageInfo, error) {
 // 使用单个 metadata 事务完成所有元数据删除，文件级清理在事务提交成功后执行
 // 对齐 containerd: 先标记删除元数据（事务），再清理文件，确保崩溃时不会出现"文件存在但元数据缺失"或"元数据存在但文件缺失"
 func (s *Service) Remove(ctx context.Context, imageRef string) error {
-	if s.meta == nil {
-		return fmt.Errorf("metadata.DB 未初始化")
-	}
-
 	name, tag := utils.ParseImageTag(imageRef)
 	if tag == "" {
 		tag = "latest"
@@ -259,15 +184,13 @@ func (s *Service) Remove(ctx context.Context, imageRef string) error {
 		}
 
 		// 查找孤儿层（只被当前镜像引用的层）
-		for _, layerDigest := range m.Layers {
+		for _, layerDigest := range m.LayerDigests {
 			if !metadata.HasOtherRefs(tx, layerDigest, imageID) {
 				cacheID := content.DigestToCacheID(layerDigest)
 				orphanedLayers = append(orphanedLayers, struct {
 					digest  string
 					cacheID string
 				}{layerDigest, cacheID})
-				// 删除层元数据（事务内）
-				metadata.DeleteLayer(tx, layerDigest)
 			}
 		}
 
@@ -284,31 +207,23 @@ func (s *Service) Remove(ctx context.Context, imageRef string) error {
 	for _, layer := range orphanedLayers {
 		// 对齐 containerd: 通过 Snapshotter.Remove() 和 contentStore.Delete() 统一删除
 		// 确保文件和 BoltDB 元数据在同一操作中清理，避免不一致
-		if s.snapshotter != nil {
-			if err := s.snapshotter.Remove(ctx, layer.cacheID); err != nil {
-				// 快照可能不存在（未注册），忽略错误继续清理
-			}
+		if err := s.snapshotter.Remove(ctx, layer.cacheID); err != nil {
+			// 快照可能不存在（未注册），忽略错误继续清理
 		}
-		if s.content != nil {
-			s.content.Delete(ctx, layer.digest)
-		}
+		s.content.Delete(ctx, layer.digest)
 	}
 
 	return nil
 }
 
-// Inspect 获取镜像详细信息
-func (s *Service) Inspect(ctx context.Context, imageRef string) (*ImageManifest, error) {
-	if s.meta == nil {
-		return nil, fmt.Errorf("metadata.DB 未初始化")
-	}
-
+// Inspect 获取镜像详细信息（boltdb 中的原始元数据，无 Size）
+func (s *Service) Inspect(ctx context.Context, imageRef string) (*metadata.Image, error) {
 	name, tag := utils.ParseImageTag(imageRef)
 	if tag == "" {
 		tag = "latest"
 	}
 
-	var manifest *metadata.ImageManifest
+	var manifest *metadata.Image
 	err := s.meta.View(func(tx *bolt.Tx) error {
 		imageID, err := metadata.ResolveImageID(tx, name, tag)
 		if err != nil {
@@ -327,18 +242,14 @@ func (s *Service) Inspect(ctx context.Context, imageRef string) (*ImageManifest,
 	return manifest, nil
 }
 
-// Resolve 解析镜像引用，返回镜像信息
-func (s *Service) Resolve(ctx context.Context, imageRef string) (*ImageInfo, error) {
-	if s.meta == nil {
-		return nil, fmt.Errorf("metadata.DB 未初始化")
-	}
-
+// Resolve 解析镜像引用，返回镜像信息（含实时计算的 Size）
+func (s *Service) Resolve(ctx context.Context, imageRef string) (*metadata.Image, error) {
 	name, tag := utils.ParseImageTag(imageRef)
 	if tag == "" {
 		tag = "latest"
 	}
 
-	var info *ImageInfo
+	var info *metadata.Image
 	err := s.meta.View(func(tx *bolt.Tx) error {
 		imageID, err := metadata.ResolveImageID(tx, name, tag)
 		if err != nil {
@@ -349,18 +260,9 @@ func (s *Service) Resolve(ctx context.Context, imageRef string) (*ImageInfo, err
 			return err
 		}
 
-		// 镜像大小通过 Snapshotter.DiffPath() 获取层路径后计算，不再直接拼接路径
-		size := s.CalculateLayersSize(context.Background(), m.Layers)
-
-		info = &ImageInfo{
-			Name:      m.Name,
-			Tag:       m.Tag,
-			ImageID:   m.ImageID,
-			Size:      size,
-			CreatedAt: m.CreatedAt,
-			RootFS:    m.RootFSPath,
-			Layers:    m.Layers,
-		}
+		// 镜像大小通过 Snapshotter.DiffPath() 获取层路径后计算
+		m.Size = s.CalculateLayersSize(context.Background(), m.LayerDigests)
+		info = m
 		return nil
 	})
 	if err != nil {

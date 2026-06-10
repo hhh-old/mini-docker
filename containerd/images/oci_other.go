@@ -4,6 +4,9 @@ package images
 
 // DigestToCacheID 已迁移到 content.DigestToCacheID（统一实现，避免多包重复定义）
 
+// LayerDiffDir 非 Linux 桩实现（实际 mini-docker 仅在 Linux 运行容器）
+func LayerDiffDir(digest string) string { return "" }
+
 // cleanOpaqueDir 处理 opaque whiteout（非 Linux 桩实现）
 func cleanOpaqueDir(dir string) {}
 

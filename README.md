@@ -894,7 +894,7 @@ mini-docker 实现了一个简化版 containerd GC，参考其**三色标记 + L
 ```
 Tags → ImageID → LayerDigests → Content (blob)
 ContainerInfo → Image → LayerDigests → Content (blob)
-ContainerInfo → SnapshotKey (containerID，容器可写层)
+ContainerInfo → SnapshotID (containerID，容器可写层)
 Snapshot → Parent → Parent (链式，递归标记)
 Lease → Content/Snapshot (保护机制)
 ```
