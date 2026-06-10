@@ -145,9 +145,10 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 	}
 
 	var layerDigests []string
-	// 遍历镜像中的每一层
-	// 对齐 containerd: 通过 Snapshotter.UnpackLayer 统一完成"解压+元数据注册"，
-	// 保证文件与 BoltDB 元数据的一致性，崩溃恢复时不会留下孤儿目录
+	// 对齐 containerd: 逐层执行 Prepare-Apply-Commit 循环
+	// Prepare: 创建 Active 快照（可写）
+	// Apply:   解压 tar.gz 到 diff/，处理 whiteout 文件
+	// Commit:  将 Active 快照提交为 Committed 快照（O(1) rename）
 	var parentSnapKey string
 	for i, layerDesc := range manifest.Layers {
 		digestShort := layerDesc.Digest
@@ -165,30 +166,43 @@ func doPullFromRegistry(registry, repository, tag string, progress ProgressFunc,
 				progress(StatusDownloading, fmt.Sprintf("下载层 %d/%d: %d bytes", i+1, len(manifest.Layers), completed))
 			}
 		}
-		// 下载这个镜像的这一层 layer 的数据，使用 Digest 唯一标识（镜像中的唯一标识）去下载，返回存储路径
+		// 下载这个镜像的这一层 layer 的数据
 		blobPath, err := client.DownloadBlob(repository, layerDesc.Digest, blobProgress)
 		if err != nil {
-			// 下载失败时清理已下载的层快照和 blob，避免孤儿数据残留
 			cleanupPullLayers(context.Background(), snap, contentStore, layerDigests)
 			return nil, fmt.Errorf("下载层 %d 失败: %w", i+1, err)
 		}
 
 		diffID := ""
 		if ociConfig != nil && i < len(ociConfig.RootFS.DiffIDs) {
-			diffID = ociConfig.RootFS.DiffIDs[i] //解压后的每一层的 SHA-256 哈希值
+			diffID = ociConfig.RootFS.DiffIDs[i]
 		}
 
-		progress(StatusExtracting, fmt.Sprintf("解压层 %d/%d...", i+1, len(manifest.Layers)))
-		// 对齐 containerd: 通过 Snapshotter.UnpackLayer 统一完成"解压+元数据注册"
-		cacheID, err := snap.UnpackLayer(context.Background(), blobPath, layerDesc.Digest, diffID, parentSnapKey)
-		if err != nil {
-			// 解压失败时清理已下载的层快照和 blob，避免孤儿数据残留
+		cacheID := content.DigestToCacheID(layerDesc.Digest)
+
+		// Step 1: Prepare — 创建 Active 快照（key = cacheID）
+		progress(StatusExtracting, fmt.Sprintf("准备层 %d/%d...", i+1, len(manifest.Layers)))
+		if _, err := snap.Prepare(context.Background(), cacheID, parentSnapKey); err != nil {
 			cleanupPullLayers(context.Background(), snap, contentStore, layerDigests)
-			return nil, fmt.Errorf("解压并注册层 %d 失败: %w", i+1, err)
+			return nil, fmt.Errorf("Prepare 层 %d 失败: %w", i+1, err)
 		}
-		parentSnapKey = cacheID
 
-		_ = cacheID // cacheID 已通过 content.DigestToCacheID 与 layerDesc.Digest 关联
+		// Step 2: Apply — 解压 tar.gz + 处理 whiteout
+		progress(StatusExtracting, fmt.Sprintf("解压层 %d/%d...", i+1, len(manifest.Layers)))
+		if err := snap.Apply(context.Background(), layerDesc.Digest, diffID, blobPath, cacheID); err != nil {
+			snap.Remove(context.Background(), cacheID)
+			cleanupPullLayers(context.Background(), snap, contentStore, layerDigests)
+			return nil, fmt.Errorf("Apply 层 %d 失败: %w", i+1, err)
+		}
+
+		// Step 3: Commit — 原地提交为 Committed 快照（只更新元数据）
+		if _, err := snap.Commit(context.Background(), cacheID); err != nil {
+			snap.Remove(context.Background(), cacheID)
+			cleanupPullLayers(context.Background(), snap, contentStore, layerDigests)
+			return nil, fmt.Errorf("Commit 层 %d 失败: %w", i+1, err)
+		}
+
+		parentSnapKey = cacheID
 		layerDigests = append(layerDigests, layerDesc.Digest)
 		progress(StatusDownloading, fmt.Sprintf("层 %d/%d 完成", i+1, len(manifest.Layers)))
 	}
@@ -283,11 +297,24 @@ func pullLocal(imageRef string, progress ProgressFunc, snap snapshots.Snapshotte
 	imageID := computeImageID(name, tag, rootFSPath)
 	layerDigest := computeLayerDigest(rootFSPath)
 
-	// 对齐 containerd: 本地构建的镜像也需要注册快照元数据到 boltdb
-	// 这样 GC 能跟踪该快照，容器运行时 lowerDirs() 能沿 parent 链递归构建 lowerdir
-	// 本地构建的镜像使用 name 作为 snapshot key（与 Registry 拉取使用 cacheID 不同）
-	if err := snap.RegisterCommitted(context.Background(), name, ""); err != nil {
-		progress(StatusWarning, fmt.Sprintf("注册本地镜像快照失败: %v", err))
+	// 对齐 containerd: 本地构建的镜像也使用 Prepare-Commit 流程
+	// 本地构建不需要 Apply（文件直接写入 diff/），只需 Prepare + Commit
+	if _, err := snap.Prepare(context.Background(), name, ""); err != nil {
+		// Prepare 失败可能是因为目录已存在（缓存命中）
+		progress(StatusWarning, fmt.Sprintf("Prepare 本地镜像快照失败: %v", err))
+	} else {
+		// 将 rootFSPath 的内容复制到 Active 快照的 diff/ 中
+		diffDir := filepath.Join(constants.SnapshotterDir, name, "diff")
+		if err := mergeLocalRootfs(rootFSPath, diffDir); err != nil {
+			snap.Remove(context.Background(), name)
+			return nil, fmt.Errorf("复制 rootfs 到快照失败: %w", err)
+		}
+
+		// 原地 Commit（只更新元数据）
+		if _, err := snap.Commit(context.Background(), name); err != nil {
+			snap.Remove(context.Background(), name)
+			progress(StatusWarning, fmt.Sprintf("Commit 本地镜像快照失败: %v", err))
+		}
 	}
 
 	info := &metadata.Image{
@@ -382,6 +409,7 @@ func CalculateRootFSSize(rootFSPath string) string {
 }
 
 // formatSize 将字节数格式化为人类可读字符串
+// 对齐 Docker: 使用 B/KB/MB/GB 单位，与 docker images 的 SIZE 列格式一致
 func formatSize(sizeBytes int64) string {
 	const (
 		KB = 1024
@@ -391,13 +419,13 @@ func formatSize(sizeBytes int64) string {
 
 	switch {
 	case sizeBytes >= GB:
-		return fmt.Sprintf("%.1fg", float64(sizeBytes)/float64(GB))
+		return fmt.Sprintf("%.1fGB", float64(sizeBytes)/float64(GB))
 	case sizeBytes >= MB:
-		return fmt.Sprintf("%.1fm", float64(sizeBytes)/float64(MB))
+		return fmt.Sprintf("%.1fMB", float64(sizeBytes)/float64(MB))
 	case sizeBytes >= KB:
-		return fmt.Sprintf("%.1fk", float64(sizeBytes)/float64(KB))
+		return fmt.Sprintf("%.1fKB", float64(sizeBytes)/float64(KB))
 	default:
-		return fmt.Sprintf("%db", sizeBytes)
+		return fmt.Sprintf("%dB", sizeBytes)
 	}
 }
 
@@ -443,46 +471,59 @@ func ociConfigToImageConfig(oci *OCIImageConfig) metadata.ImageConfig {
 // 对齐 containerd: 构建器中每条 RUN/COPY 指令生成新层。
 // upperDir: OverlayFS upper 层的路径（包含该层的文件差异）
 // parentDigest: 父层的 digest（用于建立 parent 链），为空表示基础层
-// snap: Snapshotter 接口，通过 DiffPath 获取 diff 目录路径，并通过 RegisterCommitted 注册快照元数据
+// snap: Snapshotter 接口，通过 DiffPath 获取 diff 目录路径
 // 返回该层的 digest（同时也是 cacheID），由调用方负责把 digest 注册到 metadata.DB。
 func CreateLayerFromDir(upperDir string, parentDigest string, snap snapshots.Snapshotter) (string, error) {
 	digest := computeLayerDigest(upperDir)
+	cacheID := digest // 本地构建的层使用 digest 作为 cacheID
 
 	var diffDir string
 	if snap != nil {
 		ctx := context.Background()
 		var err error
-		diffDir, err = snap.DiffPath(ctx, digest)
+		diffDir, err = snap.DiffPath(ctx, cacheID)
 		if err != nil {
 			return "", fmt.Errorf("获取 diff 目录路径失败: %w", err)
 		}
 	} else {
-		// 回退：直接拼接路径（兼容无法获取 Snapshotter 的场景）
-		diffDir = filepath.Join(constants.SnapshotterDir, digest, "diff")
+		diffDir = filepath.Join(constants.SnapshotterDir, cacheID, "diff")
 	}
 	if err := os.MkdirAll(diffDir, 0755); err != nil {
 		return "", fmt.Errorf("创建层 diff 目录失败: %w", err)
 	}
 
-	// 对齐 containerd: 使用 overlay 包统一的 MergeUpperToDiff 实现，避免重复代码
+	// 对齐 containerd: 使用 overlay 包统一的 MergeUpperToDiff 实现
 	if err := overlay.MergeUpperToDiff(upperDir, diffDir); err != nil {
 		return "", fmt.Errorf("合并 upper 到 diff 失败: %w", err)
 	}
 
-	// 对齐 containerd: 通过 Snapshotter.RegisterCommitted 注册快照元数据到 boltdb
-	// 建立 parent 链，确保 GC 和 lowerDirs() 能正确感知该层
+	// 对齐 containerd: 通过 Prepare-Commit 注册快照元数据
 	if snap != nil {
+		ctx := context.Background()
 		parentKey := ""
 		if parentDigest != "" {
 			parentKey = content.DigestToCacheID(parentDigest)
 		}
-		if err := snap.RegisterCommitted(context.Background(), digest, parentKey); err != nil {
-			// 注册失败不阻断构建流程，但记录警告（可能已注册过）
-			fmt.Printf("  警告: 注册层快照元数据失败: %v\n", err)
+
+		if _, err := snap.Prepare(ctx, cacheID, parentKey); err != nil {
+			// Prepare 失败可能是因为快照已存在（缓存命中），不阻断构建
+			fmt.Printf("  警告: Prepare 层快照失败: %v\n", err)
+		} else {
+			// diff/ 目录已由 MergeUpperToDiff 填充，直接 Commit
+			if _, err := snap.Commit(ctx, cacheID); err != nil {
+				snap.Remove(ctx, cacheID)
+				fmt.Printf("  警告: Commit 层快照失败: %v\n", err)
+			}
 		}
 	}
 
 	return digest, nil
+}
+
+// mergeLocalRootfs 将源目录的内容合并到目标目录
+// 用于本地构建镜像时将 rootfs 内容复制到快照的 diff/ 中
+func mergeLocalRootfs(srcDir, dstDir string) error {
+	return overlay.MergeUpperToDiff(srcDir, dstDir)
 }
 
 // ---------------------------------------------------------------------------

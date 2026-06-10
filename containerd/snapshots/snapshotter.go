@@ -31,39 +31,51 @@ type Info struct {
 // Snapshotter 可插拔快照接口
 // 对齐 containerd: snapshots.Snapshotter
 // 负责管理镜像层和容器可写层的文件系统快照
+//
+// 核心生命周期（对齐 containerd 的 Prepare-Apply-Commit 循环）：
+//  1. Prepare(key, parent) → 创建 Active 快照，返回 mount 信息
+//  2. Apply(digest, diffID, blobPath, key) → 将层差异应用到 Active 快照
+//  3. Commit(key) → 将 Active 快照原地提交为 Committed 快照
+//
+// 镜像拉取时，每层执行一次 Prepare-Apply-Commit：
+//
+//	for each layer:
+//	  Prepare(cacheID, parentCacheID)  → 创建可写快照
+//	  Apply(digest, diffID, blob, cacheID)  → 解压 tar + 处理 whiteout
+//	  Commit(cacheID)  → 原地提交为只读快照
+//
+// 容器运行时，只需 Prepare：
+//
+//	Prepare(containerID, topLayerSnapshotID)  → 创建容器可写层
 type Snapshotter interface {
 	// Prepare 创建一个可写快照 (用于容器运行或镜像解包)
 	// key: 快照唯一标识 (如 container-id 或 unpack-session-id)
 	// parent: 父快照的 key (空则无父)
 	Prepare(ctx context.Context, key, parent string) ([]Mount, error)
 
-	// Commit 将可写快照提交为只读快照
-	// 对齐 Docker: docker commit 的底层实现
-	Commit(ctx context.Context, name, key string) error
-
-	// UnpackLayer 解压 tar.gz blob 到快照目录并注册为 Committed 快照
-	// 对齐 containerd: 镜像解压（Unpack）时，将"文件解压"和"元数据注册"合并为原子操作，
-	// 避免分两步执行时崩溃导致"文件存在但元数据缺失"的不一致状态。
-	// blobPath: tar.gz 文件的路径
+	// Apply 将层差异应用到 Active 快照
+	// 对齐 containerd: diff.Applier.Apply —— 将 blob 解压到 active snapshot 的挂载点
 	// digest: 该层的压缩 digest (sha256:...)，用于生成 cacheID
 	// diffID: 该层的未压缩 digest (sha256:...)，用于校验解压后数据的完整性
-	// parent: 父快照的 key（上一层的 cacheID，基础层为空）
-	// 返回值: cacheID（层的快照标识），由调用方用于关联层 digest
-	UnpackLayer(ctx context.Context, blobPath, digest, diffID, parent string) (string, error)
+	// blobPath: tar.gz 文件的路径
+	// key: Active 快照的 key（由 Prepare 创建）
+	Apply(ctx context.Context, digest, diffID, blobPath, key string) error
 
-	// RegisterCommitted 注册一个已存在的目录为 Committed 快照
-	// 对齐 containerd: 镜像解压（Unpack）时，层已解压到 snapshots/overlay/<key>/diff/，
-	// 但 boltdb 中没有对应的 SnapshotInfo。本方法补注册 SnapshotInfo，建立 parent 链，
-	// 使 Snapshotter 的 lowerDirs() 能递归构建多层 lowerdir。
-	// 注意：新代码应优先使用 UnpackLayer，RegisterCommitted 仅用于兼容已有 diff/ 目录的补注册场景
-	// key: 快照名称（通常为层的 cacheID）
-	// parent: 父快照名称（上一层的 cacheID，基础层为空）
-	RegisterCommitted(ctx context.Context, key, parent string) error
+	// Commit 原地提交：将 Active 快照转为 Committed 快照
+	// 合并 upper/ → diff/（如有），删除 upper/ + work/，更新元数据
+	// key: Active 快照的名称，提交后该快照变为 Committed
+	// 用于 Pull 流程和 Build 流程
+	Commit(ctx context.Context, key string) ([]Mount, error)
+
+	// CommitAs 创建新快照：从 Active 快照创建新的 Committed 快照
+	// 源 Active 快照保持不变，由调用方决定是否 Remove
+	// 用于容器 commit（docker commit 等场景）
+	// name: 新 Committed 快照的名称
+	// key: 源 Active 快照的名称
+	CommitAs(ctx context.Context, name, key string) ([]Mount, error)
 
 	// DiffPath 返回指定快照的 diff 目录路径
 	// 用于外部需要直接访问层文件内容的场景（如镜像层解压、容器运行时构建 overlay lowerdir）
-	// 对齐 containerd: 通过 Snapshotter 接口获取层路径，而非直接拼接常量路径
-	// 这样 image 包不再需要知道底层是 overlay 实现，支持可插拔 Snapshotter
 	DiffPath(ctx context.Context, key string) (string, error)
 
 	// Mounts 获取快照的挂载信息

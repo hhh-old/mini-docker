@@ -56,6 +56,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -249,7 +250,20 @@ func isProgressStream(reqType string) bool {
 // 对齐 Docker: containerd 的每个 gRPC 请求都是独立的
 // 流式请求（attach/exec/pull_image）在发送响应后进入转发逻辑，
 // 连接生命周期由转发逻辑管理（attach/exec 双向转发，pull_image 单向进度推送）
+//
+// panic recovery: 单个请求的 panic 不应导致整个 containerd 进程崩溃
+// 对齐真实 containerd 的容错设计——服务端必须隔离请求级别的故障
 func (c *Containerd) handleConnection(conn net.Conn) {
+	// 捕获 panic，避免单个请求的错误导致整个 containerd 进程崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[panic] 请求处理 panic: %v\n%s", r, debug.Stack())
+			// 尝试通知客户端发生了错误
+			WriteResponse(conn, Response{Success: false, Message: fmt.Sprintf("containerd 内部错误: %v", r)})
+			conn.Close()
+		}
+	}()
+
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		WriteResponse(conn, Response{Success: false, Message: fmt.Sprintf("解析请求失败: %v", err)})
@@ -325,10 +339,12 @@ func (c *Containerd) routeRequest(req Request, conn net.Conn) Response {
 		return c.handlePrepareSnapshot(req)
 	case ReqRemoveSnapshot:
 		return c.handleRemoveSnapshot(req)
-	case ReqRegisterCommitted:
-		return c.handleRegisterCommitted(req)
 	case ReqDiffPath:
 		return c.handleDiffPath(req)
+	case ReqCommitSnapshot:
+		return c.handleCommitSnapshot(req)
+	case ReqWalkSnapshots:
+		return c.handleWalkSnapshots(req)
 	case ReqPing:
 		return Response{Success: true, Message: "pong"}
 	default:

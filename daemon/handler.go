@@ -163,18 +163,32 @@ func (d *Daemon) handleRun(req Request, conn net.Conn) Response {
 func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Response {
 	imageName := req.Args["image"]
 	cmdStr := req.Args["cmd"]
-	if imageName == "" || cmdStr == "" {
-		return Response{Success: false, Message: "需要指定镜像名和命令"}
+	if imageName == "" {
+		return Response{Success: false, Message: "需要指定镜像名"}
 	}
 
 	var cmd []string
-	if cmdJSON := req.Args["cmd_json"]; cmdJSON != "" {
-		if err := json.Unmarshal([]byte(cmdJSON), &cmd); err != nil {
-			log.Printf("警告: cmd_json 解析失败 (%v)，回退到 cmd 字段", err)
+	if cmdStr != "" {
+		if cmdJSON := req.Args["cmd_json"]; cmdJSON != "" {
+			if err := json.Unmarshal([]byte(cmdJSON), &cmd); err != nil {
+				log.Printf("警告: cmd_json 解析失败 (%v)，回退到 cmd 字段", err)
+				cmd = strings.Fields(cmdStr)
+			}
+		} else {
 			cmd = strings.Fields(cmdStr)
 		}
-	} else {
-		cmd = strings.Fields(cmdStr)
+	}
+
+	// 对齐 Docker: 如果未指定命令，使用镜像 Config.Cmd 作为默认命令
+	// 这正是 Dockerfile 中 CMD 指令存在的意义：docker run myimage 无需手动指定命令
+	if len(cmd) == 0 {
+		imageInfo, err := d.service.InspectImage(imageName)
+		if err == nil && imageInfo != nil && len(imageInfo.Config.Cmd) > 0 {
+			cmd = imageInfo.Config.Cmd
+			fmt.Printf("  使用镜像默认命令: %s\n", strings.Join(cmd, " "))
+		} else {
+			return Response{Success: false, Message: "需要指定要执行的命令（镜像未定义 CMD）"}
+		}
 	}
 
 	tty := getBoolArg(req.Args, "tty")
@@ -835,7 +849,7 @@ func (d *Daemon) handleBuild(req Request) Response {
 		DockerfilePath: dockerfilePath,
 		ContextDir:     contextDir,
 		Tag:            tag,
-		Service:        &containerdBuildService{client: d.service},
+		Service:        &containerdBuildService{client: d.service}, //containerdBuildService 是桥接层，把 builder 的抽象接口映射到 containerd 的具体实现
 	}
 
 	result, err := builder.Build(config)

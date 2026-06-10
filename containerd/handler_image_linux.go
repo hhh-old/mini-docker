@@ -24,7 +24,6 @@ import (
 	"mini-docker/containerd/images"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerstore"
-	"mini-docker/utils"
 )
 
 // handlePullImage 拉取镜像，通过连接流式推送进度和最终结果
@@ -119,42 +118,30 @@ func (c *Containerd) handleListImages(req Request) Response {
 }
 
 // handleRemoveImage 删除本地镜像，若有容器正在使用则拒绝删除
+// 对齐 Docker: imageRef 支持 name:tag 和 imageID 两种格式
+// （解析由 metadata.ResolveImageRef 统一处理，handler 不再自行拼接 tag）
 func (c *Containerd) handleRemoveImage(req Request) Response {
-	imageName := req.Args["image"]
-	if imageName == "" {
+	imageRef := req.Args["image"]
+	if imageRef == "" {
 		return Response{Success: false, Message: "需要指定镜像名"}
 	}
 	if c.imageService == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
-	if tag := req.Args["tag"]; tag != "" {
-		imageName = imageName + ":" + tag
-	}
-
 	// 检查是否有容器正在使用该镜像
 	ctx := context.Background()
 	containers, err := containerstore.ListContainers()
 	if err == nil {
-		// 解析待删除镜像的 name:tag
-		rmName, rmTag := utils.ParseImageTag(imageName)
-		if rmTag == "" {
-			rmTag = "latest"
-		}
 		for _, container := range containers {
-			// 容器引用的是 imageName（可能不含 tag），需要做宽松匹配
-			cName, cTag := utils.ParseImageTag(container.Image)
-			if cTag == "" {
-				cTag = "latest"
-			}
-			// 如果镜像名和标签都精确匹配，则拒绝删除
-			if cName == rmName && cTag == rmTag {
-				return Response{Success: false, Message: fmt.Sprintf("镜像 %s 正被容器 %s (%s) 使用，请先删除容器", imageName, container.ID, container.Name)}
+			// 宽松匹配：容器引用的镜像名可能是 name 或 name:tag
+			if container.Image == imageRef || container.Image == strings.TrimSuffix(imageRef, ":latest") {
+				return Response{Success: false, Message: fmt.Sprintf("镜像 %s 正被容器 %s (%s) 使用，请先删除容器", imageRef, container.ID, container.Name)}
 			}
 		}
 	}
 
-	if err := c.imageService.Remove(ctx, imageName); err != nil {
+	if err := c.imageService.Remove(ctx, imageRef); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("删除镜像失败: %v", err)}
 	}
 	return Response{Success: true}
@@ -197,7 +184,10 @@ func (c *Containerd) handleResolveImage(req Request) Response {
 }
 
 // handleRegisterImage 注册一个已构建好的镜像（builder 通过 Daemon 调用）
-// args: name, tag, image_id, size, created_at, top_layer_snapshot_id, layers(逗号分隔)
+// 对齐 containerd: 完整反序列化 metadata.Image，包括 Config/Annotations 等嵌套结构
+// args: name, tag, image_id, size, created_at, top_layer_snapshot_id, layers(逗号分隔),
+//
+//	config(JSON), annotations(JSON), config_digest
 func (c *Containerd) handleRegisterImage(req Request) Response {
 	if c.imageService == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
@@ -213,6 +203,22 @@ func (c *Containerd) handleRegisterImage(req Request) Response {
 		}
 	}
 
+	// 反序列化 Config（JSON 字符串 → metadata.ImageConfig）
+	var config metadata.ImageConfig
+	if configJSON := req.Args["config"]; configJSON != "" {
+		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+			return Response{Success: false, Message: fmt.Sprintf("解析镜像 Config 失败: %v", err)}
+		}
+	}
+
+	// 反序列化 Annotations（JSON 字符串 → map[string]string）
+	var annotations map[string]string
+	if annotationsJSON := req.Args["annotations"]; annotationsJSON != "" {
+		if err := json.Unmarshal([]byte(annotationsJSON), &annotations); err != nil {
+			return Response{Success: false, Message: fmt.Sprintf("解析镜像 Annotations 失败: %v", err)}
+		}
+	}
+
 	info := &metadata.Image{
 		Name:               req.Args["name"],
 		Tag:                req.Args["tag"],
@@ -220,6 +226,10 @@ func (c *Containerd) handleRegisterImage(req Request) Response {
 		CreatedAt:          req.Args["created_at"],
 		TopLayerSnapshotID: req.Args["top_layer_snapshot_id"],
 		LayerDigests:       layers,
+		Config:             config,
+		Size:               req.Args["size"],
+		ConfigDigest:       req.Args["config_digest"],
+		Annotations:        annotations,
 	}
 
 	ctx := context.Background()

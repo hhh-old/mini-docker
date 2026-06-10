@@ -24,6 +24,8 @@ package containerd
 import (
 	"context"
 	"fmt"
+
+	"mini-docker/containerd/snapshots"
 )
 
 // ---------------------------------------------------------------------------
@@ -83,26 +85,6 @@ func (c *Containerd) handleRemoveSnapshot(req Request) Response {
 	return Response{Success: true}
 }
 
-// handleRegisterCommitted 注册已存在的快照元数据（对齐 containerd: Snapshotter.RegisterCommitted）
-// 用于 builder 等场景：文件已落盘但需要补注册元数据到 boltdb
-func (c *Containerd) handleRegisterCommitted(req Request) Response {
-	key := req.Args["key"]
-	if key == "" {
-		return Response{Success: false, Message: "快照 key 不能为空"}
-	}
-	parent := req.Args["parent"]
-	if c.snapshotter == nil {
-		return Response{Success: false, Message: "Snapshotter 未初始化"}
-	}
-
-	ctx := context.Background()
-	if err := c.snapshotter.RegisterCommitted(ctx, key, parent); err != nil {
-		return Response{Success: false, Message: fmt.Sprintf("注册快照元数据失败: %v", err)}
-	}
-
-	return Response{Success: true}
-}
-
 // handleDiffPath 获取快照的 diff 目录路径（对齐 containerd: Snapshotter.DiffPath）
 func (c *Containerd) handleDiffPath(req Request) Response {
 	key := req.Args["key"]
@@ -120,4 +102,53 @@ func (c *Containerd) handleDiffPath(req Request) Response {
 	}
 
 	return Response{Success: true, Data: map[string]interface{}{"path": path}}
+}
+
+// handleCommitSnapshot 提交快照（对齐 containerd: Snapshotter.Commit）
+// builder 构建流程使用：RUN/COPY 指令执行完毕后，将 Active 快照提交为 Committed
+func (c *Containerd) handleCommitSnapshot(req Request) Response {
+	key := req.Args["key"]
+	if key == "" {
+		return Response{Success: false, Message: "快照 key 不能为空"}
+	}
+	if c.snapshotter == nil {
+		return Response{Success: false, Message: "Snapshotter 未初始化"}
+	}
+
+	ctx := context.Background()
+	mounts, err := c.snapshotter.Commit(ctx, key)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("提交快照失败: %v", err)}
+	}
+
+	mountData := make([]map[string]interface{}, len(mounts))
+	for i, m := range mounts {
+		mountData[i] = map[string]interface{}{
+			"type":    m.Type,
+			"source":  m.Source,
+			"options": m.Options,
+		}
+	}
+
+	return Response{Success: true, Data: map[string]interface{}{"mounts": mountData}}
+}
+
+// handleWalkSnapshots 遍历所有快照（对齐 containerd: Snapshotter.Walk）
+// builder 构建流程使用：构建完成后遍历快照，收集已 Commit 层的 digest
+func (c *Containerd) handleWalkSnapshots(req Request) Response {
+	if c.snapshotter == nil {
+		return Response{Success: false, Message: "Snapshotter 未初始化"}
+	}
+
+	ctx := context.Background()
+	var infos []snapshots.Info
+	err := c.snapshotter.Walk(ctx, func(info snapshots.Info) error {
+		infos = append(infos, info)
+		return nil
+	})
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("遍历快照失败: %v", err)}
+	}
+
+	return Response{Success: true, Data: map[string]interface{}{"snapshots": infos}}
 }

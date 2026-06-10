@@ -164,15 +164,27 @@ func CleanupPortMapping(portMap string, containerIP string) {
 // ParseImageTag 解析镜像引用为 name 和 tag
 // 格式: "name" → (name, ""), "name:tag" → (name, tag)
 // 正确处理含端口的 Registry 地址：myreg.com:5000/myapp:v1
-// 规则：如果冒号后包含 /，则该冒号是端口分隔符而非 tag 分隔符
+// 规则：tag 分隔符只出现在最后一个 "/" 之后，避免将端口号误认为 tag
+//
+// 示例：
+//
+//	"ubuntu:24.04"              → ("ubuntu", "24.04")
+//	"library/ubuntu:3.18"       → ("library/ubuntu", "3.18")
+//	"myreg.com:5000/myapp:v1"   → ("myreg.com:5000/myapp", "v1")
+//	"myreg.com:5000/myapp"      → ("myreg.com:5000/myapp", "")
+//	"ubuntu"                    → ("ubuntu", "")
 func ParseImageTag(ref string) (string, string) {
-	lastColon := strings.LastIndex(ref, ":")
-	if lastColon == -1 {
+	// tag 分隔符只可能在最后一个 "/" 之后的部分
+	// 这样 myreg.com:5000/myapp:v1 中的端口号冒号不会被误认为 tag
+	lastSlash := strings.LastIndex(ref, "/")
+	afterSlash := ref[lastSlash+1:]
+
+	colonInTail := strings.LastIndex(afterSlash, ":")
+	if colonInTail == -1 {
 		return ref, ""
 	}
-	afterColon := ref[lastColon+1:]
-	if strings.Contains(afterColon, "/") || strings.Contains(afterColon, ".") {
-		return ref, ""
-	}
-	return ref[:lastColon], afterColon
+
+	// 冒号在完整 ref 中的实际位置
+	colonPos := lastSlash + 1 + colonInTail
+	return ref[:colonPos], ref[colonPos+1:]
 }

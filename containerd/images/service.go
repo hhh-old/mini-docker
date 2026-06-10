@@ -157,12 +157,8 @@ func (s *Service) List(ctx context.Context) ([]*metadata.Image, error) {
 // Remove 删除本地镜像
 // 使用单个 metadata 事务完成所有元数据删除，文件级清理在事务提交成功后执行
 // 对齐 containerd: 先标记删除元数据（事务），再清理文件，确保崩溃时不会出现"文件存在但元数据缺失"或"元数据存在但文件缺失"
+// 对齐 Docker: 支持 name:tag 和 imageID 两种引用方式（通过 metadata.ResolveImageRef 统一解析）
 func (s *Service) Remove(ctx context.Context, imageRef string) error {
-	name, tag := utils.ParseImageTag(imageRef)
-	if tag == "" {
-		tag = "latest"
-	}
-
 	// 收集需要在事务提交后清理的文件/快照信息
 	var orphanedLayers []struct {
 		digest  string
@@ -170,18 +166,14 @@ func (s *Service) Remove(ctx context.Context, imageRef string) error {
 	}
 	var imageID string
 
-	// 单个事务: 解析 imageID → 查找孤儿层 → 删除 image/tag/layer 元数据
+	// 单个事务: 解析引用 → 查找孤儿层 → 删除 image/tag/layer 元数据
 	if err := s.meta.Update(func(tx *bolt.Tx) error {
-		id, err := metadata.ResolveImageID(tx, name, tag)
+		// 统一解析镜像引用（支持 name:tag 和 imageID 两种格式）
+		m, err := metadata.ResolveImageRef(tx, imageRef)
 		if err != nil {
 			return err
 		}
-		imageID = id
-
-		m, err := metadata.LoadImage(tx, imageID)
-		if err != nil {
-			return err
-		}
+		imageID = m.ImageID
 
 		// 查找孤儿层（只被当前镜像引用的层）
 		for _, layerDigest := range m.LayerDigests {
@@ -198,7 +190,8 @@ func (s *Service) Remove(ctx context.Context, imageRef string) error {
 		if err := metadata.DeleteImage(tx, imageID); err != nil {
 			return err
 		}
-		return metadata.RemoveTag(tx, name, tag)
+		// ResolveImageRef 返回的 *Image 已包含 Name/Tag，直接用于删除 tag 映射
+		return metadata.RemoveTag(tx, m.Name, m.Tag)
 	}); err != nil {
 		return fmt.Errorf("删除镜像元数据失败: %w", err)
 	}
@@ -217,19 +210,11 @@ func (s *Service) Remove(ctx context.Context, imageRef string) error {
 }
 
 // Inspect 获取镜像详细信息（boltdb 中的原始元数据，无 Size）
+// 对齐 Docker: 支持 name:tag 和 imageID 两种引用方式（通过 metadata.ResolveImageRef 统一解析）
 func (s *Service) Inspect(ctx context.Context, imageRef string) (*metadata.Image, error) {
-	name, tag := utils.ParseImageTag(imageRef)
-	if tag == "" {
-		tag = "latest"
-	}
-
 	var manifest *metadata.Image
 	err := s.meta.View(func(tx *bolt.Tx) error {
-		imageID, err := metadata.ResolveImageID(tx, name, tag)
-		if err != nil {
-			return err
-		}
-		m, err := metadata.LoadImage(tx, imageID)
+		m, err := metadata.ResolveImageRef(tx, imageRef)
 		if err != nil {
 			return err
 		}
@@ -243,19 +228,11 @@ func (s *Service) Inspect(ctx context.Context, imageRef string) (*metadata.Image
 }
 
 // Resolve 解析镜像引用，返回镜像信息（含实时计算的 Size）
+// 对齐 Docker: 支持 name:tag 和 imageID 两种引用方式（通过 metadata.ResolveImageRef 统一解析）
 func (s *Service) Resolve(ctx context.Context, imageRef string) (*metadata.Image, error) {
-	name, tag := utils.ParseImageTag(imageRef)
-	if tag == "" {
-		tag = "latest"
-	}
-
 	var info *metadata.Image
 	err := s.meta.View(func(tx *bolt.Tx) error {
-		imageID, err := metadata.ResolveImageID(tx, name, tag)
-		if err != nil {
-			return err
-		}
-		m, err := metadata.LoadImage(tx, imageID)
+		m, err := metadata.ResolveImageRef(tx, imageRef)
 		if err != nil {
 			return err
 		}

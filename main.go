@@ -342,13 +342,13 @@ parseLoop:
 	}
 	reqArgs["image"] = args[i]
 	i++
-	if i >= len(args) {
-		fmt.Println("错误: 需要指定要执行的命令")
-		os.Exit(1)
+	// 对齐 Docker: 命令可选，省略时使用镜像的 CMD 作为默认命令
+	// docker run myimage 等价于 docker run myimage <镜像的CMD>
+	if i < len(args) {
+		reqArgs["cmd"] = strings.Join(args[i:], " ")
+		cmdJSON, _ := json.Marshal(args[i:])
+		reqArgs["cmd_json"] = string(cmdJSON)
 	}
-	reqArgs["cmd"] = strings.Join(args[i:], " ")
-	cmdJSON, _ := json.Marshal(args[i:])
-	reqArgs["cmd_json"] = string(cmdJSON)
 
 	if reqArgs["tty"] == "true" && reqArgs["detach"] != "true" {
 		reqArgs["stream"] = "true"
@@ -960,11 +960,19 @@ func buildCommand() {
 		os.Exit(1)
 	}
 
+	// 将构建上下文转换为绝对路径
+	// 因为 CLI 和 Daemon 可能运行在不同的工作目录，相对路径会导致 Daemon 找不到文件
+	absContextDir, err := filepath.Abs(contextDir)
+	if err != nil {
+		fmt.Printf("错误: 无法解析构建上下文路径: %v\n", err)
+		os.Exit(1)
+	}
+
 	resp, err := daemon.NewClient().WithTimeout(constants.LongOperationTimeout).Send(daemon.Request{
 		Type: "build",
 		Args: map[string]string{
-			"dockerfile": filepath.Join(contextDir, "Dockerfile"),
-			"context":    contextDir,
+			"dockerfile": filepath.Join(absContextDir, "Dockerfile"),
+			"context":    absContextDir,
 			"tag":        tag,
 		},
 	})

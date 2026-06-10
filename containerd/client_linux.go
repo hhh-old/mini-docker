@@ -40,7 +40,6 @@ import (
 	"mini-docker/containerstore"
 	"mini-docker/libcontainer"
 	"mini-docker/types"
-	"mini-docker/utils"
 
 	"golang.org/x/sys/unix"
 )
@@ -450,18 +449,12 @@ func (c *Client) ListImages() ([]*metadata.Image, error) {
 }
 
 // RemoveImage 删除镜像
-// 支持格式: name:tag 或 name（默认 latest）
-// 协议字段: image（完整引用，含 tag）, tag（可选拆分后单独传）
+// 对齐 Docker: imageRef 支持 name:tag 和 imageID 两种格式
+// 解析由 metadata.ResolveImageRef 统一处理，客户端只需传递完整引用
 func (c *Client) RemoveImage(imageRef string) error {
-	args := map[string]string{"image": imageRef}
-
-	if _, tag := utils.ParseImageTag(imageRef); tag != "" {
-		args["tag"] = tag
-	}
-
 	resp, err := SendRequest(Request{
 		Type: ReqRemoveImage,
-		Args: args,
+		Args: map[string]string{"image": imageRef},
 	})
 	if err != nil {
 		return err
@@ -517,7 +510,11 @@ func (c *Client) ResolveImage(imageRef string) (string, error) {
 }
 
 // RegisterImage 注册一个已构建好的镜像（builder 使用）
+// 对齐 containerd: 通过 RPC 将完整的 metadata.Image 传输到服务端
+// 嵌套结构（Config、Annotations）序列化为 JSON 字符串传输，避免 map[string]string 无法表达复杂类型
 func (c *Client) RegisterImage(info *metadata.Image) error {
+	configJSON, _ := json.Marshal(info.Config)
+	annotationsJSON, _ := json.Marshal(info.Annotations)
 	args := map[string]string{
 		"name":                  info.Name,
 		"tag":                   info.Tag,
@@ -525,6 +522,10 @@ func (c *Client) RegisterImage(info *metadata.Image) error {
 		"created_at":            info.CreatedAt,
 		"top_layer_snapshot_id": info.TopLayerSnapshotID,
 		"layer_digests":         strings.Join(info.LayerDigests, ","),
+		"config":                string(configJSON),
+		"size":                  info.Size,
+		"config_digest":         info.ConfigDigest,
+		"annotations":           string(annotationsJSON),
 	}
 	resp, err := SendRequest(Request{
 		Type: ReqRegisterImage,
@@ -611,7 +612,7 @@ func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types
 
 // Snapshotter 返回一个基于远程调用的 Snapshotter 代理
 // 对齐 containerd: Daemon 通过此代理调用 containerd 服务端的 Snapshotter 方法
-// 代理通过 Unix Socket 转发 DiffPath/RegisterCommitted 等调用到服务端
+// 代理通过 Unix Socket 转发 DiffPath 等调用到服务端
 func (c *Client) Snapshotter() snapshots.Snapshotter {
 	return &clientSnapshotter{client: c}
 }
@@ -619,12 +620,12 @@ func (c *Client) Snapshotter() snapshots.Snapshotter {
 // clientSnapshotter 基于 Unix Socket 的远程 Snapshotter 代理
 // 对齐 containerd: Daemon 不直接持有 Snapshotter，而是通过 Unix Socket RPC 代理调用
 //
-// 本代理完整实现 snapshots.Snapshotter 接口（9 个方法）：
-//   - RPC 转发（支持远程）：Prepare、Remove、RegisterCommitted、DiffPath、Close
-//   - 本地不支持（服务器内部操作）：Mounts、Commit、Walk、UnpackLayer
+// 本代理实现 snapshots.Snapshotter 接口：
+//   - RPC 转发（支持远程）：Prepare、Remove、DiffPath、Close
+//   - 本地不支持（服务器内部操作）：Mounts、Commit、Walk、Apply
 //
-// Prepare/Remove/RegisterCommitted/DiffPath 通过对应 RPC 路由（ReqPrepareSnapshot 等）调用
-// Mounts/Commit/Walk/UnpackLayer 是 Snapshotter 内部细节（overlay mount 句柄、layer blob 解压等），
+// Prepare/Remove/DiffPath 通过对应 RPC 路由调用
+// Mounts/Commit/Walk/Apply 是 Snapshotter 内部细节，
 // 不需要也不应该跨进程调用
 type clientSnapshotter struct {
 	client *Client
@@ -658,11 +659,14 @@ func sendPrepareSnapshotRPC(containerID, topLayerSnapshotID string) ([]snapshots
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var mounts []snapshots.Mount
-	if err := json.Unmarshal(data, &mounts); err != nil {
+	// 服务端返回 {"mounts": [{...}]}, 需要先提取 mounts 字段
+	var wrapper struct {
+		Mounts []snapshots.Mount `json:"mounts"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return nil, fmt.Errorf("解析挂载信息失败: %w", err)
 	}
-	return mounts, nil
+	return wrapper.Mounts, nil
 }
 
 // Mounts 是 Snapshotter 内部细节（返回 overlay mount 句柄），不支持跨进程调用
@@ -670,9 +674,33 @@ func (cs *clientSnapshotter) Mounts(ctx context.Context, key string) ([]snapshot
 	return nil, fmt.Errorf("clientSnapshotter: Mounts 是 Snapshotter 内部细节，不支持远程调用")
 }
 
-// Commit 是 Snapshotter 内部细节（提交 Committed 快照），不支持跨进程调用
-func (cs *clientSnapshotter) Commit(ctx context.Context, name, key string) error {
-	return fmt.Errorf("clientSnapshotter: Commit 是 Snapshotter 内部细节，不支持远程调用")
+// Commit 通过 RPC 提交快照（对齐 containerd: Snapshotter.Commit）
+// builder 构建流程使用：RUN/COPY 指令执行完毕后，将 Active 快照提交为 Committed
+func (cs *clientSnapshotter) Commit(ctx context.Context, key string) ([]snapshots.Mount, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqCommitSnapshot,
+		Args: map[string]string{"key": key},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Mounts []snapshots.Mount `json:"mounts"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("解析挂载信息失败: %w", err)
+	}
+	return wrapper.Mounts, nil
+}
+
+// CommitAs 是 Snapshotter 内部细节（创建新 Committed 快照），不支持跨进程调用
+func (cs *clientSnapshotter) CommitAs(ctx context.Context, name, key string) ([]snapshots.Mount, error) {
+	return nil, fmt.Errorf("clientSnapshotter: CommitAs 是 Snapshotter 内部细节，不支持远程调用")
 }
 
 // Remove 通过 RPC 删除容器快照
@@ -692,22 +720,12 @@ func (cs *clientSnapshotter) Remove(ctx context.Context, key string) error {
 	return nil
 }
 
-// Walk 是 Snapshotter 内部细节（遍历本地快照元数据），不支持跨进程调用
-// 真实 containerd 中此方法也仅供 GC 在服务端内部使用
+// Walk 通过 RPC 遍历所有快照（对齐 containerd: Snapshotter.Walk）
+// builder 构建流程使用：构建完成后遍历快照，收集已 Commit 层的 digest
 func (cs *clientSnapshotter) Walk(ctx context.Context, fn func(snapshots.Info) error) error {
-	return fmt.Errorf("clientSnapshotter: Walk 是 Snapshotter 内部细节，不支持远程调用")
-}
-
-// RegisterCommitted 通过 RPC 注册已存在的快照元数据
-// 对齐 containerd: Snapshotter.RegisterCommitted 在 builder 场景下被调用，
-// builder 在容器d 进程外运行需要通过 RPC 注册
-func (cs *clientSnapshotter) RegisterCommitted(ctx context.Context, key, parent string) error {
 	resp, err := SendRequest(Request{
-		Type: ReqRegisterCommitted,
-		Args: map[string]string{
-			"key":    key,
-			"parent": parent,
-		},
+		Type: ReqWalkSnapshots,
+		Args: map[string]string{},
 	})
 	if err != nil {
 		return err
@@ -715,13 +733,26 @@ func (cs *clientSnapshotter) RegisterCommitted(ctx context.Context, key, parent 
 	if !resp.Success {
 		return fmt.Errorf("%s", resp.Message)
 	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Snapshots []snapshots.Info `json:"snapshots"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return fmt.Errorf("解析快照列表失败: %w", err)
+	}
+	for _, info := range wrapper.Snapshots {
+		if err := fn(info); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// UnpackLayer 是 Snapshotter 内部细节（解压 tar.gz blob 到 diff 目录），不支持跨进程调用
+// Apply 是 Snapshotter 内部细节（解压 tar.gz blob 到 diff 目录），不支持跨进程调用
 // 镜像拉取发生在 containerd 进程内部，不通过客户端走 RPC
-func (cs *clientSnapshotter) UnpackLayer(ctx context.Context, blobPath, digest, diffID, parent string) (string, error) {
-	return "", fmt.Errorf("clientSnapshotter: UnpackLayer 是 Snapshotter 内部细节，不支持远程调用")
+func (cs *clientSnapshotter) Apply(ctx context.Context, digest, diffID, blobPath, key string) error {
+	return fmt.Errorf("clientSnapshotter: Apply 是 Snapshotter 内部细节，不支持远程调用")
 }
 
 // DiffPath 通过 RPC 获取快照的 diff 目录路径

@@ -14,7 +14,7 @@ package containerd
   - Shim 生命周期：ReqShutdownShim / ReqRestartShim / ReqIsShimAlive / ReqReadShimPID
   - 任务状态：ReqGetTaskState / ReqGetExitInfo / ReqReadExitInfo / ReqWaitForCreate / ReqListTasks
   - 流式连接：ReqAttachTask / ReqExecTaskStream / ReqResizeTask
-  - 快照：ReqPrepareSnapshot / ReqRemoveSnapshot / ReqRegisterCommitted / ReqDiffPath
+  - 快照：ReqPrepareSnapshot / ReqRemoveSnapshot / ReqDiffPath
   - 运维：ReqGC / ReqPing
 
 =======================================================================
@@ -75,11 +75,12 @@ const (
 	ReqPrepareSnapshot = "prepare_snapshot"
 	// ReqRemoveSnapshot 删除容器快照（对齐 containerd: Snapshotter.Remove）
 	ReqRemoveSnapshot = "remove_snapshot"
-	// ReqRegisterCommitted 注册已存在的快照元数据（对齐 containerd: Snapshotter.RegisterCommitted）
-	// 用于 builder 等场景：文件已落盘但需要补注册元数据到 boltdb
-	ReqRegisterCommitted = "register_committed"
 	// ReqDiffPath 获取快照的 diff 目录路径（对齐 containerd: Snapshotter.DiffPath）
 	ReqDiffPath = "diff_path"
+	// ReqCommitSnapshot 提交快照（对齐 containerd: Snapshotter.Commit，builder 构建流程使用）
+	ReqCommitSnapshot = "commit_snapshot"
+	// ReqWalkSnapshots 遍历快照（对齐 containerd: Snapshotter.Walk，builder 构建流程使用）
+	ReqWalkSnapshots = "walk_snapshots"
 	// ReqPing 健康检查
 	ReqPing = "ping"
 )
