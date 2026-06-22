@@ -47,14 +47,21 @@ func sendErrorf(conn net.Conn, format string, args ...interface{}) {
 // ---------------------------------------------------------------------------
 
 // handleState 处理 state 请求
-// 对齐 Docker/containerd: shim 通过 runtime state 获取容器状态，而非直接访问 libcontainer
+// 对齐 containerd: shim State RPC 只返回 containerd 需要的字段
+// 不暴露 runtime 内部字段（ociVersion/bundle/rootfs/annotations）
+// 返回字段与 metadata.TaskState 的 JSON tag 匹配，containerd 可直接反序列化
 func handleState(conn net.Conn, ctx *shimContext, req *types.ShimRequest) {
 	state, err := getContainerStateViaRuntime(ctx.containerID)
 	if err != nil {
 		sendError(conn, err.Error())
 		return
 	}
-	sendSuccess(conn, state)
+	// 只返回 containerd 需要的字段，过滤 runtime 内部字段
+	sendSuccess(conn, map[string]interface{}{
+		"container_id": state["id"],
+		"pid":          state["pid"],
+		"status":       state["status"],
+	})
 }
 
 // handleKill 处理 kill 请求

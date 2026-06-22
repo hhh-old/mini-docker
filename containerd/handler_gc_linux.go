@@ -26,12 +26,12 @@ import (
 
 // handleGC 处理手动触发垃圾回收请求
 func (c *Containerd) handleGC(req Request) Response {
-	if c.gcCollector == nil {
+	if c.getGcCollector() == nil {
 		return Response{Success: false, Message: "GC 未初始化"}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	stats, err := c.gcCollector.Run(ctx)
+	stats, err := c.getGcCollector().Run(ctx)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("GC 执行失败: %v", err)}
 	}

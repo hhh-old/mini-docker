@@ -23,7 +23,6 @@ import (
 
 	"mini-docker/containerd/images"
 	"mini-docker/containerd/metadata"
-	"mini-docker/containerstore"
 )
 
 // handlePullImage 拉取镜像，通过连接流式推送进度和最终结果
@@ -42,7 +41,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 		conn.Close()
 		return Response{}
 	}
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		resultFrame := ProgressFrameData{
 			Type:    ResultFrame, //结束帧
 			Status:  images.StatusError,
@@ -75,7 +74,7 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 	}
 
 	ctx := context.Background()
-	info, err := c.imageService.Pull(ctx, imageName, progress)
+	info, err := c.getImageService().Pull(ctx, imageName, progress)
 
 	// 发送最终结果帧
 	if err != nil {
@@ -106,11 +105,11 @@ func (c *Containerd) handlePullImage(req Request, conn net.Conn) Response {
 
 // handleListImages 列出本地所有镜像
 func (c *Containerd) handleListImages(req Request) Response {
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 	ctx := context.Background()
-	images, err := c.imageService.List(ctx)
+	images, err := c.getImageService().List(ctx)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("列出镜像失败: %v", err)}
 	}
@@ -125,23 +124,27 @@ func (c *Containerd) handleRemoveImage(req Request) Response {
 	if imageRef == "" {
 		return Response{Success: false, Message: "需要指定镜像名"}
 	}
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
 	// 检查是否有容器正在使用该镜像
+	// 对齐 containerd: 通过 ContainersService 获取容器列表，而非直接操作 containerstore
 	ctx := context.Background()
-	containers, err := containerstore.ListContainers()
-	if err == nil {
-		for _, container := range containers {
-			// 宽松匹配：容器引用的镜像名可能是 name 或 name:tag
-			if container.Image == imageRef || container.Image == strings.TrimSuffix(imageRef, ":latest") {
-				return Response{Success: false, Message: fmt.Sprintf("镜像 %s 正被容器 %s (%s) 使用，请先删除容器", imageRef, container.ID, container.Name)}
+	svc := c.getContainersService()
+	if svc != nil {
+		containers, err := svc.List()
+		if err == nil {
+			for _, container := range containers {
+				// 宽松匹配：容器引用的镜像名可能是 name 或 name:tag
+				if container.Image == imageRef || container.Image == strings.TrimSuffix(imageRef, ":latest") {
+					return Response{Success: false, Message: fmt.Sprintf("镜像 %s 正被容器 %s (%s) 使用，请先删除容器", imageRef, container.ID, container.Name)}
+				}
 			}
 		}
 	}
 
-	if err := c.imageService.Remove(ctx, imageRef); err != nil {
+	if err := c.getImageService().Remove(ctx, imageRef); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("删除镜像失败: %v", err)}
 	}
 	return Response{Success: true}
@@ -153,12 +156,12 @@ func (c *Containerd) handleInspectImage(req Request) Response {
 	if imageRef == "" {
 		return Response{Success: false, Message: "需要指定镜像名"}
 	}
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
 	ctx := context.Background()
-	manifest, err := c.imageService.Inspect(ctx, imageRef)
+	manifest, err := c.getImageService().Inspect(ctx, imageRef)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("查看镜像详情失败: %v", err)}
 	}
@@ -171,12 +174,12 @@ func (c *Containerd) handleResolveImage(req Request) Response {
 	if imageRef == "" {
 		return Response{Success: false, Message: "需要指定镜像名"}
 	}
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
 	ctx := context.Background()
-	info, err := c.imageService.Resolve(ctx, imageRef)
+	info, err := c.getImageService().Resolve(ctx, imageRef)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("解析镜像失败: %v", err)}
 	}
@@ -189,7 +192,7 @@ func (c *Containerd) handleResolveImage(req Request) Response {
 //
 //	config(JSON), annotations(JSON), config_digest
 func (c *Containerd) handleRegisterImage(req Request) Response {
-	if c.imageService == nil {
+	if c.getImageService() == nil {
 		return Response{Success: false, Message: "镜像服务未初始化"}
 	}
 
@@ -233,8 +236,33 @@ func (c *Containerd) handleRegisterImage(req Request) Response {
 	}
 
 	ctx := context.Background()
-	if err := c.imageService.Register(ctx, info); err != nil {
+	if err := c.getImageService().Register(ctx, info); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("注册镜像失败: %v", err)}
 	}
 	return Response{Success: true}
+}
+
+// handleCommitContainer 将容器的可写层提交为新镜像（对齐 docker commit）
+// 对齐 containerd: diff.Differ + Snapshotter.Commit
+func (c *Containerd) handleCommitContainer(req Request) Response {
+	containerID := req.Args["container_id"]
+	imageName := req.Args["image_name"]
+	tag := req.Args["tag"]
+	if tag == "" {
+		tag = "latest"
+	}
+
+	if containerID == "" || imageName == "" {
+		return Response{Success: false, Message: "需要指定容器ID和镜像名"}
+	}
+	if c.getImageService() == nil {
+		return Response{Success: false, Message: "镜像服务未初始化"}
+	}
+
+	ctx := context.Background()
+	img, err := c.getImageService().CommitContainer(ctx, containerID, imageName, tag)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("提交容器失败: %v", err)}
+	}
+	return Response{Success: true, Data: img}
 }

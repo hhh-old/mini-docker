@@ -115,7 +115,11 @@ func (w *contentWriter) Commit(ctx context.Context, expectedDigest string) error
 
 	calculated := "sha256:" + hex.EncodeToString(w.hash.Sum(nil))
 
-	if expectedDigest != "" && calculated != expectedDigest {
+	if expectedDigest == "" {
+		os.Remove(w.tmpPath)
+		return fmt.Errorf("expectedDigest 不能为空")
+	}
+	if calculated != expectedDigest {
 		os.Remove(w.tmpPath)
 		return fmt.Errorf("digest 校验失败: 期望 %s, 实际 %s", expectedDigest, calculated)
 	}

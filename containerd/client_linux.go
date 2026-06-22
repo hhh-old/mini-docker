@@ -23,8 +23,12 @@ package containerd
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,12 +37,16 @@ import (
 	"syscall"
 	"time"
 
+	crypto_sha256 "crypto/sha256"
+
 	"mini-docker/constants"
+	"mini-docker/containerd/content"
+	"mini-docker/containerd/diff"
+	"mini-docker/containerd/events"
 	"mini-docker/containerd/gc"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
-	"mini-docker/libcontainer"
 	"mini-docker/types"
 
 	"golang.org/x/sys/unix"
@@ -59,11 +67,14 @@ func NewClient() *Client {
 	}
 }
 
-// CreateTask 创建容器任务（对齐原 Service.CreateTask）
-func (c *Client) CreateTask(info *containerstore.ContainerInfo) (shimPID int, err error) {
+// CreateTask 创建容器任务（对齐 containerd: Task.Create 只传 containerID）
+func (c *Client) CreateTask(containerID, cgroupName string) (shimPID int, err error) {
 	resp, err := SendRequest(Request{
 		Type: ReqCreateTask,
-		Args: map[string]string{"container_id": info.ID},
+		Args: map[string]string{
+			"container_id": containerID,
+			"cgroup_name":  cgroupName,
+		},
 	})
 	if err != nil {
 		return 0, err
@@ -100,8 +111,9 @@ func (c *Client) KillTask(containerID string, signal syscall.Signal) error {
 	return nil
 }
 
-// GetTaskState 获取容器任务状态（对齐原 Service.GetTaskState）
-func (c *Client) GetTaskState(containerID string) (*libcontainer.ContainerState, error) {
+// GetTaskState 获取容器任务状态
+// 对齐 containerd: 返回 TaskState（containerd 层类型），不暴露 runtime 层类型
+func (c *Client) GetTaskState(containerID string) (*metadata.TaskState, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqGetTaskState,
 		Args: map[string]string{"container_id": containerID},
@@ -114,7 +126,7 @@ func (c *Client) GetTaskState(containerID string) (*libcontainer.ContainerState,
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var state libcontainer.ContainerState
+	var state metadata.TaskState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("解析任务状态失败: %w", err)
 	}
@@ -320,8 +332,9 @@ func (c *Client) ResizeTask(containerID string, rows, cols uint16) error {
 	return nil
 }
 
-// ListTasks 列出所有容器任务（对齐原 Service.ListTasks）
-func (c *Client) ListTasks() ([]*libcontainer.ContainerState, error) {
+// ListTasks 列出所有容器任务
+// 对齐 containerd: 返回 TaskState（containerd 层类型），不暴露 runtime 层类型
+func (c *Client) ListTasks() ([]*metadata.TaskState, error) {
 	resp, err := SendRequest(Request{
 		Type: ReqListTasks,
 		Args: map[string]string{},
@@ -334,7 +347,7 @@ func (c *Client) ListTasks() ([]*libcontainer.ContainerState, error) {
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var states []*libcontainer.ContainerState
+	var states []*metadata.TaskState
 	if err := json.Unmarshal(data, &states); err != nil {
 		return nil, fmt.Errorf("解析任务列表失败: %w", err)
 	}
@@ -540,6 +553,128 @@ func (c *Client) RegisterImage(info *metadata.Image) error {
 	return nil
 }
 
+// CommitContainer 将容器的可写层提交为新镜像（对齐 docker commit）
+// 对齐 containerd: 通过 RPC 调用 containerd 的 CommitContainer
+func (c *Client) CommitContainer(containerID, imageName, tag string) (*metadata.Image, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqCommitContainer,
+		Args: map[string]string{
+			"container_id": containerID,
+			"image_name":   imageName,
+			"tag":          tag,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var img metadata.Image
+	if err := json.Unmarshal(data, &img); err != nil {
+		return nil, fmt.Errorf("解析镜像信息失败: %w", err)
+	}
+	return &img, nil
+}
+
+// ---------------------------------------------------------------------------
+// 容器元数据 RPC 方法（对齐 containerd: containers.Store gRPC 服务）
+// 改造前：Daemon 直接调用 containerstore 包函数操作 boltdb，绕过 containerd
+// 改造后：Daemon 通过 RPC 调用 containerd 的 Container Service
+// ---------------------------------------------------------------------------
+
+// CreateContainer 创建容器元数据记录（对齐 containerd: containers.Store.Create）
+func (c *Client) CreateContainer(info *containerstore.ContainerInfo) error {
+	infoJSON, _ := json.Marshal(info)
+	resp, err := SendRequest(Request{
+		Type: ReqCreateContainer,
+		Args: map[string]string{"info": string(infoJSON)},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// GetContainer 查询容器元数据（对齐 containerd: containers.Store.Get）
+// 支持 ID 和名称两种查询方式
+func (c *Client) GetContainer(id string) (*containerstore.ContainerInfo, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqGetContainer,
+		Args: map[string]string{"id": id},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var info containerstore.ContainerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("解析容器信息失败: %w", err)
+	}
+	return &info, nil
+}
+
+// ListContainers 列出所有容器元数据（对齐 containerd: containers.Store.List）
+func (c *Client) ListContainers() ([]*containerstore.ContainerInfo, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqListContainers,
+		Args: map[string]string{},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var containers []*containerstore.ContainerInfo
+	if err := json.Unmarshal(data, &containers); err != nil {
+		return nil, fmt.Errorf("解析容器列表失败: %w", err)
+	}
+	return containers, nil
+}
+
+// UpdateContainer 更新容器元数据（对齐 containerd: containers.Store.Update）
+func (c *Client) UpdateContainer(info *containerstore.ContainerInfo) error {
+	infoJSON, _ := json.Marshal(info)
+	resp, err := SendRequest(Request{
+		Type: ReqUpdateContainer,
+		Args: map[string]string{"info": string(infoJSON)},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// DeleteContainer 删除容器元数据（对齐 containerd: containers.Store.Delete）
+func (c *Client) DeleteContainer(id string) error {
+	resp, err := SendRequest(Request{
+		Type: ReqDeleteContainer,
+		Args: map[string]string{"id": id},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
 // GC 手动触发垃圾回收
 func (c *Client) GC() (*gc.GCStats, error) {
 	resp, err := SendRequest(Request{
@@ -561,6 +696,78 @@ func (c *Client) GC() (*gc.GCStats, error) {
 	return &stats, nil
 }
 
+// PublishEvent 向 containerd 事件总线发布事件。
+func (c *Client) PublishEvent(ev *events.Envelope) error {
+	eventJSON, err := json.Marshal(ev.Event)
+	if err != nil {
+		return fmt.Errorf("序列化事件失败: %w", err)
+	}
+
+	resp, err := SendRequest(Request{
+		Type: ReqPublishEvent,
+		Args: map[string]string{
+			"topic":     ev.Topic,
+			"namespace": ev.Namespace,
+			"timestamp": ev.Timestamp.Format(time.RFC3339Nano),
+			"event":     string(eventJSON),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// SubscribeEvents 订阅 containerd 事件流，返回长连接。
+// filters 为 topic glob 过滤规则，例如 "/tasks/**"。
+func (c *Client) SubscribeEvents(filters ...string) (net.Conn, error) {
+	filtersJSON, _ := json.Marshal(filters)
+	conn, resp, err := SendStreamRequest(Request{
+		Type: ReqSubscribeEvents,
+		Args: map[string]string{"filters": string(filtersJSON)},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil && !resp.Success {
+		conn.Close()
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+	return conn, nil
+}
+
+// GetEventArchive 获取 containerd 事件归档。
+func (c *Client) GetEventArchive(since, until time.Time) ([]*events.Envelope, error) {
+	args := map[string]string{}
+	if !since.IsZero() {
+		args["since"] = since.Format(time.RFC3339Nano)
+	}
+	if !until.IsZero() {
+		args["until"] = until.Format(time.RFC3339Nano)
+	}
+
+	resp, err := SendRequest(Request{
+		Type: ReqGetEventArchive,
+		Args: args,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var archive []*events.Envelope
+	if err := json.Unmarshal(data, &archive); err != nil {
+		return nil, fmt.Errorf("解析事件归档失败: %w", err)
+	}
+	return archive, nil
+}
+
 // PrepareSnapshot 创建容器可写层快照并在宿主机上挂载 OverlayFS
 // 对齐 containerd: 通过 Snapshotter.Prepare() 创建可写快照，注册元数据到 boltdb，
 // 然后在宿主机上执行 overlay mount，使 merged 目录成为真正的容器 rootfs。
@@ -570,6 +777,10 @@ func (c *Client) GC() (*gc.GCStats, error) {
 //
 // 对齐真实 containerd 行为：overlay mount 在宿主机上完成（而非容器 init 进程内），
 // runc/容器 init 只需 pivot_root 到已挂载的 merged 目录即可。
+//
+// 新接口支持两种挂载类型：
+//   - overlay mount（有父快照）：解析 lowerdir/upperdir/workdir，执行 overlay mount
+//   - bind mount（无父快照）：source 为 fs/ 目录，直接作为 merged 目录使用
 func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types.OverlayDirs, error) {
 	mounts, err := sendPrepareSnapshotRPC(containerID, topLayerSnapshotID)
 	if err != nil {
@@ -578,7 +789,9 @@ func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types
 
 	overlayDirs := &types.OverlayDirs{}
 	for _, m := range mounts {
-		if m.Type == "overlay" {
+		switch m.Type {
+		case "overlay":
+			// overlay mount：解析 lowerdir/upperdir/workdir
 			for _, opt := range m.Options {
 				if strings.HasPrefix(opt, "upperdir=") {
 					overlayDirs.Upper = strings.TrimPrefix(opt, "upperdir=")
@@ -588,22 +801,27 @@ func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types
 					overlayDirs.Lower = strings.TrimPrefix(opt, "lowerdir=")
 				}
 			}
-		}
-	}
 
-	// merged 目录在快照目录下
-	if overlayDirs.Upper != "" {
-		overlayDirs.Merged = filepath.Join(filepath.Dir(overlayDirs.Upper), "merged")
-		if err := os.MkdirAll(overlayDirs.Merged, 0755); err != nil {
-			return nil, fmt.Errorf("创建 merged 目录失败: %w", err)
-		}
+			// merged 目录在快照目录下
+			if overlayDirs.Upper != "" {
+				overlayDirs.Merged = filepath.Join(filepath.Dir(overlayDirs.Upper), "merged")
+				if err := os.MkdirAll(overlayDirs.Merged, 0755); err != nil {
+					return nil, fmt.Errorf("创建 merged 目录失败: %w", err)
+				}
 
-		// 对齐 containerd: 在宿主机上执行 overlay mount
-		// merged 目录从空目录变为真正的 overlay 文件系统
-		options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
-			overlayDirs.Lower, overlayDirs.Upper, overlayDirs.Work)
-		if err := unix.Mount("overlay", overlayDirs.Merged, "overlay", 0, options); err != nil {
-			return nil, fmt.Errorf("宿主机 overlay mount 失败: %w", err)
+				// 对齐 containerd: 在宿主机上执行 overlay mount
+				// merged 目录从空目录变为真正的 overlay 文件系统
+				options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+					overlayDirs.Lower, overlayDirs.Upper, overlayDirs.Work)
+				if err := unix.Mount("overlay", overlayDirs.Merged, "overlay", 0, options); err != nil {
+					return nil, fmt.Errorf("宿主机 overlay mount 失败: %w", err)
+				}
+			}
+
+		case "bind":
+			// bind mount（无父快照）：source 为 fs/ 目录，直接作为 merged 目录使用
+			// 不需要执行 mount，fs/ 目录本身就是容器的 rootfs
+			overlayDirs.Merged = m.Source
 		}
 	}
 
@@ -612,7 +830,7 @@ func (c *Client) PrepareSnapshot(containerID, topLayerSnapshotID string) (*types
 
 // Snapshotter 返回一个基于远程调用的 Snapshotter 代理
 // 对齐 containerd: Daemon 通过此代理调用 containerd 服务端的 Snapshotter 方法
-// 代理通过 Unix Socket 转发 DiffPath 等调用到服务端
+// 代理通过 Unix Socket 转发所有 Snapshotter 接口调用到服务端
 func (c *Client) Snapshotter() snapshots.Snapshotter {
 	return &clientSnapshotter{client: c}
 }
@@ -621,21 +839,27 @@ func (c *Client) Snapshotter() snapshots.Snapshotter {
 // 对齐 containerd: Daemon 不直接持有 Snapshotter，而是通过 Unix Socket RPC 代理调用
 //
 // 本代理实现 snapshots.Snapshotter 接口：
-//   - RPC 转发（支持远程）：Prepare、Remove、DiffPath、Close
-//   - 本地不支持（服务器内部操作）：Mounts、Commit、Walk、Apply
+//   - Prepare: 创建可写快照，返回 mount 信息
+//   - View: 创建只读活跃快照，返回 mount 信息
+//   - Commit: 提交 Active 快照为 Committed
+//   - Mounts: 获取快照的挂载信息
+//   - Remove: 删除快照
+//   - Stat: 查询快照元信息
+//   - Update: 更新快照元信息
+//   - Usage: 查询快照资源使用量
+//   - Walk: 遍历所有快照
+//   - Cleanup: 清理已移除/废弃快照的磁盘资源
+//   - Close: 关闭（no-op）
 //
-// Prepare/Remove/DiffPath 通过对应 RPC 路由调用
-// Mounts/Commit/Walk/Apply 是 Snapshotter 内部细节，
-// 不需要也不应该跨进程调用
+// 所有方法通过 RPC 转发到 containerd 服务端执行
 type clientSnapshotter struct {
 	client *Client
 }
 
 // Prepare 通过 RPC 创建容器可写层快照
-// 对齐 containerd: Snapshotter.Prepare 是 client 唯一能调用的"准备快照"方法，
-// 之前返回 "应通过 PrepareSnapshot API 调用" 的错误误导调用方，
-// 现在代理直接转发到 server，调用方拿到的就是标准 snapshots.Mount 列表
-func (cs *clientSnapshotter) Prepare(ctx context.Context, key, parent string) ([]snapshots.Mount, error) {
+// 对齐 containerd: Snapshotter.Prepare 创建 Active 可写快照，返回 mount 信息
+// opts 在远程调用中被忽略（标签等选项仅服务端本地调用时生效）
+func (cs *clientSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]snapshots.Mount, error) {
 	return sendPrepareSnapshotRPC(key, parent)
 }
 
@@ -669,16 +893,11 @@ func sendPrepareSnapshotRPC(containerID, topLayerSnapshotID string) ([]snapshots
 	return wrapper.Mounts, nil
 }
 
-// Mounts 是 Snapshotter 内部细节（返回 overlay mount 句柄），不支持跨进程调用
+// Mounts 通过 RPC 获取快照的挂载信息
+// 对齐 containerd: Snapshotter.Mounts 返回快照的 mount 列表
 func (cs *clientSnapshotter) Mounts(ctx context.Context, key string) ([]snapshots.Mount, error) {
-	return nil, fmt.Errorf("clientSnapshotter: Mounts 是 Snapshotter 内部细节，不支持远程调用")
-}
-
-// Commit 通过 RPC 提交快照（对齐 containerd: Snapshotter.Commit）
-// builder 构建流程使用：RUN/COPY 指令执行完毕后，将 Active 快照提交为 Committed
-func (cs *clientSnapshotter) Commit(ctx context.Context, key string) ([]snapshots.Mount, error) {
 	resp, err := SendRequest(Request{
-		Type: ReqCommitSnapshot,
+		Type: ReqMountsSnapshot,
 		Args: map[string]string{"key": key},
 	})
 	if err != nil {
@@ -698,14 +917,26 @@ func (cs *clientSnapshotter) Commit(ctx context.Context, key string) ([]snapshot
 	return wrapper.Mounts, nil
 }
 
-// CommitAs 是 Snapshotter 内部细节（创建新 Committed 快照），不支持跨进程调用
-func (cs *clientSnapshotter) CommitAs(ctx context.Context, name, key string) ([]snapshots.Mount, error) {
-	return nil, fmt.Errorf("clientSnapshotter: CommitAs 是 Snapshotter 内部细节，不支持远程调用")
+// Commit 通过 RPC 提交快照（对齐 containerd: Snapshotter.Commit）
+// builder 构建流程使用：RUN/COPY 指令执行完毕后，将 Active 快照提交为 Committed
+// name: 提交后的快照名称，key: 源 Active 快照名称（提交后该 key 被消费）
+// opts 在远程调用中被忽略
+func (cs *clientSnapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	resp, err := SendRequest(Request{
+		Type: ReqCommitSnapshot,
+		Args: map[string]string{"name": name, "key": key},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
 }
 
 // Remove 通过 RPC 删除容器快照
-// 对齐 containerd: Snapshotter.Remove 唯一会跨进程调用的删除方法
-// 直接发 RPC，不再绕道 Client.RemoveSnapshot（已删除，避免两条 API 路径）
+// 对齐 containerd: Snapshotter.Remove 删除快照及其元数据
 func (cs *clientSnapshotter) Remove(ctx context.Context, key string) error {
 	resp, err := SendRequest(Request{
 		Type: ReqRemoveSnapshot,
@@ -722,7 +953,8 @@ func (cs *clientSnapshotter) Remove(ctx context.Context, key string) error {
 
 // Walk 通过 RPC 遍历所有快照（对齐 containerd: Snapshotter.Walk）
 // builder 构建流程使用：构建完成后遍历快照，收集已 Commit 层的 digest
-func (cs *clientSnapshotter) Walk(ctx context.Context, fn func(snapshots.Info) error) error {
+// 使用新的 WalkFunc 签名：(ctx context.Context, info Info) error
+func (cs *clientSnapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
 	resp, err := SendRequest(Request{
 		Type: ReqWalkSnapshots,
 		Args: map[string]string{},
@@ -742,24 +974,186 @@ func (cs *clientSnapshotter) Walk(ctx context.Context, fn func(snapshots.Info) e
 		return fmt.Errorf("解析快照列表失败: %w", err)
 	}
 	for _, info := range wrapper.Snapshots {
-		if err := fn(info); err != nil {
+		if err := fn(ctx, info); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// Apply 是 Snapshotter 内部细节（解压 tar.gz blob 到 diff 目录），不支持跨进程调用
-// 镜像拉取发生在 containerd 进程内部，不通过客户端走 RPC
-func (cs *clientSnapshotter) Apply(ctx context.Context, digest, diffID, blobPath, key string) error {
-	return fmt.Errorf("clientSnapshotter: Apply 是 Snapshotter 内部细节，不支持远程调用")
+// View 通过 RPC 创建只读活跃快照（对齐 containerd: Snapshotter.View）
+// 用于挂载查看镜像内容等只读场景，无 upperdir/workdir
+// opts 在远程调用中被忽略
+func (cs *clientSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]snapshots.Mount, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqViewSnapshot,
+		Args: map[string]string{
+			"key":    key,
+			"parent": parent,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Mounts []snapshots.Mount `json:"mounts"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("解析挂载信息失败: %w", err)
+	}
+	return wrapper.Mounts, nil
 }
 
-// DiffPath 通过 RPC 获取快照的 diff 目录路径
-func (cs *clientSnapshotter) DiffPath(ctx context.Context, key string) (string, error) {
+// Stat 通过 RPC 查询快照元信息（对齐 containerd: Snapshotter.Stat）
+func (cs *clientSnapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
 	resp, err := SendRequest(Request{
-		Type: ReqDiffPath,
+		Type: ReqStatSnapshot,
 		Args: map[string]string{"key": key},
+	})
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	if !resp.Success {
+		return snapshots.Info{}, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Info snapshots.Info `json:"info"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return snapshots.Info{}, fmt.Errorf("解析快照信息失败: %w", err)
+	}
+	return wrapper.Info, nil
+}
+
+// Update 通过 RPC 更新快照元信息（对齐 containerd: Snapshotter.Update）
+// fieldpaths: 指定要更新的字段路径，为空则更新所有可变字段
+func (cs *clientSnapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
+	args := map[string]string{
+		"name": info.Name,
+	}
+	// 序列化 info 的 labels（可变字段）
+	if info.Labels != nil {
+		labelsJSON, _ := json.Marshal(info.Labels)
+		args["labels"] = string(labelsJSON)
+	}
+	// 序列化 fieldpaths
+	if len(fieldpaths) > 0 {
+		args["fieldpaths"] = strings.Join(fieldpaths, ",")
+	}
+
+	resp, err := SendRequest(Request{
+		Type: ReqUpdateSnapshot,
+		Args: args,
+	})
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	if !resp.Success {
+		return snapshots.Info{}, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Info snapshots.Info `json:"info"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return snapshots.Info{}, fmt.Errorf("解析更新后的快照信息失败: %w", err)
+	}
+	return wrapper.Info, nil
+}
+
+// Usage 通过 RPC 查询快照资源使用量（对齐 containerd: Snapshotter.Usage）
+func (cs *clientSnapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqUsageSnapshot,
+		Args: map[string]string{"key": key},
+	})
+	if err != nil {
+		return snapshots.Usage{}, err
+	}
+	if !resp.Success {
+		return snapshots.Usage{}, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Usage snapshots.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return snapshots.Usage{}, fmt.Errorf("解析资源使用量失败: %w", err)
+	}
+	return wrapper.Usage, nil
+}
+
+// Cleanup 通过 RPC 清理已移除/废弃快照的磁盘资源（对齐 containerd: Snapshotter.Cleanup）
+func (cs *clientSnapshotter) Cleanup(ctx context.Context) error {
+	resp, err := SendRequest(Request{
+		Type: ReqCleanupSnapshot,
+		Args: map[string]string{},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// Close 客户端 Snapshotter 不需要关闭，no-op
+func (cs *clientSnapshotter) Close() error {
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Content Store RPC 代理（对齐 containerd: Daemon 不直接持有 Content Store，
+// 而是通过 RPC 代理调用 containerd 服务端）
+// ---------------------------------------------------------------------------
+
+// ContentStore 返回一个基于远程调用的 Content Store 代理
+// 对齐 containerd: Daemon 通过此代理调用 containerd 服务端的 Content Store 方法
+func (c *Client) ContentStore() content.Store {
+	return &clientContentStore{client: c}
+}
+
+// clientContentStore 基于 Unix Socket 的远程 Content Store 代理
+type clientContentStore struct {
+	client *Client
+}
+
+// Info 通过 RPC 查询 blob 元信息
+func (cs *clientContentStore) Info(ctx context.Context, digest string) (content.Info, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqContentInfo,
+		Args: map[string]string{"digest": digest},
+	})
+	if err != nil {
+		return content.Info{}, err
+	}
+	if !resp.Success {
+		return content.Info{}, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var info content.Info
+	if err := json.Unmarshal(data, &info); err != nil {
+		return content.Info{}, fmt.Errorf("解析 blob 信息失败: %w", err)
+	}
+	return info, nil
+}
+
+// Path 通过 RPC 获取 blob 本地存储路径
+func (cs *clientContentStore) Path(ctx context.Context, digest string) (string, error) {
+	resp, err := SendRequest(Request{
+		Type: ReqContentPath,
+		Args: map[string]string{"digest": digest},
 	})
 	if err != nil {
 		return "", err
@@ -769,18 +1163,284 @@ func (cs *clientSnapshotter) DiffPath(ctx context.Context, key string) (string, 
 	}
 
 	data, _ := json.Marshal(resp.Data)
-	var result map[string]interface{}
+	var result struct {
+		Path string `json:"path"`
+	}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return "", fmt.Errorf("解析 diff 路径失败: %w", err)
+		return "", fmt.Errorf("解析路径失败: %w", err)
 	}
-	path, ok := result["path"].(string)
-	if !ok {
-		return "", fmt.Errorf("响应中缺少 path 字段")
-	}
-	return path, nil
+	return result.Path, nil
 }
 
-// Close 客户端 Snapshotter 不需要关闭，no-op
-func (cs *clientSnapshotter) Close() error {
+// Exists 通过 RPC 检查 blob 是否存在
+func (cs *clientContentStore) Exists(ctx context.Context, digest string) bool {
+	resp, err := SendRequest(Request{
+		Type: ReqContentExists,
+		Args: map[string]string{"digest": digest},
+	})
+	if err != nil || !resp.Success {
+		return false
+	}
+	data, _ := json.Marshal(resp.Data)
+	var result struct {
+		Exists bool `json:"exists"`
+	}
+	if json.Unmarshal(data, &result) != nil {
+		return false
+	}
+	return result.Exists
+}
+
+// Delete 通过 RPC 删除 blob
+func (cs *clientContentStore) Delete(ctx context.Context, digest string) error {
+	resp, err := SendRequest(Request{
+		Type: ReqContentDelete,
+		Args: map[string]string{"digest": digest},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
 	return nil
+}
+
+// Writer 通过 RPC 创建 Content Writer
+// 采用分块写入模式：先创建 Writer，再分块写入，最后 Commit
+func (cs *clientContentStore) Writer(ctx context.Context, expected string, size int64, mediaType string) (content.Writer, error) {
+	ref := fmt.Sprintf("ref-%d", time.Now().UnixNano())
+
+	resp, err := SendRequest(Request{
+		Type: ReqContentWrite,
+		Args: map[string]string{
+			"ref":        ref,
+			"action":     "create",
+			"expected":   expected,
+			"size":       strconv.FormatInt(size, 10),
+			"media_type": mediaType,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Message)
+	}
+
+	return &rpcContentWriter{
+		client:   cs.client,
+		ref:      ref,
+		digester: crypto_sha256.New(),
+	}, nil
+}
+
+// Reader 返回 blob 的读取流
+// 由于 RPC 不支持流式读取，这里直接打开本地文件（Daemon 和 containerd 共享文件系统）
+func (cs *clientContentStore) Reader(ctx context.Context, digest string) (io.ReadCloser, error) {
+	path, err := cs.Path(ctx, digest)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(path)
+}
+
+// Walk 通过 RPC 遍历所有 blob 元信息
+func (cs *clientContentStore) Walk(ctx context.Context, fn func(content.Info) error) error {
+	resp, err := SendRequest(Request{
+		Type: ReqContentWalk,
+		Args: map[string]string{},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var wrapper struct {
+		Infos []content.Info `json:"infos"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return fmt.Errorf("解析 blob 列表失败: %w", err)
+	}
+	for _, info := range wrapper.Infos {
+		if err := fn(info); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Update 通过 RPC 更新 blob 标签
+func (cs *clientContentStore) Update(ctx context.Context, digest string, labels map[string]string) error {
+	labelsJSON, _ := json.Marshal(labels)
+	resp, err := SendRequest(Request{
+		Type: ReqContentUpdate,
+		Args: map[string]string{
+			"digest": digest,
+			"labels": string(labelsJSON),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// rpcContentWriter 基于 RPC 的 Content Writer 代理
+type rpcContentWriter struct {
+	client   *Client
+	ref      string
+	digester hash.Hash
+	written  int64
+}
+
+// Write 通过 RPC 分块写入数据
+func (w *rpcContentWriter) Write(p []byte) (int, error) {
+	// 将二进制数据编码为 base64 传输，避免 JSON 序列化问题
+	encoded := base64.StdEncoding.EncodeToString(p)
+
+	resp, err := SendRequest(Request{
+		Type: ReqContentWrite,
+		Args: map[string]string{
+			"ref":    w.ref,
+			"action": "write",
+			"data":   encoded,
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !resp.Success {
+		return 0, fmt.Errorf("%s", resp.Message)
+	}
+
+	w.digester.Write(p)
+	w.written += int64(len(p))
+	return len(p), nil
+}
+
+// Commit 通过 RPC 提交 blob 并校验 digest
+func (w *rpcContentWriter) Commit(ctx context.Context, expectedDigest string) error {
+	calculated := "sha256:" + hex.EncodeToString(w.digester.Sum(nil))
+	if expectedDigest == "" {
+		expectedDigest = calculated
+	}
+
+	resp, err := SendRequest(Request{
+		Type: ReqContentWrite,
+		Args: map[string]string{
+			"ref":             w.ref,
+			"action":          "commit",
+			"expected_digest": expectedDigest,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// Status 返回已写入的字节数
+func (w *rpcContentWriter) Status() (int64, error) {
+	return w.written, nil
+}
+
+// Close 通过 RPC 关闭 Writer（丢弃未提交的数据）
+func (w *rpcContentWriter) Close() error {
+	resp, err := SendRequest(Request{
+		Type: ReqContentWrite,
+		Args: map[string]string{
+			"ref":    w.ref,
+			"action": "close",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// Digest 返回当前计算的 digest
+func (w *rpcContentWriter) Digest() string {
+	return "sha256:" + hex.EncodeToString(w.digester.Sum(nil))
+}
+
+// DiffService 返回一个基于远程调用的 Diff Service 代理
+// 对齐 containerd: Daemon 通过此代理调用 containerd 服务端的 Diff Service 方法
+func (c *Client) DiffService() *clientDiffService {
+	return &clientDiffService{client: c}
+}
+
+// clientDiffService 基于 Unix Socket 的远程 Diff Service 代理
+type clientDiffService struct {
+	client *Client
+}
+
+// Apply 通过 RPC 将层差异应用到 Active 快照
+func (cds *clientDiffService) Apply(ctx context.Context, digest, diffID, key string) error {
+	resp, err := SendRequest(Request{
+		Type: ReqDiffApply,
+		Args: map[string]string{
+			"digest":  digest,
+			"diff_id": diffID,
+			"key":     key,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Message)
+	}
+	return nil
+}
+
+// Diff 通过 RPC 计算两个快照之间的差异，生成 blob 写入 Content Store
+// opts 会在客户端应用为 DiffConfig 后序列化到 RPC 请求中
+func (cds *clientDiffService) Diff(ctx context.Context, lowerKey, upperKey string, opts ...diff.DiffOpt) (diff.DiffResult, error) {
+	// 应用选项到默认配置，提取可序列化字段
+	cfg := diff.DiffConfig{}
+	for _, opt := range opts {
+		if err := opt(&cfg); err != nil {
+			return diff.DiffResult{}, fmt.Errorf("应用 diff 选项失败: %w", err)
+		}
+	}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return diff.DiffResult{}, fmt.Errorf("序列化 diff 选项失败: %w", err)
+	}
+
+	resp, err := SendRequest(Request{
+		Type: ReqDiffDiff,
+		Args: map[string]string{
+			"lower_key": lowerKey,
+			"upper_key": upperKey,
+			"config":    string(cfgJSON),
+		},
+	})
+	if err != nil {
+		return diff.DiffResult{}, err
+	}
+	if !resp.Success {
+		return diff.DiffResult{}, fmt.Errorf("%s", resp.Message)
+	}
+
+	data, _ := json.Marshal(resp.Data)
+	var result diff.DiffResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return diff.DiffResult{}, fmt.Errorf("解析 diff 结果失败: %w", err)
+	}
+	return result, nil
 }

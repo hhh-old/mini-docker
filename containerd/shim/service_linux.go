@@ -1,13 +1,18 @@
 //go:build linux
 
-package containerd
+package shim
 
 /*
 =======================================================================
-  Shim 进程管理（对齐 Docker: containerd 对 shim 的生命周期管理）
+  Shim Manager 服务 —— 对齐 containerd 的 shim 生命周期管理
 
-  包含 shim 进程的连接、通信、创建、删除、重启等底层操作。
-  这些函数被 Task 处理器调用，但逻辑上属于独立的 shim 管理领域。
+  将 shim_manager_linux.go 中的包级函数封装为 ShimManager 结构体，
+  使其成为插件系统中的一员，生命周期由 Plugin Manager 统一管理。
+
+  对齐真实 containerd 架构：
+  - Shim Manager 是 Task Service 的底层依赖
+  - Task Service 通过 Shim Manager 管理所有 shim 进程
+  - Shim Manager 负责 shim 的连接、通信、创建、删除、重启
 
 =======================================================================
 */
@@ -25,22 +30,36 @@ import (
 	"time"
 
 	"mini-docker/constants"
+	"mini-docker/containerd/metadata"
 	"mini-docker/containerstore"
+	"mini-docker/libcontainer"
 	"mini-docker/spec"
 	"mini-docker/types"
 	"mini-docker/utils"
 )
 
-// ExitInfo 退出信息类型别名见 types.go
+// ExitInfo 退出信息类型别名
+type ExitInfo = types.ExitInfo
+
+// ShimManager 管理 shim 进程的生命周期
+// 对齐 containerd: shim 管理是 Task Service 的底层依赖
+type ShimManager struct {
+	metaDB *metadata.DB
+}
+
+// NewShimManager 创建 ShimManager 实例
+func NewShimManager(metaDB *metadata.DB) *ShimManager {
+	return &ShimManager{metaDB: metaDB}
+}
 
 // resolveShimDir 解析指定容器的 shim 工作目录路径
-func resolveShimDir(containerID string) string {
+func (m *ShimManager) resolveShimDir(containerID string) string {
 	return filepath.Join(constants.ShimDir, containerID)
 }
 
-// connectShim 通过 Unix socket 连接指定容器的 shim 进程
-func connectShim(containerID string) (net.Conn, error) {
-	shimContainerDir := resolveShimDir(containerID)
+// Connect 通过 Unix socket 连接指定容器的 shim 进程
+func (m *ShimManager) Connect(containerID string) (net.Conn, error) {
+	shimContainerDir := m.resolveShimDir(containerID)
 	socketPath := filepath.Join(shimContainerDir, "shim.sock")
 	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
 	if err != nil {
@@ -49,9 +68,9 @@ func connectShim(containerID string) (net.Conn, error) {
 	return conn, nil
 }
 
-// shimCall 向 shim 发送请求并等待响应（不关心返回数据）
-func shimCall(containerID string, req types.ShimRequest) error {
-	conn, err := connectShim(containerID)
+// Call 向 shim 发送请求并等待响应（不关心返回数据）
+func (m *ShimManager) Call(containerID string, req types.ShimRequest) error {
+	conn, err := m.Connect(containerID)
 	if err != nil {
 		return err
 	}
@@ -71,9 +90,9 @@ func shimCall(containerID string, req types.ShimRequest) error {
 	return nil
 }
 
-// shimCallWithData 向 shim 发送请求并将响应数据反序列化到 result
-func shimCallWithData(containerID string, req types.ShimRequest, result any) error {
-	conn, err := connectShim(containerID)
+// CallWithData 向 shim 发送请求并将响应数据反序列化到 result
+func (m *ShimManager) CallWithData(containerID string, req types.ShimRequest, result any) error {
+	conn, err := m.Connect(containerID)
 	if err != nil {
 		return err
 	}
@@ -98,9 +117,9 @@ func shimCallWithData(containerID string, req types.ShimRequest, result any) err
 	return nil
 }
 
-// readExitInfoFromFile 读取 shim 退出时持久化的 exit.json 文件
-func readExitInfoFromFile(containerID string) (*ExitInfo, error) {
-	shimContainerDir := resolveShimDir(containerID)
+// ReadExitInfoFromFile 读取 shim 退出时持久化的 exit.json 文件
+func (m *ShimManager) ReadExitInfoFromFile(containerID string) (*ExitInfo, error) {
+	shimContainerDir := m.resolveShimDir(containerID)
 	exitPath := filepath.Join(shimContainerDir, "exit.json")
 	data, err := os.ReadFile(exitPath)
 	if err != nil {
@@ -113,8 +132,8 @@ func readExitInfoFromFile(containerID string) (*ExitInfo, error) {
 	return &info, nil
 }
 
-// waitForSocket 轮询等待 Unix socket 文件可连接，超时返回错误
-func waitForSocket(path string, timeout time.Duration) error {
+// WaitForSocket 轮询等待 Unix socket 文件可连接，超时返回错误
+func (m *ShimManager) WaitForSocket(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("unix", path, constants.ShimConnectTimeout)
@@ -127,8 +146,8 @@ func waitForSocket(path string, timeout time.Duration) error {
 	return fmt.Errorf("等待 socket %s 超时", path)
 }
 
-// buildOCISpec 根据容器存储信息生成 OCI Runtime Spec
-func buildOCISpec(info *containerstore.ContainerInfo) *spec.Spec {
+// BuildOCISpec 根据容器存储信息生成 OCI Runtime Spec
+func (m *ShimManager) BuildOCISpec(info *containerstore.ContainerInfo, cgroupName string) *spec.Spec {
 	return spec.DefaultSpec(&spec.SpecConfig{
 		Tty:           info.Tty,
 		Memory:        info.Memory,
@@ -141,14 +160,23 @@ func buildOCISpec(info *containerstore.ContainerInfo) *spec.Spec {
 		Network:       info.Network,
 		RestartPolicy: info.RestartPolicy,
 		PortMap:       info.PortMap,
-		CgroupName:    info.CgroupName,
+		CgroupName:    cgroupName,
 	})
 }
 
-// isShimAlive 通过尝试连接 socket 判断 shim 进程是否还活着
-func isShimAlive(containerID string) bool {
-	shimContainerDir := resolveShimDir(containerID)
+// IsAlive 通过尝试连接 socket 判断 shim 进程是否还活着
+func (m *ShimManager) IsAlive(containerID string) bool {
+	shimContainerDir := m.resolveShimDir(containerID)
 	socketPath := filepath.Join(shimContainerDir, "shim.sock")
+
+	// 先校验 shim 进程是否存活：socket 文件残留但进程已死时不能误判为存活
+	if shimPID := m.ReadPID(containerID); shimPID > 0 {
+		proc, err := os.FindProcess(shimPID)
+		if err != nil || proc.Signal(syscall.Signal(0)) != nil {
+			return false
+		}
+	}
+
 	conn, err := net.DialTimeout("unix", socketPath, constants.ShimConnectTimeout)
 	if err != nil {
 		return false
@@ -157,9 +185,9 @@ func isShimAlive(containerID string) bool {
 	return true
 }
 
-// readShimPID 从 shim.pid 文件中读取 shim 进程 PID，失败返回 0
-func readShimPID(containerID string) int {
-	pidPath := filepath.Join(resolveShimDir(containerID), "shim.pid")
+// ReadPID 从 shim.pid 文件中读取 shim 进程 PID，失败返回 0
+func (m *ShimManager) ReadPID(containerID string) int {
+	pidPath := filepath.Join(m.resolveShimDir(containerID), "shim.pid")
 	data, err := os.ReadFile(pidPath)
 	if err != nil {
 		return 0
@@ -169,13 +197,13 @@ func readShimPID(containerID string) int {
 	return pid
 }
 
-// deleteTask 删除容器任务：停止 shim 和容器进程，清理运行时目录
-func deleteTask(containerID string) error {
-	conn, err := connectShim(containerID)
+// Delete 删除容器任务：停止 shim 和容器进程，清理运行时目录
+func (m *ShimManager) Delete(containerID string) error {
+	conn, err := m.Connect(containerID)
 	if err == nil {
 		json.NewEncoder(conn).Encode(types.ShimRequest{Type: "shutdown"})
 		conn.Close()
-		shimPID := readShimPID(containerID)
+		shimPID := m.ReadPID(containerID)
 		if shimPID > 0 {
 			exited := false
 			for i := 0; i < 30; i++ {
@@ -205,7 +233,7 @@ func deleteTask(containerID string) error {
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		shimPID := readShimPID(containerID)
+		shimPID := m.ReadPID(containerID)
 		if shimPID > 0 {
 			if proc, e := os.FindProcess(shimPID); e == nil {
 				proc.Signal(syscall.SIGKILL)
@@ -220,8 +248,8 @@ func deleteTask(containerID string) error {
 	}
 
 	containerPID := 0
-	if info, err := readExitInfoFromFile(containerID); err != nil || info == nil {
-		createdPath := filepath.Join(resolveShimDir(containerID), "created")
+	if info, err := m.ReadExitInfoFromFile(containerID); err != nil || info == nil {
+		createdPath := filepath.Join(m.resolveShimDir(containerID), "created")
 		if data, err := os.ReadFile(createdPath); err == nil {
 			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &containerPID)
 		}
@@ -242,15 +270,15 @@ func deleteTask(containerID string) error {
 	stateDir := filepath.Join(constants.RuntimeDir, containerID)
 	os.RemoveAll(stateDir)
 
-	shimContainerDir := resolveShimDir(containerID)
+	shimContainerDir := m.resolveShimDir(containerID)
 	os.RemoveAll(shimContainerDir)
 
 	return nil
 }
 
-// shutdownShim 向 shim 发送 shutdown 请求并等待其退出
-func shutdownShim(containerID string) {
-	conn, err := connectShim(containerID)
+// Shutdown 向 shim 发送 shutdown 请求并等待其退出
+func (m *ShimManager) Shutdown(containerID string) {
+	conn, err := m.Connect(containerID)
 	if err != nil {
 		return
 	}
@@ -259,20 +287,20 @@ func shutdownShim(containerID string) {
 	time.Sleep(constants.ShutdownWaitTime)
 }
 
-// restartShim 重启 shim 并以 --takeover 接管已存在的容器进程，返回新 shim 的 PID
-func restartShim(containerID string, containerPID int) (int, error) {
+// Restart 重启 shim 并以 --takeover 接管已存在的容器进程，返回新 shim 的 PID
+func (m *ShimManager) Restart(containerID string, containerPID int) (int, error) {
 	bundlePath := filepath.Join(constants.RuntimeDir, containerID, "bundle")
 	if _, err := os.Stat(bundlePath); err != nil {
 		return 0, fmt.Errorf("bundle 目录不存在: %w", err)
 	}
 
-	shimContainerDir := resolveShimDir(containerID)
+	shimContainerDir := m.resolveShimDir(containerID)
 	os.Remove(filepath.Join(shimContainerDir, "shim.sock"))
 	os.Remove(filepath.Join(shimContainerDir, "shim.pid"))
 	os.Remove(filepath.Join(shimContainerDir, "created"))
 	os.Remove(filepath.Join(shimContainerDir, "exit.json"))
 
-	cmd := newShimCommand([]string{"shim", containerID, bundlePath, "--takeover", fmt.Sprintf("%d", containerPID)})
+	cmd := m.NewCommand([]string{"shim", containerID, bundlePath, "--takeover", fmt.Sprintf("%d", containerPID)})
 
 	logDir := filepath.Join(filepath.Dir(constants.DaemonLogPath), "shim")
 	logPath := filepath.Join(logDir, containerID+".log")
@@ -294,7 +322,7 @@ func restartShim(containerID string, containerPID int) (int, error) {
 	shimPID := cmd.Process.Pid
 
 	socketPath := filepath.Join(shimContainerDir, "shim.sock")
-	if err := waitForSocket(socketPath, constants.SocketWaitTimeout); err != nil {
+	if err := m.WaitForSocket(socketPath, constants.SocketWaitTimeout); err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
 		return 0, fmt.Errorf("shim socket 未就绪: %w", err)
@@ -303,9 +331,9 @@ func restartShim(containerID string, containerPID int) (int, error) {
 	return shimPID, nil
 }
 
-// waitForCreate 轮询等待 shim 创建容器完成，从 created 文件读取容器 PID
-func waitForCreate(containerID string, timeout time.Duration) (int, error) {
-	shimContainerDir := resolveShimDir(containerID)
+// WaitForCreate 轮询等待 shim 创建容器完成，从 created 文件读取容器 PID
+func (m *ShimManager) WaitForCreate(containerID string, timeout time.Duration) (int, error) {
+	shimContainerDir := m.resolveShimDir(containerID)
 	createdPath := filepath.Join(shimContainerDir, "created")
 
 	deadline := time.Now().Add(timeout)
@@ -322,9 +350,9 @@ func waitForCreate(containerID string, timeout time.Duration) (int, error) {
 	return 0, fmt.Errorf("等待容器 %s 创建超时", containerID)
 }
 
-// attachToShim 向 shim 发送 attach 请求，建立 I/O 透传的连接
-func attachToShim(containerID string) (net.Conn, error) {
-	conn, err := connectShim(containerID)
+// Attach 向 shim 发送 attach 请求，建立 I/O 透传的连接
+func (m *ShimManager) Attach(containerID string) (net.Conn, error) {
+	conn, err := m.Connect(containerID)
 	if err != nil {
 		return nil, err
 	}
@@ -347,9 +375,9 @@ func attachToShim(containerID string) (net.Conn, error) {
 	return conn, nil
 }
 
-// execTaskStream 在运行中的容器内执行命令，返回与 shim 通信的连接
-func execTaskStream(containerID string, args []string, tty bool) (net.Conn, error) {
-	conn, err := connectShim(containerID)
+// ExecStream 在运行中的容器内执行命令，返回与 shim 通信的连接
+func (m *ShimManager) ExecStream(containerID string, args []string, tty bool) (net.Conn, error) {
+	conn, err := m.Connect(containerID)
 	if err != nil {
 		return nil, err
 	}
@@ -373,10 +401,70 @@ func execTaskStream(containerID string, args []string, tty bool) (net.Conn, erro
 	return conn, nil
 }
 
-// newShimCommand 创建 shim 进程命令
+// NewCommand 创建 shim 进程命令
 // containerd 独立进程后，使用 /proc/self/exe 仍然可行（同一个二进制）
-func newShimCommand(args []string) *exec.Cmd {
+func (m *ShimManager) NewCommand(args []string) *exec.Cmd {
 	cmd := exec.Command("/proc/self/exe", args...)
-	cmd.SysProcAttr = newShimSysProcAttr()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	return cmd
+}
+
+// GetState 获取容器运行时状态
+// 对齐 containerd: 通过 shim 协议获取，不暴露 runtime 层类型给上层
+// 在线：通过 shim socket 获取（shim State RPC 返回 container_id/pid/status）
+// 离线：从 state.json 文件读取并转换
+// ShimManager 是 containerd 与 runtime 的边界层，内部使用 libcontainer 是合理的
+func (m *ShimManager) GetState(containerID string) (*metadata.TaskState, error) {
+	// 在线：通过 shim socket 获取
+	conn, err := m.Connect(containerID)
+	if err == nil {
+		conn.Close()
+		var state metadata.TaskState
+		if err := m.CallWithData(containerID, types.ShimRequest{Type: "state"}, &state); err == nil {
+			state.ShimPID = m.ReadPID(containerID)
+			return &state, nil
+		}
+	}
+
+	// 离线 fallback：从 state.json 读取并转换
+	cs, err := libcontainer.LoadContainerState(containerID)
+	if err != nil {
+		return nil, fmt.Errorf("获取任务状态失败: %w", err)
+	}
+	return &metadata.TaskState{
+		ContainerID: cs.ID,
+		PID:         cs.Pid,
+		ShimPID:     m.ReadPID(containerID),
+		Status:      cs.Status,
+	}, nil
+}
+
+// ListStates 列出所有容器运行时状态
+// 对齐 containerd: 通过扫描 state.json 获取，不暴露 runtime 层类型给上层
+// 对状态为 Running/Created 的容器，额外检测进程是否真正存活，不存活则修正为 Stopped
+// 原因：容器可能被 OOM kill 或外部信号杀死，state.json 未及时更新
+func (m *ShimManager) ListStates() ([]*metadata.TaskState, error) {
+	containerStates, err := libcontainer.ListContainerStates()
+	if err != nil {
+		return nil, fmt.Errorf("列出任务失败: %w", err)
+	}
+
+	states := make([]*metadata.TaskState, 0, len(containerStates))
+	for _, cs := range containerStates {
+		ts := &metadata.TaskState{
+			ContainerID: cs.ID,
+			PID:         cs.Pid,
+			ShimPID:     m.ReadPID(cs.ID),
+			Status:      cs.Status,
+		}
+		// 检查进程是否真正存活
+		if ts.Status == containerstore.StatusRunning || ts.Status == containerstore.StatusCreated {
+			proc, err := os.FindProcess(ts.PID)
+			if err != nil || proc.Signal(syscall.Signal(0)) != nil {
+				ts.Status = containerstore.StatusStopped
+			}
+		}
+		states = append(states, ts)
+	}
+	return states, nil
 }

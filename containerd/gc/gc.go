@@ -3,7 +3,6 @@ package gc
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -11,9 +10,10 @@ import (
 
 	"mini-docker/constants"
 	"mini-docker/containerd/content"
+	"mini-docker/containerd/events"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
-	"mini-docker/containerstore"
+	"mini-docker/log"
 	"mini-docker/utils"
 )
 
@@ -60,6 +60,7 @@ type Collector struct {
 	interval    time.Duration
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
+	events      *events.Service // 事件总线服务，发布 GC 完成事件
 }
 
 // GCStats GC 统计信息
@@ -70,14 +71,30 @@ type GCStats struct {
 }
 
 // NewCollector 创建 GC 收集器
-func NewCollector(db *metadata.DB, content content.Store, snapshotter snapshots.Snapshotter, interval time.Duration) *Collector {
+func NewCollector(db *metadata.DB, content content.Store, snapshotter snapshots.Snapshotter, interval time.Duration, ev *events.Service) *Collector {
 	return &Collector{
 		db:          db,
 		content:     content,
 		snapshotter: snapshotter,
 		interval:    interval,
 		stopCh:      make(chan struct{}),
+		events:      ev,
 	}
+}
+
+// publishEvent 发布 GC 完成事件（events 为 nil 时静默跳过）
+func (g *Collector) publishEvent(stats GCStats) {
+	if g.events == nil {
+		return
+	}
+	g.events.Publish(&events.Envelope{
+		Topic: "/gc/run",
+		Event: events.GCRun{
+			RemovedImages:    stats.ContentDeleted,
+			RemovedLayers:    stats.ContentDeleted,
+			RemovedSnapshots: stats.SnapDeleted,
+		},
+	})
 }
 
 // Start 启动周期性 GC
@@ -94,9 +111,9 @@ func (g *Collector) Start() {
 				stats, err := g.Run(ctx)
 				cancel()
 				if err != nil {
-					log.Printf("[gc] 周期性 GC 执行失败: %v\n", err)
+					log.Errorf("[gc] periodic gc run failed: %v", err)
 				} else if stats.ContentDeleted > 0 || stats.SnapDeleted > 0 {
-					log.Printf("[gc] 周期性 GC 完成: 删除 content=%d, snapshot=%d, 耗时=%v\n",
+					log.Infof("[gc] periodic gc completed content_deleted=%d snap_deleted=%d elapsed=%v",
 						stats.ContentDeleted, stats.SnapDeleted, stats.Elapsed)
 				}
 			case <-g.stopCh:
@@ -125,8 +142,8 @@ func (g *Collector) Run(ctx context.Context) (GCStats, error) {
 		return stats, fmt.Errorf("preflight 失败: %w", err)
 	}
 	if skip {
-		log.Printf("[gc] 检测到 in-progress lease,本轮跳过 (避免误删拉取中的半成品)\n")
-		stats.Elapsed = time.Since(start) //time.Since(start) 是 Go 语言中用于计算从 start 时刻到当前时刻所经过时间的一个函数。它返回一个 time.Duration 类型的值，表示时间间隔（例如纳秒、微秒、毫秒等）。
+		log.Infof("[gc] in-progress lease detected, skipping this round")
+		stats.Elapsed = time.Since(start)
 		return stats, nil
 	}
 
@@ -148,6 +165,7 @@ func (g *Collector) Run(ctx context.Context) (GCStats, error) {
 	stats.SnapDeleted = snapDeleted
 
 	stats.Elapsed = time.Since(start)
+	g.publishEvent(stats)
 	return stats, nil
 }
 
@@ -184,7 +202,7 @@ func (g *Collector) preflight(ctx context.Context) (bool, error) {
 				if err := metadata.DeleteLease(tx, info.ID); err != nil {
 					return fmt.Errorf("清理僵尸 lease %s 失败: %w", info.ID, err)
 				}
-				log.Printf("[gc] 清理僵尸 in-progress lease: %s (创建于 %s)\n", info.ID, info.CreatedAt)
+				log.Infof("[gc] cleaned up stale in-progress lease id=%s created_at=%s", info.ID, info.CreatedAt)
 			}
 			return nil
 		})
@@ -241,10 +259,10 @@ func (g *Collector) mark(ctx context.Context) (map[string]struct{}, map[string]s
 	}
 
 	// 2. 从 ContainerInfo 出发，标记容器使用的镜像层和快照
-	// 对齐 containerd: 通过 containerstore 包获取容器信息，而非直接读 JSON 文件
-	// 这样保证了访问方式的一致性，容器存储格式变化时只需修改 containerstore 包
-	if containers, err := containerstore.ListContainers(); err == nil {
-		for _, containerInfo := range containers {
+	// 对齐 containerd: 通过 metadata.WalkContainers 在同一 boltdb 事务中获取容器信息
+	// 确保容器引用检查与 images/snapshots 在同一事务中，避免竞态
+	if err := g.db.View(func(tx *bolt.Tx) error {
+		return metadata.WalkContainers(tx, func(containerInfo *metadata.ContainerInfo) error {
 			// 标记容器的快照（容器 ID 即为快照 key）
 			if containerInfo.ID != "" {
 				reachableSnapKeys[containerInfo.ID] = struct{}{}
@@ -256,25 +274,25 @@ func (g *Collector) mark(ctx context.Context) (map[string]struct{}, map[string]s
 				if tag == "" {
 					tag = "latest"
 				}
-				// 从 boltdb 查找镜像 ID
-				g.db.View(func(tx *bolt.Tx) error {
-					imageID, err := metadata.ResolveImageID(tx, name, tag)
-					if err != nil {
-						return nil
-					}
-					img, err := metadata.LoadImage(tx, imageID)
-					if err != nil {
-						return nil
-					}
-					for _, layerDigest := range img.LayerDigests {
-						reachableDigests[layerDigest] = struct{}{}
-						cacheID := content.DigestToCacheID(layerDigest)
-						reachableSnapKeys[cacheID] = struct{}{}
-					}
+				// 从 boltdb 查找镜像 ID（同一事务内）
+				imageID, err := metadata.ResolveImageID(tx, name, tag)
+				if err != nil {
 					return nil
-				})
+				}
+				img, err := metadata.LoadImage(tx, imageID)
+				if err != nil {
+					return nil
+				}
+				for _, layerDigest := range img.LayerDigests {
+					reachableDigests[layerDigest] = struct{}{}
+					cacheID := content.DigestToCacheID(layerDigest)
+					reachableSnapKeys[cacheID] = struct{}{}
+				}
 			}
-		}
+			return nil
+		})
+	}); err != nil {
+		log.Warnf("[gc] failed to read container metadata: %v", err)
 	}
 
 	// 3. 从已标记的快照出发，递归标记其父链
@@ -347,7 +365,7 @@ func (g *Collector) sweepContent(ctx context.Context, reachable map[string]struc
 	// 先删除文件，再批量清理 boltdb 元数据
 	for _, digest := range toDelete {
 		if err := g.content.Delete(ctx, digest); err != nil {
-			log.Printf("[gc] 删除 content %s 失败: %v\n", digest, err)
+			log.Warnf("[gc] failed to delete content digest=%s: %v", digest, err)
 			continue
 		}
 		deleted++
@@ -410,7 +428,7 @@ func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]str
 
 			// 可以安全删除
 			if err := g.snapshotter.Remove(ctx, name); err != nil {
-				log.Printf("[gc] 删除 snapshot %s 失败: %v\n", name, err)
+				log.Warnf("[gc] failed to delete snapshot name=%s: %v", name, err)
 				continue
 			}
 			deletedThisRound = append(deletedThisRound, name)
@@ -421,7 +439,7 @@ func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]str
 			if err := g.db.Update(func(tx *bolt.Tx) error {
 				return metadata.DeleteSnapshot(tx, name)
 			}); err != nil {
-				log.Printf("[gc] 删除 snapshot %s 元数据失败: %v\n", name, err)
+				log.Warnf("[gc] failed to delete snapshot metadata name=%s: %v", name, err)
 			}
 
 			// 减少父快照的引用计数（O(1) 查找，替代 O(n²) 遍历）
@@ -434,7 +452,7 @@ func (g *Collector) sweepSnapshots(ctx context.Context, reachable map[string]str
 		// 对齐 containerd: 跳过而非强制删除，避免破坏可达快照的父链
 		// 这些快照将在下次 GC 时重新评估（可能引用它的快照已被其他 GC 周期清理）
 		if len(deletedThisRound) == 0 {
-			log.Printf("[gc] 拓扑排序无法继续，跳过 %d 个未标记快照（可能存在循环引用），等待下次 GC 评估\n", len(toDelete))
+			log.Warnf("[gc] snapshot topology sort stalled, skipping %d unreferenced snapshots", len(toDelete))
 			break
 		}
 

@@ -1,0 +1,36 @@
+# mini-containerd 配置文件
+# 对齐 containerd: /etc/containerd/config.toml
+# 配置加载优先级: 配置文件中的值 > constants 包中的默认值
+
+# 全局配置
+# 默认 snapshotter 类型，可选 "overlay" 或 "native"
+default_snapshotter = "overlay"
+
+# 插件专属配置
+# 对齐 containerd: [plugins."io.containerd.service.v1.xxx"]
+[plugins]
+
+  # metadata 数据库插件
+  # 对齐 containerd: [plugins."io.containerd.metadata.v1.bolt"]
+  [plugins."service.metadata"]
+    path = "/var/lib/mini-docker/metadata/metadata.db"
+
+  # Content Store 插件
+  # 对齐 containerd: [plugins."io.containerd.content.v1.content"]
+  [plugins."content.filesys"]
+    root = "/var/lib/mini-docker/content/sha256"
+
+  # OverlayFS Snapshotter 插件
+  # 对齐 containerd: [plugins."io.containerd.snapshotter.v1.overlayfs"]
+  [plugins."snapshotter.overlay"]
+    root = "/var/lib/mini-docker/snapshots/overlay"
+
+  # Native Snapshotter 插件
+  # 对齐 containerd: [plugins."io.containerd.snapshotter.v1.native"]
+  [plugins."snapshotter.native"]
+    root = "/var/lib/mini-docker/snapshots/overlay-native"
+
+  # GC 收集器插件
+  # 对齐 containerd: [plugins."io.containerd.service.v1.garbage_collector"]
+  [plugins."service.gc"]
+    interval = "5m"

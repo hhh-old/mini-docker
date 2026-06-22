@@ -60,6 +60,9 @@ const (
 
 	// ContainerdLogPath 是 containerd 独立进程的日志文件路径
 	ContainerdLogPath = "/var/log/mini-docker/containerd.log"
+
+	// ContainerdConfigPath 是 containerd 配置文件路径（对齐 containerd: /etc/containerd/config.toml）
+	ContainerdConfigPath = "/etc/mini-docker/containerd.toml"
 )
 
 // 缓冲区大小常量

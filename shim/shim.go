@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -236,7 +237,7 @@ func run(containerID, bundlePath string, isTTY bool) (retErr error) {
 	log.Printf("[shim] 容器 %s: 用户进程已启动 (PID=%d)\n", containerID, containerPID)
 
 	// 11. 异步等待容器进程退出
-	go waitContainerExit(containerPID, ctx.exitInfo, shimContainerDir, containerID)
+	go waitContainerExit(containerPID, ctx.exitInfo, shimContainerDir, containerID, ctx.exitReady, &ctx.exitOnce)
 
 	// 12. 阻塞等待 shutdown 信号
 	<-ctx.shutdownDone       // 1. 阻塞等待关闭信号
@@ -418,7 +419,7 @@ func runtimeCreate(containerID, bundlePath string, containerPTY *pty.PTY, logFil
 }
 
 // waitContainerExit 等待容器进程退出并保存退出信息
-func waitContainerExit(containerPID int, exitInfo *types.ExitInfo, shimContainerDir, containerID string) {
+func waitContainerExit(containerPID int, exitInfo *types.ExitInfo, shimContainerDir, containerID string, exitReady chan struct{}, exitOnce *sync.Once) {
 	exitCode := waitForContainerExit(containerPID) // 1. 阻塞等待系统调用 Wait4 返回,等待容器进程结束
 	exitInfo.ExitCode = exitCode
 	exitInfo.ExitedAt = time.Now().Format(time.RFC3339)
@@ -430,6 +431,9 @@ func waitContainerExit(containerPID int, exitInfo *types.ExitInfo, shimContainer
 	}
 
 	log.Printf("[shim] 容器 %s: 已退出 (exit_code=%d)\n", containerID, exitCode)
+
+	// 通知 handleExitInfo 容器已退出，Daemon 可立即获取退出信息
+	exitOnce.Do(func() { close(exitReady) })
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +563,7 @@ func runTakeover(containerID, bundlePath string, containerPID int) (retErr error
 	log.Printf("[shim] 容器 %s: takeover 模式，接管 PID=%d\n", containerID, containerPID)
 
 	// 等待容器进程退出
-	go waitContainerExit(containerPID, exitInfo, shimContainerDir, containerID)
+	go waitContainerExit(containerPID, exitInfo, shimContainerDir, containerID, exitReady, &ctx.exitOnce)
 
 	<-shutdownDone
 	return nil

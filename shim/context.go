@@ -25,7 +25,8 @@ type shimContext struct {
 	containerID  string
 	containerPID int
 	pidMu        sync.Mutex
-	exitReady    <-chan struct{}
+	exitReady    chan struct{}
+	exitOnce     sync.Once
 	exitInfo     *types.ExitInfo
 	shutdownDone chan struct{}
 	shutdownOnce sync.Once

@@ -39,11 +39,17 @@ package containerd
 
   文件拆分：
   - server_linux.go          ← 核心结构体、初始化、启动/停止、连接处理、路由
-  - handler_task_linux.go    ← Task 生命周期处理器
+  - handler_task_linux.go    ← Task 生命周期处理器（薄层，委托 task.Service 插件）
   - handler_image_linux.go   ← 镜像管理处理器
   - handler_snapshot_linux.go← 快照管理处理器（Prepare/Remove/RegisterCommitted/DiffPath）
   - handler_gc_linux.go      ← GC 处理器
-  - shim_manager_linux.go    ← Shim 进程管理函数
+  - handler_content_linux.go ← Content Store RPC 处理器
+  - handler_container_linux.go← Container 元数据处理器
+
+  插件化服务（通过 Plugin Manager 管理）：
+  - containerd/shim/         ← Shim Manager 插件（shim 进程生命周期）
+  - containerd/runtime/      ← Runtime Service 插件（OCI Runtime 抽象）
+  - containerd/task/         ← Task Service 插件（容器运行时生命周期）
 
 =======================================================================
 */
@@ -57,16 +63,19 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
 	"mini-docker/constants"
 	"mini-docker/containerd/content"
+	"mini-docker/containerd/diff"
+	"mini-docker/containerd/events"
 	"mini-docker/containerd/gc"
 	"mini-docker/containerd/images"
 	"mini-docker/containerd/metadata"
+	"mini-docker/containerd/plugin"
 	"mini-docker/containerd/snapshots"
-	"mini-docker/containerd/snapshots/overlay"
 )
 
 // ---------------------------------------------------------------------------
@@ -76,68 +85,116 @@ import (
 // Containerd containerd 独立进程主体
 // 对齐 Docker: containerd 作为一个独立守护进程运行，有自己的事件循环和状态管理
 //
-// 字段类型说明：
-//   - snapshotter  使用接口 snapshots.Snapshotter（可插拔：overlay/btrfs/native）
-//   - contentStore 使用接口 content.Store（同上：file/blob/s3 等）
-//   - metaDB/imageService/gcCollector  使用具体类型（当前项目唯一实现，未来如需可插拔再升级为接口）
-//
-// 混用接口/具体类型是有意为之：依赖反转原则（"对扩展开放"）仅在确实存在多种实现的边界处
-// 才有价值。snapshotter 和 contentStore 是真实 containerd 中已存在多实现的标准扩展点，
-// 而其他组件（boltdb 元数据库、image 服务、gc 收集器）目前只有单一实现。
+// 重构为使用 Plugin Manager：
+// 所有核心组件（metadata/content/snapshotter/images/gc）通过插件系统管理，
+// Containerd 不再持有各组件的直接引用，而是通过 Plugin Manager 按需获取。
+// 这对齐了真实 containerd 的架构：所有组件都是插件，生命周期由 Plugin Manager 统一管理。
 type Containerd struct {
-	listener     net.Listener
-	shutdown     chan struct{}
-	metaDB       *metadata.DB
-	contentStore content.Store
-	snapshotter  snapshots.Snapshotter // 对齐 containerd: 依赖接口而非具体类型，支持可插拔 Snapshotter
-	imageService *images.Service
-	gcCollector  *gc.Collector
+	listener net.Listener // Unix Socket 监听器
+	shutdown chan struct{}
+	stopOnce sync.Once       // 防止 close(shutdown) 被 double-close 导致 panic
+	plugins  *plugin.Manager // 插件管理器，统一管理所有组件的生命周期
+	config   *plugin.Config  // 插件配置，对齐 containerd: config.toml
+
+	// activeWriters 管理当前活跃的 Content Writer 实例
+	// Writer 创建后需要在多次 RPC 调用间保持状态，直到 Commit 或 Close
+	activeWriters   map[string]content.Writer // ref → Writer
+	activeWritersMu sync.Mutex
 }
 
 // NewContainerd 创建 containerd 实例
-// 关键组件（metadata.DB）初始化失败时返回 error，避免返回不可用的实例
+// 对齐 containerd: 使用 Plugin Manager 管理所有组件的生命周期
+// 1. 加载配置文件（对齐 containerd: /etc/containerd/config.toml）
+// 2. 创建 Plugin Manager
+// 3. 注册所有内置插件
+// 4. 按拓扑排序初始化所有插件
 func NewContainerd() (*Containerd, error) {
 	c := &Containerd{
-		shutdown: make(chan struct{}),
+		shutdown:      make(chan struct{}),
+		plugins:       plugin.NewManager(),
+		activeWriters: make(map[string]content.Writer),
 	}
 	log.Printf("containerd 进程启动")
 
-	// 初始化 metadata.DB（关键组件，失败则直接返回错误）
-	metaDB, err := metadata.Open(constants.MiniDockerRoot + "/metadata.db")
+	// 加载配置文件（对齐 containerd: 从 config.toml 加载）
+	// 配置文件不存在时自动生成默认配置
+	configPath := constants.ContainerdConfigPath
+	cfg, err := plugin.LoadConfig(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("初始化 metadata.DB 失败: %w", err)
+		log.Printf("警告: 加载配置文件 %s 失败: %v，使用默认配置", configPath, err)
+		cfg = plugin.DefaultConfig()
 	}
-	c.metaDB = metaDB
+	c.config = cfg
+	log.Printf("配置文件加载完成: %s (default_snapshotter=%s)", configPath, cfg.DefaultSnapshotter)
 
-	// 初始化 Content Store（关键组件，镜像拉取/删除依赖此存储）
-	contentRoot := constants.ContentStoreDir
-	contentStore, err := content.NewFilesystemStore(contentRoot, metaDB)
-	if err != nil {
-		c.metaDB.Close()
-		return nil, fmt.Errorf("初始化 Content Store 失败: %w", err)
+	// 注册所有内置插件
+	plugin.RegisterBuiltinPlugins(c.plugins)
+
+	// 按拓扑排序初始化所有插件，传入配置
+	if err := c.plugins.Initialize(cfg); err != nil {
+		c.plugins.Close()
+		return nil, fmt.Errorf("初始化插件失败: %w", err)
 	}
-	c.contentStore = contentStore
-
-	// 初始化 Snapshotter（关键组件，镜像层解压和容器运行时依赖此存储）
-	snapRoot := constants.SnapshotterDir
-	snap, err := overlay.NewSnapshotter(snapRoot, metaDB)
-	if err != nil {
-		c.metaDB.Close()
-		return nil, fmt.Errorf("初始化 Snapshotter 失败: %w", err)
-	}
-	c.snapshotter = snap
-
-	// 初始化 Image Service
-	leaseMgr := gc.NewLeaseManager(metaDB)
-	c.imageService = images.NewService(metaDB, contentStore, snap, leaseMgr)
-
-	// 初始化 GC (5分钟周期)
-	// Collector 直接复用 content.Store / snapshots.Snapshotter 接口，
-	// 无需 adapter 层 —— 详见 gc/gc.go 中 Collector 的说明。
-	gcCollector := gc.NewCollector(metaDB, contentStore, snap, 5*time.Minute)
-	c.gcCollector = gcCollector
 
 	return c, nil
+}
+
+// ---------------------------------------------------------------------------
+// 插件访问辅助方法
+// ---------------------------------------------------------------------------
+
+// getImageService 从插件管理器获取镜像服务
+func (c *Containerd) getImageService() *images.Service {
+	inst, _ := c.plugins.Get(plugin.TypeService, "images")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*images.Service)
+}
+
+// getSnapshotterService 从插件管理器获取 Snapshotter Service
+func (c *Containerd) getSnapshotterService() *snapshots.Service {
+	inst, _ := c.plugins.Get(plugin.TypeService, "snapshotter")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*snapshots.Service)
+}
+
+// getDiffService 从插件管理器获取 Diff Service
+func (c *Containerd) getDiffService() *diff.Service {
+	inst, _ := c.plugins.Get(plugin.TypeService, "diff")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*diff.Service)
+}
+
+// getGcCollector 从插件管理器获取 GC 收集器
+func (c *Containerd) getGcCollector() *gc.Collector {
+	inst, _ := c.plugins.Get(plugin.TypeService, "gc")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*gc.Collector)
+}
+
+// getMetaDB 从插件管理器获取元数据数据库
+func (c *Containerd) getMetaDB() *metadata.DB {
+	inst, _ := c.plugins.Get(plugin.TypeService, "metadata")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*metadata.DB)
+}
+
+// getEventService 从插件管理器获取事件服务
+func (c *Containerd) getEventService() *events.Service {
+	inst, _ := c.plugins.Get(plugin.TypeService, "events")
+	if inst == nil {
+		return nil
+	}
+	return inst.(*events.Service)
 }
 
 // Start 启动 containerd 独立进程
@@ -180,31 +237,28 @@ func (c *Containerd) Start() error {
 
 	go c.acceptLoop()
 
-	if c.gcCollector != nil {
-		c.gcCollector.Start()
-		log.Println("GC 守护进程已启动 (周期: 5分钟)")
-	}
+	// GC 已在插件初始化时启动（service.gc 插件的 Init 中调用 collector.Start()）
+	log.Println("GC 守护进程已通过插件系统启动 (周期: 5分钟)")
 
 	return nil
 }
 
 // Stop 优雅关闭 containerd
+// 对齐 containerd: 通过 Plugin Manager 按逆初始化顺序关闭所有插件
 func (c *Containerd) Stop() {
-	close(c.shutdown)
-	if c.gcCollector != nil {
-		c.gcCollector.Stop()
-	}
-	if c.metaDB != nil {
-		c.metaDB.Close()
-	}
-	if c.snapshotter != nil {
-		c.snapshotter.Close()
-	}
-	if c.listener != nil {
-		c.listener.Close()
-	}
-	os.Remove(constants.ContainerdSocketPath)
-	log.Println("containerd 已停止")
+	c.stopOnce.Do(func() {
+		close(c.shutdown)
+		// 插件管理器按逆初始化顺序关闭所有插件
+		// 包括: gc.Stop() → snapshotter.Close() → contentStore.Close() → metaDB.Close()
+		if c.plugins != nil {
+			c.plugins.Close()
+		}
+		if c.listener != nil {
+			c.listener.Close()
+		}
+		os.Remove(constants.ContainerdSocketPath)
+		log.Println("containerd 已停止")
+	})
 }
 
 // acceptLoop 接受 Daemon 的连接
@@ -240,10 +294,10 @@ func isBidirectionalStream(reqType string) bool {
 }
 
 // isProgressStream 判断请求是否为单向进度推送流式请求
-// 单向进度流：pull_image，服务端在 JSON 帧中持续推送下载进度
+// 单向进度流：pull_image，客户端和服务端在 JSON 帧中持续推送下载进度
 // 客户端在 ResultFrame 收到后断开连接，不需要双向转发
 func isProgressStream(reqType string) bool {
-	return reqType == ReqPullImage
+	return reqType == ReqPullImage || reqType == ReqSubscribeEvents
 }
 
 // handleConnection 处理单个 Daemon 连接
@@ -333,6 +387,18 @@ func (c *Containerd) routeRequest(req Request, conn net.Conn) Response {
 		return c.handleResolveImage(req)
 	case ReqRegisterImage:
 		return c.handleRegisterImage(req)
+	case ReqCommitContainer:
+		return c.handleCommitContainer(req)
+	case ReqCreateContainer:
+		return c.handleCreateContainer(req)
+	case ReqGetContainer:
+		return c.handleGetContainer(req)
+	case ReqListContainers:
+		return c.handleListContainers(req)
+	case ReqUpdateContainer:
+		return c.handleUpdateContainer(req)
+	case ReqDeleteContainer:
+		return c.handleDeleteContainer(req)
 	case ReqGC:
 		return c.handleGC(req)
 	case ReqPrepareSnapshot:
@@ -345,6 +411,44 @@ func (c *Containerd) routeRequest(req Request, conn net.Conn) Response {
 		return c.handleCommitSnapshot(req)
 	case ReqWalkSnapshots:
 		return c.handleWalkSnapshots(req)
+	case ReqViewSnapshot:
+		return c.handleViewSnapshot(req)
+	case ReqStatSnapshot:
+		return c.handleStatSnapshot(req)
+	case ReqCleanupSnapshot:
+		return c.handleCleanup(req)
+	case ReqMountsSnapshot:
+		return c.handleMountsSnapshot(req)
+	case ReqUpdateSnapshot:
+		return c.handleUpdateSnapshot(req)
+	case ReqUsageSnapshot:
+		return c.handleUsageSnapshot(req)
+	case ReqContentInfo:
+		return c.handleContentInfo(req)
+	case ReqContentPath:
+		return c.handleContentPath(req)
+	case ReqContentExists:
+		return c.handleContentExists(req)
+	case ReqContentDelete:
+		return c.handleContentDelete(req)
+	case ReqContentWrite:
+		return c.handleContentWrite(req)
+	case ReqContentCommit:
+		return c.handleContentCommit(req)
+	case ReqContentWalk:
+		return c.handleContentWalk(req)
+	case ReqContentUpdate:
+		return c.handleContentUpdate(req)
+	case ReqDiffApply:
+		return c.handleDiffApply(req)
+	case ReqDiffDiff:
+		return c.handleDiffDiff(req)
+	case ReqPublishEvent:
+		return c.handlePublishEvent(req)
+	case ReqSubscribeEvents:
+		return c.handleSubscribeEvents(req, conn)
+	case ReqGetEventArchive:
+		return c.handleGetEventArchive(req)
 	case ReqPing:
 		return Response{Success: true, Message: "pong"}
 	default:

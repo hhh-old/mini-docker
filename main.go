@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -76,6 +78,8 @@ func main() {
 		volumeCommand()
 	case "build":
 		buildCommand()
+	case "commit":
+		commitCommand()
 	case "runtime": //调用运行时
 		runtimeCommand()
 	case "shim":
@@ -111,6 +115,7 @@ func printUsage() {
 	fmt.Println("  mini-docker network  <子命令>               管理容器网络")
 	fmt.Println("  mini-docker volume   <子命令>               管理数据卷")
 	fmt.Println("  mini-docker build    -t <镜像名> <上下文>       构建镜像")
+	fmt.Println("  mini-docker commit   <容器ID> <镜像名>[:标签]   提交容器为新镜像")
 	fmt.Println()
 	fmt.Println("内部命令（对齐 Docker 分层架构）:")
 	fmt.Println("  mini-docker containerd                                容器运行时守护进程 (对标 containerd)")
@@ -582,9 +587,7 @@ func isTerminal() bool {
 
 func handleSIGWINCH(ctx context.Context, containerID string) {
 	sigCh := make(chan os.Signal, 1)
-	// SIGWINCH 是 Linux 特有的信号，Windows 不支持
-	// 使用条件编译或运行时检查
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
 	for {
 		select {
@@ -615,7 +618,12 @@ func psCommand() {
 	execSimpleCmd(daemon.Request{Type: "ps", Args: map[string]string{}},
 		"列出容器", func(resp *daemon.Response) {
 			data, _ := json.Marshal(resp.Data)
-			var containers []*containerstore.ContainerInfo
+			// Status 已迁移到 TaskState，handlePs 返回的容器数据包含附加的 status 字段
+			type containerWithStatus struct {
+				*containerstore.ContainerInfo
+				Status string `json:"status"`
+			}
+			var containers []containerWithStatus
 			if err := json.Unmarshal(data, &containers); err != nil {
 				fmt.Printf("解析容器列表失败: %v\n", err)
 				os.Exit(1)
@@ -705,19 +713,55 @@ func logsCommand() {
 }
 
 func eventsCommand() {
-	execSimpleCmd(daemon.Request{Type: "events", Args: map[string]string{}},
-		"获取事件", func(resp *daemon.Response) {
-			if resp.Data != nil {
-				data, _ := json.Marshal(resp.Data)
-				var events []map[string]interface{}
-				if err := json.Unmarshal(data, &events); err == nil {
-					for _, e := range events {
-						edata, _ := json.Marshal(e)
-						fmt.Println(string(edata))
-					}
-				}
+	// 默认流式订阅，支持 --since / --until 参数
+	args := map[string]string{"stream": "true"}
+	for i, arg := range os.Args[2:] {
+		switch arg {
+		case "--since":
+			if i+1 < len(os.Args[2:]) {
+				args["since"] = os.Args[2:][i+1]
 			}
-		}, "")
+		case "--until":
+			if i+1 < len(os.Args[2:]) {
+				args["until"] = os.Args[2:][i+1]
+			}
+		}
+	}
+
+	client := daemon.NewClient()
+	conn, resp, err := client.SendStream(daemon.Request{Type: "events", Args: args})
+	if err != nil {
+		fmt.Printf("错误: %v\n", err)
+		os.Exit(1)
+	}
+	if resp != nil && !resp.Success {
+		fmt.Printf("获取事件失败: %s\n", resp.Message)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// 捕获 Ctrl+C 优雅退出
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		conn.Close()
+		os.Exit(0)
+	}()
+
+	decoder := json.NewDecoder(conn)
+	for {
+		var ev map[string]interface{}
+		if err := decoder.Decode(&ev); err != nil {
+			if err == io.EOF {
+				return
+			}
+			fmt.Printf("读取事件流失败: %v\n", err)
+			os.Exit(1)
+		}
+		data, _ := json.Marshal(ev)
+		fmt.Println(string(data))
+	}
 }
 
 func imagesCommand() {
@@ -990,6 +1034,40 @@ func buildCommand() {
 			fmt.Printf("构建成功: %s\n", imageID)
 		}
 	}
+}
+
+// commitCommand 将容器的可写层提交为新镜像（对齐 docker commit）
+func commitCommand() {
+	args := os.Args[2:]
+	if len(args) < 2 {
+		fmt.Println("用法: mini-docker commit <容器ID> <镜像名>[:标签]")
+		fmt.Println("示例:")
+		fmt.Println("  mini-docker commit abc123 myimage")
+		fmt.Println("  mini-docker commit abc123 myimage:v2")
+		os.Exit(1)
+	}
+
+	containerID := args[0]
+	imageRef := args[1]
+
+	// 解析镜像名和标签
+	var imageName, tag string
+	if idx := strings.LastIndex(imageRef, ":"); idx != -1 && idx > 0 {
+		imageName = imageRef[:idx]
+		tag = imageRef[idx+1:]
+	} else {
+		imageName = imageRef
+		tag = "latest"
+	}
+
+	execSimpleCmd(daemon.Request{
+		Type: "commit",
+		Args: map[string]string{
+			"container_id": containerID,
+			"image_name":   imageName,
+			"tag":          tag,
+		},
+	}, "提交容器", nil, "容器已提交为镜像 %s:%s", imageName, tag)
 }
 
 func runtimeCommand() {

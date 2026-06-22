@@ -13,19 +13,21 @@ import (
 	"fmt"
 	"os"
 
+	"mini-docker/containerstore"
 	"mini-docker/libcontainer/cgroups"
 	"mini-docker/libcontainer/configs"
 )
 
-// Status 容器状态
-type Status = string
+// Status 容器状态类型，引用 containerstore 中的权威定义
+// 对齐 containerd 分层原则：状态常量定义在共享包中，消除上层对 libcontainer 的跨层依赖
+type Status = containerstore.Status
 
 const (
-	StatusCreated  Status = "created"
-	StatusCreating Status = "creating"
-	StatusRunning  Status = "running"
-	StatusPaused   Status = "paused"
-	StatusStopped  Status = "stopped"
+	StatusCreated  Status = containerstore.StatusCreated
+	StatusCreating Status = containerstore.StatusCreating
+	StatusRunning  Status = containerstore.StatusRunning
+	StatusPaused   Status = containerstore.StatusPaused
+	StatusStopped  Status = containerstore.StatusStopped
 )
 
 // containerRunState 容器运行时状态（纯内存态，对标 runc 的 containerState 接口）

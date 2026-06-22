@@ -14,7 +14,8 @@ package containerd
   - Shim 生命周期：ReqShutdownShim / ReqRestartShim / ReqIsShimAlive / ReqReadShimPID
   - 任务状态：ReqGetTaskState / ReqGetExitInfo / ReqReadExitInfo / ReqWaitForCreate / ReqListTasks
   - 流式连接：ReqAttachTask / ReqExecTaskStream / ReqResizeTask
-  - 快照：ReqPrepareSnapshot / ReqRemoveSnapshot / ReqDiffPath
+  - 快照：ReqPrepareSnapshot / ReqRemoveSnapshot / ReqDiffPath / ReqCommitSnapshot / ReqWalkSnapshots / ReqViewSnapshot / ReqStatSnapshot / ReqMountsSnapshot / ReqUpdateSnapshot / ReqUsageSnapshot / ReqCleanupSnapshot
+  - 容器元数据：ReqCreateContainer / ReqGetContainer / ReqListContainers / ReqUpdateContainer / ReqDeleteContainer
   - 运维：ReqGC / ReqPing
 
 =======================================================================
@@ -69,18 +70,70 @@ const (
 	ReqResolveImage = "resolve_image"
 	// ReqRegisterImage 注册一个已构建好的镜像（builder 调用）
 	ReqRegisterImage = "register_image"
+	// ReqCommitContainer 将容器的可写层提交为新镜像（对齐 docker commit）
+	ReqCommitContainer = "commit_container"
+	// ReqCreateContainer 创建容器元数据记录（对齐 containerd: containers.Store.Create）
+	ReqCreateContainer = "create_container"
+	// ReqGetContainer 查询容器元数据（对齐 containerd: containers.Store.Get）
+	ReqGetContainer = "get_container"
+	// ReqListContainers 列出所有容器元数据（对齐 containerd: containers.Store.List）
+	ReqListContainers = "list_containers"
+	// ReqUpdateContainer 更新容器元数据（对齐 containerd: containers.Store.Update）
+	ReqUpdateContainer = "update_container"
+	// ReqDeleteContainer 删除容器元数据（对齐 containerd: containers.Store.Delete）
+	ReqDeleteContainer = "delete_container"
 	// ReqGC 手动触发垃圾回收
 	ReqGC = "gc"
 	// ReqPrepareSnapshot 创建容器可写层快照（对齐 containerd: Snapshotter.Prepare）
 	ReqPrepareSnapshot = "prepare_snapshot"
 	// ReqRemoveSnapshot 删除容器快照（对齐 containerd: Snapshotter.Remove）
 	ReqRemoveSnapshot = "remove_snapshot"
-	// ReqDiffPath 获取快照的 diff 目录路径（对齐 containerd: Snapshotter.DiffPath）
+	// ReqDiffPath 获取快照的 diff 目录路径（通过 Stat + diff.FSDir 实现）
 	ReqDiffPath = "diff_path"
 	// ReqCommitSnapshot 提交快照（对齐 containerd: Snapshotter.Commit，builder 构建流程使用）
 	ReqCommitSnapshot = "commit_snapshot"
 	// ReqWalkSnapshots 遍历快照（对齐 containerd: Snapshotter.Walk，builder 构建流程使用）
 	ReqWalkSnapshots = "walk_snapshots"
+	// ReqViewSnapshot 创建只读活跃快照（对齐 containerd: Snapshotter.View）
+	ReqViewSnapshot = "view_snapshot"
+	// ReqStatSnapshot 查询快照元信息（对齐 containerd: Snapshotter.Stat）
+	ReqStatSnapshot = "stat_snapshot"
+	// ReqCleanupSnapshot 清理已移除/废弃快照的磁盘资源（对齐 containerd: Snapshotter.Cleanup）
+	ReqCleanupSnapshot = "cleanup_snapshot"
+	// ReqMountsSnapshot 获取快照的挂载信息（对齐 containerd: Snapshotter.Mounts）
+	ReqMountsSnapshot = "mounts_snapshot"
+	// ReqUpdateSnapshot 更新快照元信息（对齐 containerd: Snapshotter.Update）
+	ReqUpdateSnapshot = "update_snapshot"
+	// ReqUsageSnapshot 查询快照资源使用量（对齐 containerd: Snapshotter.Usage）
+	ReqUsageSnapshot = "usage_snapshot"
 	// ReqPing 健康检查
 	ReqPing = "ping"
+	// ReqContentInfo 查询 blob 元信息（对齐 containerd: Content Store Info）
+	ReqContentInfo = "content_info"
+	// ReqContentPath 获取 blob 本地存储路径（对齐 containerd: Content Store Path）
+	ReqContentPath = "content_path"
+	// ReqContentExists 检查 blob 是否存在（对齐 containerd: Content Store Exists）
+	ReqContentExists = "content_exists"
+	// ReqContentDelete 删除 blob（对齐 containerd: Content Store Delete）
+	ReqContentDelete = "content_delete"
+	// ReqContentWrite 写入 blob 数据（对齐 containerd: Content Store Writer）
+	ReqContentWrite = "content_write"
+	// ReqContentCommit 提交 blob 并校验 digest（对齐 containerd: Content Store Commit）
+	ReqContentCommit = "content_commit"
+	// ReqContentWalk 遍历所有 blob 元信息（对齐 containerd: Content Store Walk）
+	ReqContentWalk = "content_walk"
+	// ReqContentUpdate 更新 blob 标签（对齐 containerd: Content Store Update）
+	ReqContentUpdate = "content_update"
+
+	// ReqDiffApply 将层差异应用到 Active 快照（对齐 containerd: Diff Apply）
+	ReqDiffApply = "diff_apply"
+	// ReqDiffDiff 计算两个快照之间的差异（对齐 containerd: Diff Diff）
+	ReqDiffDiff = "diff_diff"
+
+	// ReqPublishEvent 发布事件到 containerd 事件总线
+	ReqPublishEvent = "publish_event"
+	// ReqSubscribeEvents 订阅事件流（长连接）
+	ReqSubscribeEvents = "subscribe_events"
+	// ReqGetEventArchive 获取事件归档（支持 since/until 时间过滤）
+	ReqGetEventArchive = "get_event_archive"
 )

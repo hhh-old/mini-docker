@@ -49,13 +49,15 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"mini-docker/constants"
+	"mini-docker/containerd/content"
+	"mini-docker/containerd/diff"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/utils"
@@ -80,6 +82,12 @@ type BuildService interface {
 	// 对齐 containerd: 构建器通过 Snapshotter.Prepare-Commit 注册每层快照，
 	// 确保 GC 和 lowerDirs() 能正确感知构建镜像的层
 	Snapshotter() snapshots.Snapshotter
+	// ContentStore 返回 Content Store 接口，用于 Differ 计算层差异写入 blob
+	// 对齐 containerd: 构建器通过 Differ.Diff() 计算每层的真实 tar blob digest
+	ContentStore() content.Store
+	// Differ 返回层差异计算器接口，由插件系统注入
+	// 对齐 containerd: diff 服务可插拔，构建器通过此接口计算层差异
+	Differ() diff.Differ
 }
 
 type BuildResult struct {
@@ -319,12 +327,13 @@ func Build(config BuildConfig) (*BuildResult, error) {
 
 	// 构建上下文：追踪当前状态
 	buildCtx := &buildContext{
-		svc:        config.Service,
-		snap:       config.Service.Snapshotter(),
-		contextDir: config.ContextDir,
-		workDir:    "/",
-		envVars:    make(map[string]string),
-		imageName:  "",
+		svc:          config.Service,
+		snap:         config.Service.Snapshotter(),
+		contentStore: config.Service.ContentStore(),
+		contextDir:   config.ContextDir,
+		workDir:      "/",
+		envVars:      make(map[string]string),
+		imageName:    "",
 	}
 
 	for i, inst := range instructions {
@@ -386,6 +395,7 @@ func Build(config BuildConfig) (*BuildResult, error) {
 type buildContext struct {
 	svc            BuildService
 	snap           snapshots.Snapshotter // 通过 Snapshotter 统一管理构建层
+	contentStore   content.Store         // Content Store，用于 Differ 计算层差异
 	contextDir     string
 	workDir        string
 	envVars        map[string]string //存储环境变量
@@ -393,6 +403,7 @@ type buildContext struct {
 	exposedPorts   []string
 	imageName      string
 	layers         []string // 记录已 Commit 的层 ID（cacheID）
+	layerDigests   []string // 每层的真实 tar blob digest（sha256:...），由 Differ 计算
 	currentLayerID string   // 当前最顶层的快照 ID，作为下一层的 parent
 }
 
@@ -408,8 +419,8 @@ func (ctx *buildContext) handleFrom(inst DockerfileInstruction) error {
 	}
 
 	// 设置当前层 ID，作为后续 RUN/COPY 的 parent
-	// 注意：这里不需要获取 diffPath，因为：
-	// 1. DiffPath 只返回单层 diff/ 目录，不是完整 rootfs（多层镜像会缺失下层内容）
+	// 注意：这里不需要获取 fs 目录路径，因为：
+	// 1. Stat + diff.FSDir 只返回单层 fs/ 目录，不是完整 rootfs（多层镜像会缺失下层内容）
 	// 2. 后续的 RUN/COPY 会通过 Snapshotter.Prepare(parent=snapshotID) 自动构建完整的 overlay lowerdir 链
 	ctx.currentLayerID = snapshotID
 
@@ -465,24 +476,32 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 	}
 
 	// 2. Mount: 使用 Snapshotter 返回的 mount 信息挂载 overlay
-	// 创建 merged 目录作为挂载点
-	mergedDir := filepath.Join(constants.SnapshotterDir, layerID, "merged")
-	if err := os.MkdirAll(mergedDir, 0755); err != nil {
+	// 对齐 containerd: 挂载点路径不依赖 Snapshotter 内部目录结构
+	// 使用系统临时目录作为挂载点，与 Snapshotter 的存储目录解耦
+	mergedDir, err := os.MkdirTemp("", "mini-docker-build-*")
+	if err != nil {
 		ctx.snap.Remove(context.Background(), layerID)
-		return fmt.Errorf("创建 merged 目录失败: %w", err)
+		return fmt.Errorf("创建临时挂载目录失败: %w", err)
 	}
+	// 记录 merged 目录路径，用于后续 umount 和清理
+	// workDir 是实际文件操作的目标目录，overlay 时等于 mergedDir，bind 时等于 Source
+	// mergedDir 保持为临时目录，确保 defer RemoveAll 只清理临时目录而非 Snapshotter 管理的目录
+	workDir := mergedDir
+	defer os.RemoveAll(mergedDir)
 
+	isOverlayMount := false
 	if len(mounts) > 0 && mounts[0].Type == "overlay" {
+		isOverlayMount = true
 		mountOpts := strings.Join(mounts[0].Options, ",")
 		mountCmd := exec.Command("mount", "-t", "overlay", "overlay", "-o", mountOpts, mergedDir)
 		if err := mountCmd.Run(); err != nil {
 			ctx.snap.Remove(context.Background(), layerID)
 			return fmt.Errorf("挂载 OverlayFS 失败: %w", err)
 		}
-	} else {
-		// 回退：如果没有 overlay mount，直接使用 diff 目录
-		diffPath, _ := ctx.snap.DiffPath(context.Background(), layerID)
-		mergedDir = diffPath
+	} else if len(mounts) > 0 && mounts[0].Type == "bind" {
+		// bind 挂载：直接使用 Source 作为工作目录
+		// 不重新赋值 mergedDir，避免 defer RemoveAll 删除 Snapshotter 管理的目录
+		workDir = mounts[0].Source
 	}
 
 	// 注意：不创建 proc/sys/dev 目录，这些由容器运行时挂载
@@ -490,7 +509,7 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 
 	// 确保 WORKDIR 目录存在（对齐 Docker: WORKDIR 会自动创建目录）
 	if ctx.workDir != "" && ctx.workDir != "/" {
-		workDirPath := filepath.Join(mergedDir, ctx.workDir)
+		workDirPath := filepath.Join(workDir, ctx.workDir)
 		if _, err := os.Stat(workDirPath); os.IsNotExist(err) {
 			os.MkdirAll(workDirPath, 0755)
 		}
@@ -501,7 +520,7 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 	actualExecArgs := make([]string, len(execArgs))
 	for i, a := range execArgs {
 		if a == ctx.mergedDirPlaceholder() {
-			actualExecArgs[i] = mergedDir
+			actualExecArgs[i] = workDir
 		} else {
 			actualExecArgs[i] = a
 		}
@@ -528,8 +547,15 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 	runErr := execCmd.Run()
 
 	// 4. Umount（无论成功失败都必须先卸载，否则 Remove 会因 "device busy" 失败）
-	if len(mounts) > 0 && mounts[0].Type == "overlay" {
-		exec.Command("umount", mergedDir).Run()
+	if isOverlayMount {
+		if err := exec.Command("umount", mergedDir).Run(); err != nil {
+			// umount 失败时尝试懒卸载
+			if lazyErr := exec.Command("umount", "-l", mergedDir).Run(); lazyErr != nil {
+				log.Printf("警告: 卸载 %s 失败 (普通: %v, 懒卸载: %v)，跳过目录清理防止数据损坏",
+					mergedDir, err, lazyErr)
+				return fmt.Errorf("卸载 OverlayFS 失败，请手动执行 umount %s", mergedDir)
+			}
+		}
 	}
 
 	if runErr != nil {
@@ -538,15 +564,24 @@ func (ctx *buildContext) handleRun(inst DockerfileInstruction) error {
 	}
 
 	// 5. Commit: 提交为 Committed 快照
-	if _, err := ctx.snap.Commit(context.Background(), layerID); err != nil {
+	if err := ctx.snap.Commit(context.Background(), layerID, layerID); err != nil {
 		// Commit 失败意味着该层不可用，必须清理并报错
 		// 不能静默追加到 layers，否则后续层会基于损坏的层构建
 		ctx.snap.Remove(context.Background(), layerID)
 		return fmt.Errorf("Commit 层 %s 失败: %w", layerID, err)
 	}
 
+	// 6. 使用 Differ 计算层差异（对齐 containerd: 每层都有真实的 tar blob digest）
+	layerDigest, err := ctx.computeLayerDigest(layerID)
+	if err != nil {
+		// Differ 失败不阻断构建，使用 layerID 作为降级 digest
+		fmt.Printf("    警告: 计算层差异失败: %v\n", err)
+		layerDigest = layerID
+	}
+
 	// 更新上下文
 	ctx.layers = append(ctx.layers, layerID)
+	ctx.layerDigests = append(ctx.layerDigests, layerDigest)
 	ctx.currentLayerID = layerID
 
 	fmt.Printf("    → 层 %s 已生成\n", layerID)
@@ -616,37 +651,46 @@ func (ctx *buildContext) handleCopy(inst DockerfileInstruction) error {
 	}
 
 	// 2. Mount: 挂载 overlay
-	mergedDir := filepath.Join(constants.SnapshotterDir, layerID, "merged")
-	if err := os.MkdirAll(mergedDir, 0755); err != nil {
+	// 对齐 containerd: 挂载点路径不依赖 Snapshotter 内部目录结构
+	mergedDir, err := os.MkdirTemp("", "mini-docker-build-*")
+	if err != nil {
 		ctx.snap.Remove(context.Background(), layerID)
-		return fmt.Errorf("创建 merged 目录失败: %w", err)
+		return fmt.Errorf("创建临时挂载目录失败: %w", err)
 	}
+	// workDir 是实际文件操作的目标目录，overlay 时等于 mergedDir，bind 时等于 Source
+	// mergedDir 保持为临时目录，确保 defer RemoveAll 只清理临时目录而非 Snapshotter 管理的目录
+	workDir := mergedDir
+	defer os.RemoveAll(mergedDir)
 
+	isOverlayMount := false
 	if len(mounts) > 0 && mounts[0].Type == "overlay" {
+		isOverlayMount = true
 		mountOpts := strings.Join(mounts[0].Options, ",")
 		mountCmd := exec.Command("mount", "-t", "overlay", "overlay", "-o", mountOpts, mergedDir)
 		if err := mountCmd.Run(); err != nil {
 			ctx.snap.Remove(context.Background(), layerID)
 			return fmt.Errorf("挂载 OverlayFS 失败: %w", err)
 		}
-	} else {
-		// 回退：直接使用 diff 目录
-		diffPath, _ := ctx.snap.DiffPath(context.Background(), layerID)
-		mergedDir = diffPath
+	} else if len(mounts) > 0 && mounts[0].Type == "bind" {
+		// bind 挂载：直接使用 Source 作为工作目录
+		// 不重新赋值 mergedDir，避免 defer RemoveAll 删除 Snapshotter 管理的目录
+		workDir = mounts[0].Source
 	}
 
 	// 确保 WORKDIR 目录存在（对齐 Docker: WORKDIR 会自动创建目录）
 	if ctx.workDir != "" && ctx.workDir != "/" {
-		workDirPath := filepath.Join(mergedDir, ctx.workDir)
+		workDirPath := filepath.Join(workDir, ctx.workDir)
 		if _, err := os.Stat(workDirPath); os.IsNotExist(err) {
 			os.MkdirAll(workDirPath, 0755)
 		}
 	}
 
-	// 3. 复制文件到 merged 目录
-	targetPath := filepath.Join(mergedDir, dst)
+	// 3. 复制文件到工作目录
+	targetPath := filepath.Join(workDir, dst)
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		exec.Command("umount", mergedDir).Run()
+		if isOverlayMount {
+			exec.Command("umount", mergedDir).Run()
+		}
 		ctx.snap.Remove(context.Background(), layerID)
 		return fmt.Errorf("创建目标目录失败: %w", err)
 	}
@@ -703,19 +747,35 @@ func (ctx *buildContext) handleCopy(inst DockerfileInstruction) error {
 	}
 
 	// 4. Umount
-	if len(mounts) > 0 && mounts[0].Type == "overlay" {
-		exec.Command("umount", mergedDir).Run()
+	if isOverlayMount {
+		if err := exec.Command("umount", mergedDir).Run(); err != nil {
+			// umount 失败时尝试懒卸载
+			if lazyErr := exec.Command("umount", "-l", mergedDir).Run(); lazyErr != nil {
+				log.Printf("警告: 卸载 %s 失败 (普通: %v, 懒卸载: %v)，跳过目录清理防止数据损坏",
+					mergedDir, err, lazyErr)
+				return fmt.Errorf("卸载 OverlayFS 失败，请手动执行 umount %s", mergedDir)
+			}
+		}
 	}
 
 	// 5. Commit: 提交为 Committed 快照
-	if _, err := ctx.snap.Commit(context.Background(), layerID); err != nil {
+	if err := ctx.snap.Commit(context.Background(), layerID, layerID); err != nil {
 		// Commit 失败意味着该层不可用，必须清理并报错
 		ctx.snap.Remove(context.Background(), layerID)
 		return fmt.Errorf("Commit 层 %s 失败: %w", layerID, err)
 	}
 
+	// 6. 使用 Differ 计算层差异（对齐 containerd: 每层都有真实的 tar blob digest）
+	layerDigest, err := ctx.computeLayerDigest(layerID)
+	if err != nil {
+		// Differ 失败不阻断构建，使用 layerID 作为降级 digest
+		fmt.Printf("    警告: 计算层差异失败: %v\n", err)
+		layerDigest = layerID
+	}
+
 	// 更新上下文
 	ctx.layers = append(ctx.layers, layerID)
+	ctx.layerDigests = append(ctx.layerDigests, layerDigest)
 	ctx.currentLayerID = layerID
 
 	fmt.Printf("    → 层 %s 已生成\n", layerID)
@@ -776,6 +836,50 @@ func (ctx *buildContext) handleExpose(inst DockerfileInstruction) error {
 	return nil
 }
 
+// computeLayerDigest 使用 Differ 计算已 Commit 层的真实 tar blob digest
+// 对齐 containerd: 构建器每层都通过 Differ.Diff() 计算差异，
+// 生成 tar.gz blob 写入 Content Store，返回真实的 sha256 digest
+func (ctx *buildContext) computeLayerDigest(layerID string) (string, error) {
+	if ctx.contentStore == nil || ctx.snap == nil {
+		return "", fmt.Errorf("ContentStore 或 Snapshotter 未配置")
+	}
+
+	// 获取当前层的 Mount 信息（Committed 快照，包含 lowerdir）
+	upperMounts, err := ctx.snap.Mounts(context.Background(), layerID)
+	if err != nil {
+		return "", fmt.Errorf("获取层挂载信息失败: %w", err)
+	}
+
+	// 获取父层的 Mount 信息（作为 lower）
+	info, err := ctx.snap.Stat(context.Background(), layerID)
+	if err != nil {
+		return "", fmt.Errorf("获取层快照信息失败: %w", err)
+	}
+
+	var lowerMounts []snapshots.Mount
+	if info.Parent != "" {
+		lowerMounts, err = ctx.snap.Mounts(context.Background(), info.Parent)
+		if err != nil {
+			return "", fmt.Errorf("获取父层挂载信息失败: %w", err)
+		}
+	}
+
+	// 使用注入的 Differ 计算差异（对齐 containerd: diff 服务可插拔）
+	var differ diff.Differ
+	if ctx.svc != nil {
+		differ = ctx.svc.Differ()
+	}
+	if differ == nil {
+		return "", fmt.Errorf("Differ 未配置")
+	}
+	result, err := differ.Diff(context.Background(), lowerMounts, upperMounts, ctx.contentStore)
+	if err != nil {
+		return "", fmt.Errorf("Differ.Diff 失败: %w", err)
+	}
+
+	return result.Digest, nil
+}
+
 // envSlice 将 envVars map 转换为 "KEY=VALUE" 切片，用于 exec.Cmd.Env
 func (ctx *buildContext) envSlice() []string {
 	var env []string
@@ -804,27 +908,21 @@ func (ctx *buildContext) saveFinalImage(name, tag string) (*metadata.Image, erro
 	// TopLayerSnapshotID 是最后一层的 ID（已是 cacheID/snapshot key）
 	topLayerSnapshotID := ctx.currentLayerID
 
-	// 构建 LayerDigests：使用 layerID（snapshot key）作为 digest
-	// 对齐 containerd: pull 的 LayerDigests 是 sha256:abc...，DigestToCacheID 去掉前缀后
-	// 得到的 cacheID 恰好就是 snapshot 目录名。
-	// build 产生的层没有独立的 blob digest，layerID 本身就是 cacheID（如 run-0-xxx），
-	// 因此直接用 layerID 作为 digest，这样 DigestToCacheID(layerID) = layerID，
-	// CalculateLayersSize / Remove 等流程能通过 DiffPath(layerID) 正确找到快照目录。
-	// 注意：不能使用 computeLayerDigest 计算的 content hash，因为 snapshot 目录名
-	// 是 layerID 而非 content hash，DigestToCacheID(contentHash) 找不到对应目录。
-	var layerDigests []string
-	for _, layerID := range ctx.layers {
-		layerDigests = append(layerDigests, layerID)
-	}
+	// 对齐 containerd: LayerDigests 使用 Differ 计算的真实 tar blob digest（sha256:...）
+	// 每层在 Commit 后已通过 computeLayerDigest 计算并存储在 layerDigests 中
+	// 如果 Differ 失败，降级使用 layerID 作为 digest
+	layerDigests := ctx.layerDigests
 
-	// 计算镜像大小：所有层的 diff 目录大小之和（对齐 Docker: 镜像大小 = 各层大小总和）
+	// 计算镜像大小：所有层的 Usage 之和（对齐 Docker: 镜像大小 = 各层大小总和）
+	// 对齐 containerd: 通过 snap.Usage() 获取快照资源使用量，而非手动拼接路径
 	var totalSize int64
 	if ctx.snap != nil {
 		for _, layerID := range ctx.layers {
-			diffPath, err := ctx.snap.DiffPath(context.Background(), layerID)
-			if err == nil {
-				totalSize += calculateDirSize(diffPath)
+			usage, err := ctx.snap.Usage(context.Background(), layerID)
+			if err != nil {
+				continue
 			}
+			totalSize += usage.Size
 		}
 	}
 	imageSize := formatImageSize(totalSize)

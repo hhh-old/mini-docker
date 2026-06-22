@@ -64,7 +64,7 @@ type RegistryClient struct {
 	token        string //当前缓存的 Bearer Token
 	tokenScope   string //及其适用范围（tokenScope）
 	client       *http.Client
-	contentStore content.Store // blob 存储接口（对齐 containerd: 所有 blob 写入通过 contentStore 完成）
+	contentStore *content.Service // blob 存储服务（对齐 containerd: 所有 blob 写入通过 Content Service 完成）
 }
 
 // OCIManifest OCI Image Manifest V2 格式（对齐 Docker）
@@ -203,7 +203,7 @@ type tokenResponse struct {
 //   - "https://my-registry/v2/"          → scheme=https, host=my-registry（路径被忽略，统一由客户端拼 /v2/...）
 //
 // 不接受：含 userinfo 或除 http/https 外 scheme 的输入（Registry V2 不支持）
-func NewRegistryClient(host string, contentStore content.Store) *RegistryClient {
+func NewRegistryClient(host string, contentStore *content.Service) *RegistryClient {
 	if host == "" {
 		panic("NewRegistryClient: host 不能为空")
 	}
@@ -442,7 +442,7 @@ type BlobProgressFunc func(total, completed int64)
 // 返回下载的 blob 文件路径（content/sha256/<hex>）和 SHA256 校验结果
 // progressFn 可为 nil，表示不需要进度回调
 // 401 时自动重新认证并重试（与 fetchManifestBlob 行为对齐）
-func (rc *RegistryClient) DownloadBlob(repository, digest string, progressFn BlobProgressFunc) (string, error) {
+func (rc *RegistryClient) DownloadBlob(repository, digest string, expectedSize int64, progressFn BlobProgressFunc) (string, error) {
 	ctx := context.Background()
 
 	// 对齐 containerd: 通过 contentStore.Exists() 检查 blob 是否已存在
@@ -464,7 +464,7 @@ func (rc *RegistryClient) DownloadBlob(repository, digest string, progressFn Blo
 	defer resp.Body.Close()
 
 	// 把流式字节写到 contentStore
-	return rc.downloadBlobViaContentStore(resp, digest, progressFn)
+	return rc.downloadBlobViaContentStore(resp, digest, expectedSize, progressFn)
 }
 
 // fetchBlobResponse 纯 HTTP 拉 blob 响应，401 时重试（与 fetchManifestBlob 行为对齐）
@@ -521,7 +521,7 @@ func (rc *RegistryClient) fetchBlobResponse(repository, digest string) (*http.Re
 // downloadBlobViaContentStore 通过 contentStore.Writer() 下载 blob
 // 对齐 containerd: blob 写入的唯一正确路径
 // 流程: contentStore.Writer() → io.Copy(网络流 → writer) → Commit(校验 digest + 写元数据)
-func (rc *RegistryClient) downloadBlobViaContentStore(resp *http.Response, digest string, progressFn BlobProgressFunc) (string, error) {
+func (rc *RegistryClient) downloadBlobViaContentStore(resp *http.Response, digest string, expectedSize int64, progressFn BlobProgressFunc) (string, error) {
 	ctx := context.Background()
 
 	// 解析 mediaType：layer blob 通常是 tar+gzip，config blob 通常是 json
@@ -540,7 +540,12 @@ func (rc *RegistryClient) downloadBlobViaContentStore(resp *http.Response, diges
 
 	// 分块下载并报告进度（对齐 Docker: docker pull 显示的下载进度条）
 	buf := make([]byte, constants.RegistryBlobChunkSize)
+	// 优先使用 HTTP Content-Length，当服务端使用 chunked 传输未返回 Content-Length 时，
+	// 回退到 manifest 中记录的 expectedSize，确保进度百分比始终可显示
 	total := resp.ContentLength
+	if total <= 0 && expectedSize > 0 {
+		total = expectedSize
+	}
 	var completed int64
 	lastReportTime := time.Now()
 
@@ -585,7 +590,7 @@ func (rc *RegistryClient) downloadBlobViaContentStore(resp *http.Response, diges
 // GetImageConfig 下载并解析镜像配置
 // 对齐 containerd: 通过 contentStore.Reader() 读取已存储的 blob，而非直接操作文件系统
 func (rc *RegistryClient) GetImageConfig(repository string, configDesc *OCIDescriptor) (*OCIImageConfig, error) {
-	_, err := rc.DownloadBlob(repository, configDesc.Digest, nil)
+	_, err := rc.DownloadBlob(repository, configDesc.Digest, configDesc.Size, nil)
 	if err != nil {
 		return nil, fmt.Errorf("下载镜像配置失败: %w", err)
 	}

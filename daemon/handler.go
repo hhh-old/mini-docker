@@ -37,11 +37,14 @@ import (
 	"mini-docker/builder"
 	"mini-docker/constants"
 	"mini-docker/containerd"
+	"mini-docker/containerd/content"
+	"mini-docker/containerd/diff"
+	"mini-docker/containerd/diff/walking"
+	containerdEvents "mini-docker/containerd/events"
 	"mini-docker/containerd/images"
 	"mini-docker/containerd/metadata"
 	"mini-docker/containerd/snapshots"
 	"mini-docker/containerstore"
-	"mini-docker/libcontainer"
 	"mini-docker/libcontainer/cgroups"
 	"mini-docker/network"
 	"mini-docker/utils"
@@ -87,6 +90,9 @@ func buildRunRequest(info *containerstore.ContainerInfo) Request {
 	}
 	if info.MaxRestartRetries > 0 {
 		req.Args["max_restart_retries"] = fmt.Sprintf("%d", info.MaxRestartRetries)
+	}
+	if info.Tty {
+		req.Args["tty"] = "true"
 	}
 	return req
 }
@@ -185,7 +191,7 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		imageInfo, err := d.service.InspectImage(imageName)
 		if err == nil && imageInfo != nil && len(imageInfo.Config.Cmd) > 0 {
 			cmd = imageInfo.Config.Cmd
-			fmt.Printf("  使用镜像默认命令: %s\n", strings.Join(cmd, " "))
+			log.Printf("  使用镜像默认命令: %s\n", strings.Join(cmd, " "))
 		} else {
 			return Response{Success: false, Message: "需要指定要执行的命令（镜像未定义 CMD）"}
 		}
@@ -235,9 +241,9 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		name = containerID
 	}
 
-	if existingContainers, err := containerstore.ListContainers(); err == nil {
+	if existingContainers, err := d.service.ListContainers(); err == nil {
 		for _, c := range existingContainers {
-			if c.Name == name && (c.Status == libcontainer.StatusRunning || c.Status == libcontainer.StatusCreated || c.Status == libcontainer.StatusPaused) {
+			if c.Name == name {
 				return Response{Success: false, Message: fmt.Sprintf("容器名 %s 已被使用", name)}
 			}
 		}
@@ -245,29 +251,30 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 
 	// 创建容器可写层快照（对齐 containerd: 通过 Snapshotter.Prepare 注册到 boltdb）
 	// parent 为镜像最顶层的 TopLayerSnapshotID（cacheID），这样 Snapshotter 可以沿 parent 链递归构建多层 lowerdir
-	// GC 通过此关系跟踪容器的快照，删除镜像时不会误删容器正在使用的层
 	overlay, err := d.service.PrepareSnapshot(containerID, topLayerSnapshotID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("创建容器快照失败: %v", err)}
 	}
 
+	// 对齐 Docker: 不指定 --network 时自动连接默认 bridge 网络
+	if netName == "" {
+		netName = network.DefaultNetworkName
+	}
+
 	// 先构建 ContainerInfo（持久化的真相来源）
-	// 运行时字段（Pid、网络信息）在后续步骤中补全
+	// 运行时字段（Pid、网络信息等）由 RuntimeState 管理，不写入 ContainerInfo
 	containerInfo := &containerstore.ContainerInfo{
 		ID:                containerID,
 		Name:              name,
 		Image:             imageName,
 		Cmd:               cmd,
-		Status:            libcontainer.StatusCreated,
 		CreatedAt:         time.Now().Format(constants.TimeFormat),
 		RootFS:            overlay.Merged,
-		OverlayMerged:     overlay.Merged,
 		RestartPolicy:     restartPolicy,
 		MaxRestartRetries: maxRestartRetries,
 		Volumes:           volumes,
 		Network:           netName,
 		PortMap:           portMap,
-		CgroupName:        constants.CgroupPrefix + containerID,
 		Tty:               tty,
 		HealthCmd:         req.Args["health_cmd"],
 		HealthInterval:    req.Args["health_interval"],
@@ -275,30 +282,28 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		HealthRetries:     healthRetries,
 		Memory:            memory,
 		CPUShares:         cpuShares,
+		Runtime:           "runc",
 	}
 
-	// 先保存容器信息到磁盘，containerd 的 handleCreateTask 需要从磁盘读取容器信息来构建 OCI Spec
-	if err := containerstore.SaveContainerInfo(containerInfo); err != nil {
+	// 容器静态元数据只持久化一次，且必须在 CreateTask 之前
+	// 对齐真实 containerd: Container 元数据先落盘，Task.Create 再通过 containerID 查询
+	if err := d.service.CreateContainer(containerInfo); err != nil {
 		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
 	}
 
-	shimPID, err := d.service.CreateTask(containerInfo)
+	shimPID, err := d.service.CreateTask(containerID, constants.CgroupPrefix+containerID)
 	if err != nil {
-		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{CleanupOverlay: true, RemoveInfo: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{RemoveInfo: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("创建任务失败: %v", err)}
 	}
 
 	// 等待容器创建完成（对齐 Docker: runc create 返回后才设置网络）
 	containerPid, err := d.service.WaitForCreate(containerID, 15*time.Second)
 	if err != nil {
-		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
+		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo}, CleanupOptions{DeleteTask: true, RemoveInfo: true, CleanupOverlay: true})
 		return Response{Success: false, Message: fmt.Sprintf("等待容器创建失败: %v", err)}
 	}
-
-	// cgroup 已由 libcontainer 在 runtime create 阶段通过 OCI spec 应用
-	// 对齐 Docker: cgroup 在 runc create 时生效，容器进程从第一行代码就受 cgroup 约束
-
 	// 在 create 和 start 之间设置网络（对齐 Docker: runc create → 设置网络 → runc start）
 	// 为什么在 Daemon 中设置网络是正确的?
 	//		原因 							说明
@@ -307,14 +312,11 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 	//需要全局视点 		IP 分配、端口映射需要跨容器协调，daemon 有全局状态
 	//Docker 的设计 		libnetwork 运行在 dockerd 中，containerd 只负责生命周期
 
-	// 对齐 Docker: 不指定 --network 时自动连接默认 bridge 网络
 	// Docker 的行为: docker run busybox → 自动连接到 bridge 网络（docker0 网桥）
 	// 指定 --network=none 时跳过网络设置（创建独立 netns 但不连接任何网络）
 	// 指定 --network=host 时跳过网络设置（共享宿主机网络栈，spec 中已不含 network namespace）
 	effectiveNetName := netName
-	if effectiveNetName == "" {
-		effectiveNetName = network.DefaultNetworkName
-	} else if effectiveNetName == "none" || effectiveNetName == "host" {
+	if effectiveNetName == "none" || effectiveNetName == "host" {
 		effectiveNetName = ""
 	}
 
@@ -338,29 +340,38 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		network.EnableLoopback(containerPid)
 	}
 
-	// 补全运行时字段
-	containerInfo.Pid = containerPid
-	// 对齐 Docker: Network 字段保存用户指定的网络模式（host/none/bridge/自定义），
-	// 而非 effectiveNetName（内部使用的实际网络名），
-	// 这样容器重启时可以正确恢复网络模式
-	containerInfo.Network = netName
-	if netName == "" {
-		containerInfo.Network = network.DefaultNetworkName
-	}
+	var vethHost, containerIP string
 	if netMgr != nil {
-		containerInfo.VethHost = netMgr.GetVethHost()
-		containerInfo.ContainerIP = netMgr.GetContainerIP()
+		vethHost = netMgr.GetVethHost()
+		containerIP = netMgr.GetContainerIP()
 	}
 
-	if err := containerstore.SaveContainerInfo(containerInfo); err != nil {
-		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true})
-		return Response{Success: false, Message: fmt.Sprintf("保存容器信息失败: %v", err)}
+	// 运行时状态写入 ContainerRuntimeState（Daemon 自己维护，不放在 ContainerInfo 中）
+	runtimeState := &containerstore.ContainerRuntimeState{
+		VethHost:      vethHost,
+		ContainerIP:   containerIP,
+		OverlayMerged: overlay.Merged,
+		CgroupName:    constants.CgroupPrefix + containerID,
+	}
+
+	// TaskState 仅内存，对齐 containerd: shim 是 source of truth
+	taskState := &metadata.TaskState{
+		ContainerID: containerID,
+		PID:         containerPid,
+		ShimPID:     shimPID,
+		Status:      containerstore.StatusCreated,
+	}
+
+	// 运行时状态持久化到 Daemon 自己的 state 文件
+	if err := containerstore.SaveRuntimeState(containerID, runtimeState); err != nil {
+		log.Printf("警告: 保存容器 %s 运行时状态失败: %v\n", containerID, err)
 	}
 
 	d.RegisterContainer(&ContainerLive{
-		Info:    containerInfo,
-		ShimPID: shimPID,
-		NetMgr:  netMgr,
+		Info:      containerInfo,
+		Runtime:   runtimeState,
+		TaskState: taskState,
+		NetMgr:    netMgr,
 	})
 
 	go d.WatchContainer(containerID)
@@ -370,17 +381,24 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		shimConn, err := d.service.AttachTask(containerID)
 		if err != nil {
 			d.UnregisterContainer(containerID)
-			d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
+			d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, Runtime: runtimeState, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 			return Response{Success: false, Message: fmt.Sprintf("attach 到容器失败: %v", err)}
 		}
 		// attach 已建立，现在发送 start 信号
 		if err := d.service.StartTask(containerID); err != nil {
 			log.Printf("启动容器 %s 失败: %v\n", containerID, err)
 			shimConn.Close()
+			d.UnregisterContainer(containerID)
+			d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, Runtime: runtimeState, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 			return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
 		}
-		containerInfo.Status = libcontainer.StatusRunning
-		containerstore.SaveContainerInfo(containerInfo)
+		taskState.Status = containerstore.StatusRunning
+
+		// 启动健康检查（stream 模式也需要）
+		if containerInfo.HealthCmd != "" {
+			go d.runHealthCheckLoop(containerID)
+		}
+
 		streamReady := make(chan struct{})
 		go relayStream(conn, shimConn, streamReady)
 		return Response{Success: true, Data: containerInfo, Stream: true, StreamReady: streamReady}
@@ -392,14 +410,9 @@ func (d *Daemon) runWithID(req Request, conn net.Conn, existingID string) Respon
 		d.cleanupContainerResources(containerID, &ContainerLive{Info: containerInfo, NetMgr: netMgr}, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 		return Response{Success: false, Message: fmt.Sprintf("启动容器失败: %v", err)}
 	}
-	containerInfo.Status = libcontainer.StatusRunning
-	containerstore.SaveContainerInfo(containerInfo)
+	taskState.Status = containerstore.StatusRunning
 
-	d.eventBus.Publish(Event{
-		Type:      "container_start",
-		Container: containerID,
-		Time:      time.Now(),
-	})
+	// task start 事件已由 containerd task.Service 发布，Daemon 不再重复发布
 
 	// 启动健康检查（对齐 Docker: Daemon 周期执行 HEALTHCHECK）
 	if containerInfo.HealthCmd != "" {
@@ -419,21 +432,20 @@ func (d *Daemon) handleStop(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	info, err := containerstore.LoadContainerInfoByID(containerID)
-	if err != nil {
+	if _, err := d.service.GetContainer(containerID); err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 不存在", containerID)}
 	}
 
-	if state, ok := d.GetContainerLive(containerID); ok {
-		state.mu.Lock()
-		state.UserStopped = true
-		state.mu.Unlock()
+	// 获取运行时状态（PID 用于进程存活检查，从 Daemon 本地状态获取）
+	var pid int
+	if live, ok := d.GetContainerLive(containerID); ok && live.TaskState != nil {
+		pid = live.TaskState.PID
 	}
 
 	killed, err := utils.GracefulStopProcess(
 		func(sig syscall.Signal) error { return d.service.KillTask(containerID, sig) },
 		func() bool {
-			return utils.CheckProcessAlive(info.Pid)
+			return utils.CheckProcessAlive(pid)
 		},
 	)
 	if err != nil {
@@ -444,26 +456,36 @@ func (d *Daemon) handleStop(req Request) Response {
 	if killed {
 		exitCode = 128 + int(syscall.SIGKILL)
 	}
-	info.Status = libcontainer.StatusStopped
-	info.ExitCode = exitCode
-	info.Pid = 0
-	info.FinishedAt = utils.NowFormatted()
-	containerstore.SaveContainerInfo(info)
 
+	// 更新运行时状态（Daemon 自己维护，不放在 ContainerInfo 中）
 	var state *ContainerLive
+	var runtimeState *containerstore.ContainerRuntimeState
 	if s, ok := d.GetContainerLive(containerID); ok {
 		state = s
+		runtimeState = state.Runtime
+	} else {
+		runtimeState, _ = containerstore.LoadRuntimeState(containerID)
 	}
+	if runtimeState == nil {
+		runtimeState = &containerstore.ContainerRuntimeState{}
+	}
+	runtimeState.LastExitCode = exitCode
+	runtimeState.LastExitedAt = utils.NowFormatted()
+	runtimeState.UserStopped = true
+	if err := containerstore.SaveRuntimeState(containerID, runtimeState); err != nil {
+		log.Printf("警告: 保存容器 %s 运行时状态失败: %v\n", containerID, err)
+	}
+	if state != nil {
+		state.mu.Lock()
+		state.Runtime = runtimeState
+		state.mu.Unlock()
+	}
+
 	d.UnregisterContainer(containerID)
 
 	d.cleanupContainerResources(containerID, state, CleanupOptions{DeleteTask: true})
 
-	d.eventBus.Publish(Event{
-		Type:      "container_stop",
-		Container: containerID,
-		Time:      time.Now(),
-		Message:   "容器被用户停止",
-	})
+	// task delete 事件已由 containerd task.Service 发布，Daemon 不再重复发布
 
 	return Response{Success: true, Message: fmt.Sprintf("容器 %s 已停止", containerID)}
 }
@@ -474,17 +496,28 @@ func (d *Daemon) handleStart(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
-	info, err := containerstore.LoadContainerInfoByID(containerID)
+	info, err := d.service.GetContainer(containerID)
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("查找容器失败: %v", err)}
 	}
 
-	if info.Status != libcontainer.StatusStopped && info.Status != libcontainer.StatusCreated {
-		return Response{Success: false, Message: fmt.Sprintf("容器状态为 %s，无法启动（仅 stopped/created 可启动）", info.Status)}
+	// 检查容器运行时状态（从 shim 获取实时状态）
+	taskState, _ := d.service.GetTaskState(containerID)
+	status := ""
+	if taskState != nil {
+		status = taskState.Status
+	}
+	if status != containerstore.StatusStopped && status != containerstore.StatusCreated {
+		return Response{Success: false, Message: fmt.Sprintf("容器状态为 %s，无法启动（仅 stopped/created 可启动）", status)}
 	}
 
 	savedInfo := *info
-	savedCgroupName := info.CgroupName
+
+	savedRuntimeState, _ := containerstore.LoadRuntimeState(containerID)
+	savedCgroupName := constants.CgroupPrefix + containerID
+	if savedRuntimeState != nil && savedRuntimeState.CgroupName != "" {
+		savedCgroupName = savedRuntimeState.CgroupName
+	}
 
 	newReq := buildRunRequest(info)
 
@@ -496,10 +529,18 @@ func (d *Daemon) handleStart(req Request) Response {
 	}
 
 	log.Printf("警告: 容器 %s 启动失败，恢复旧容器信息\n", containerID)
-	savedInfo.Status = libcontainer.StatusStopped
-	savedInfo.OverlayMerged = ""
-	savedInfo.CgroupName = savedCgroupName
-	containerstore.SaveContainerInfo(&savedInfo)
+	// 恢复静态元数据
+	if err := d.service.CreateContainer(&savedInfo); err != nil {
+		log.Printf("警告: 恢复容器 %s 静态元数据失败: %v\n", containerID, err)
+	}
+	// 恢复运行时状态，并重置用户手动停止标记
+	if savedRuntimeState == nil {
+		savedRuntimeState = &containerstore.ContainerRuntimeState{}
+	}
+	savedRuntimeState.UserStopped = false
+	if err := containerstore.SaveRuntimeState(containerID, savedRuntimeState); err != nil {
+		log.Printf("警告: 恢复容器 %s 运行时状态失败: %v\n", containerID, err)
+	}
 	if savedCgroupName != "" {
 		cgroups.RemoveCgroup(savedCgroupName)
 	}
@@ -516,16 +557,11 @@ func (d *Daemon) handlePause(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("暂停容器失败: %v", err)}
 	}
 
-	if info, err := containerstore.LoadContainerInfoByID(containerID); err == nil {
-		info.Status = libcontainer.StatusPaused
-		containerstore.SaveContainerInfo(info)
+	if live, ok := d.GetContainerLive(containerID); ok && live.TaskState != nil {
+		live.TaskState.Status = containerstore.StatusPaused
 	}
 
-	d.eventBus.Publish(Event{
-		Type:      "container_pause",
-		Container: containerID,
-		Time:      time.Now(),
-	})
+	// task paused 事件已由 containerd task.Service 发布，Daemon 不再重复发布
 
 	return Response{Success: true, Message: fmt.Sprintf("容器 %s 已暂停", containerID)}
 }
@@ -540,16 +576,11 @@ func (d *Daemon) handleUnpause(req Request) Response {
 		return Response{Success: false, Message: fmt.Sprintf("恢复容器失败: %v", err)}
 	}
 
-	if info, err := containerstore.LoadContainerInfoByID(containerID); err == nil {
-		info.Status = libcontainer.StatusRunning
-		containerstore.SaveContainerInfo(info)
+	if live, ok := d.GetContainerLive(containerID); ok && live.TaskState != nil {
+		live.TaskState.Status = containerstore.StatusRunning
 	}
 
-	d.eventBus.Publish(Event{
-		Type:      "container_unpause",
-		Container: containerID,
-		Time:      time.Now(),
-	})
+	// task resumed 事件已由 containerd task.Service 发布，Daemon 不再重复发布
 
 	return Response{Success: true, Message: fmt.Sprintf("容器 %s 已恢复", containerID)}
 }
@@ -560,43 +591,60 @@ func (d *Daemon) handleRm(req Request) Response {
 		return Response{Success: false, Message: "需要指定容器ID"}
 	}
 
+	// 检查运行时状态（从 shim 获取实时状态）
 	state, _ := d.service.GetTaskState(containerID)
-	if state != nil && (state.Status == libcontainer.StatusRunning || state.Status == libcontainer.StatusCreated || state.Status == libcontainer.StatusPaused) {
+	if state != nil && (state.Status == containerstore.StatusRunning || state.Status == containerstore.StatusCreated || state.Status == containerstore.StatusPaused) {
+		// 二次验证：检查进程是否真的存活
+		if state.PID > 0 && utils.CheckProcessAlive(state.PID) {
+			return Response{Success: false, Message: fmt.Sprintf("容器 %s 进程仍在运行 (PID: %d)，请先停止容器", containerID, state.PID)}
+		}
 		return Response{Success: false, Message: fmt.Sprintf("容器 %s 正在运行，请先停止容器", containerID)}
 	}
 
-	info, err := containerstore.LoadContainerInfoByID(containerID)
-	if err == nil && (info.Status == libcontainer.StatusRunning || info.Status == libcontainer.StatusPaused) && info.Pid > 0 {
-		if utils.CheckProcessAlive(info.Pid) {
-			return Response{Success: false, Message: fmt.Sprintf("容器 %s 进程仍在运行 (PID: %d)，请先停止容器", containerID, info.Pid)}
-		}
-	}
-
-	if cs, ok := d.GetContainerLive(containerID); ok {
+	if cs, ok := d.GetContainerLive(containerID); ok && cs.Runtime != nil {
 		cs.mu.Lock()
-		cs.UserStopped = true
+		cs.Runtime.UserStopped = true
 		cs.mu.Unlock()
 	}
 	d.UnregisterContainer(containerID)
 
 	d.cleanupContainerResources(containerID, nil, CleanupOptions{DeleteTask: true, CleanupOverlay: true, RemoveInfo: true})
 
-	d.eventBus.Publish(Event{
-		Type:      "container_rm",
-		Container: containerID,
-		Time:      time.Now(),
-	})
+	// container delete 事件已由 containerd containers.Service 发布，Daemon 不再重复发布
 
 	return Response{Success: true, Message: fmt.Sprintf("容器 %s 已删除", containerID)}
 }
 
 func (d *Daemon) handlePs(req Request) Response {
-	containers, err := containerstore.ListContainers()
+	containers, err := d.service.ListContainers()
 	if err != nil {
 		return Response{Success: false, Message: fmt.Sprintf("列出容器失败: %v", err)}
 	}
 
-	return Response{Success: true, Data: containers}
+	// 为每个容器附加运行时状态（优先 Daemon 本地状态，再从 shim 获取实时状态）
+	type containerWithStatus struct {
+		*containerstore.ContainerInfo
+		Status string `json:"status"`
+	}
+	var result []containerWithStatus
+	for _, c := range containers {
+		var status string
+		if live, ok := d.GetContainerLive(c.ID); ok && live.TaskState != nil {
+			status = live.TaskState.Status
+		} else if ts, err := d.service.GetTaskState(c.ID); err == nil && ts != nil {
+			status = ts.Status
+		} else {
+			if runtimeState, _ := containerstore.LoadRuntimeState(c.ID); runtimeState != nil && runtimeState.LastExitedAt != "" {
+				status = containerstore.StatusStopped
+			}
+		}
+		result = append(result, containerWithStatus{
+			ContainerInfo: c,
+			Status:        status,
+		})
+	}
+
+	return Response{Success: true, Data: result}
 }
 
 func (d *Daemon) handleExec(req Request, conn net.Conn) Response {
@@ -654,18 +702,94 @@ func (d *Daemon) handleLogs(req Request) Response {
 	return Response{Success: true, Data: logData}
 }
 
-func (d *Daemon) handleEvents(req Request) Response {
-	archive := d.eventBus.GetArchive()
-	var events []map[string]interface{}
-	for _, e := range archive {
-		events = append(events, map[string]interface{}{
-			"type":      e.Type,
-			"container": e.Container,
-			"time":      e.Time.Format(time.RFC3339),
-			"message":   e.Message,
-		})
+func (d *Daemon) handleEvents(req Request, conn net.Conn) Response {
+	stream := req.Args["stream"] != "false"
+
+	var since, until time.Time
+	if v := req.Args["since"]; v != "" {
+		since, _ = time.Parse(time.RFC3339, v)
 	}
-	return Response{Success: true, Data: events}
+	if v := req.Args["until"]; v != "" {
+		until, _ = time.Parse(time.RFC3339, v)
+	}
+
+	if !stream {
+		archive, err := d.service.GetEventArchive(since, until)
+		if err != nil {
+			return Response{Success: false, Message: fmt.Sprintf("获取事件归档失败: %v", err)}
+		}
+		var out []map[string]interface{}
+		for _, e := range archive {
+			out = append(out, eventToMap(e))
+		}
+		return Response{Success: true, Data: out}
+	}
+
+	// 流式模式：建立到 containerd 的事件订阅，转发给 CLI。
+	filters := parseEventFilters(req.Args["filters"])
+	subConn, err := d.service.SubscribeEvents(filters...)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("订阅事件失败: %v", err)}
+	}
+
+	// 先发送握手响应，然后异步转发事件流。
+	go func() {
+		defer subConn.Close()
+		defer conn.Close()
+
+		// 可选：先推送历史归档
+		if !since.IsZero() || !until.IsZero() {
+			if archive, err := d.service.GetEventArchive(since, until); err == nil {
+				for _, e := range archive {
+					if err := json.NewEncoder(conn).Encode(eventToMap(e)); err != nil {
+						return
+					}
+				}
+			}
+		}
+
+		decoder := json.NewDecoder(subConn)
+		encoder := json.NewEncoder(conn)
+		for {
+			select {
+			case <-d.shutdown:
+				return
+			default:
+			}
+
+			var ev containerdEvents.Envelope
+			if err := decoder.Decode(&ev); err != nil {
+				return
+			}
+			if err := encoder.Encode(eventToMap(&ev)); err != nil {
+				return
+			}
+		}
+	}()
+
+	return Response{Stream: true}
+}
+
+// parseEventFilters 解析事件过滤参数。
+func parseEventFilters(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var filters []string
+	if err := json.Unmarshal([]byte(raw), &filters); err == nil {
+		return filters
+	}
+	return []string{raw}
+}
+
+// eventToMap 把事件信封转换为 CLI 可读的 map 格式。
+func eventToMap(ev *containerdEvents.Envelope) map[string]interface{} {
+	return map[string]interface{}{
+		"topic":     ev.Topic,
+		"namespace": ev.Namespace,
+		"time":      ev.Timestamp.Format(time.RFC3339),
+		"event":     ev.Event,
+	}
 }
 
 func (d *Daemon) handleResize(req Request) Response {
@@ -837,6 +961,12 @@ func (d *Daemon) handleVolumeInspect(req Request) Response {
 	return Response{Success: true, Data: vol}
 }
 
+// getContentStore 获取 Content Store 实例
+// 对齐 containerd: Daemon 通过 RPC 代理访问 Content Store，不再直接创建本地实例
+func (d *Daemon) getContentStore() content.Store {
+	return d.service.ContentStore()
+}
+
 func (d *Daemon) handleBuild(req Request) Response {
 	dockerfilePath := req.Args["dockerfile"]
 	contextDir := req.Args["context"]
@@ -849,7 +979,10 @@ func (d *Daemon) handleBuild(req Request) Response {
 		DockerfilePath: dockerfilePath,
 		ContextDir:     contextDir,
 		Tag:            tag,
-		Service:        &containerdBuildService{client: d.service}, //containerdBuildService 是桥接层，把 builder 的抽象接口映射到 containerd 的具体实现
+		Service: &containerdBuildService{
+			client:       d.service,
+			contentStore: d.getContentStore(),
+		}, //containerdBuildService 是桥接层，把 builder 的抽象接口映射到 containerd 的具体实现
 	}
 
 	result, err := builder.Build(config)
@@ -859,10 +992,51 @@ func (d *Daemon) handleBuild(req Request) Response {
 	return Response{Success: true, Data: result}
 }
 
+// handleCommit 将容器的可写层提交为新镜像（对齐 docker commit）
+// 对齐 containerd: diff.Differ + Snapshotter.Commit
+func (d *Daemon) handleCommit(req Request) Response {
+	containerID := req.Args["container_id"]
+	imageName := req.Args["image_name"]
+	tag := req.Args["tag"]
+	if tag == "" {
+		tag = "latest"
+	}
+
+	if containerID == "" || imageName == "" {
+		return Response{Success: false, Message: "需要指定容器ID和镜像名"}
+	}
+
+	// 检查容器是否存在
+	_, err := d.service.GetContainer(containerID)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("容器 %s 不存在", containerID)}
+	}
+
+	// 检查容器运行时状态（优先 Daemon 本地状态，再从 shim 获取实时状态）
+	var status string
+	if live, ok := d.GetContainerLive(containerID); ok && live.TaskState != nil {
+		status = live.TaskState.Status
+	} else if ts, err := d.service.GetTaskState(containerID); err == nil && ts != nil {
+		status = ts.Status
+	}
+	if status != containerstore.StatusRunning && status != containerstore.StatusStopped {
+		return Response{Success: false, Message: fmt.Sprintf("容器 %s 状态为 %s，无法提交", containerID, status)}
+	}
+
+	img, err := d.service.CommitContainer(containerID, imageName, tag)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("提交容器失败: %v", err)}
+	}
+
+	return Response{Success: true, Data: img, Message: fmt.Sprintf("容器 %s 已提交为镜像 %s:%s", containerID, imageName, tag)}
+}
+
 // containerdBuildService 把 builder.BuildService 桥接到 containerd.Client
 // 让 builder 不直接依赖 containerd 进程通信细节
 type containerdBuildService struct {
-	client *containerd.Client
+	client       *containerd.Client
+	contentStore content.Store
+	differ       diff.Differ // 对齐 containerd: 可插拔的层差异计算器，由插件系统注入
 }
 
 func (s *containerdBuildService) ResolveImage(imageRef string) (string, error) {
@@ -875,4 +1049,18 @@ func (s *containerdBuildService) RegisterImage(info *metadata.Image) error {
 
 func (s *containerdBuildService) Snapshotter() snapshots.Snapshotter {
 	return s.client.Snapshotter()
+}
+
+func (s *containerdBuildService) ContentStore() content.Store {
+	return s.contentStore
+}
+
+// Differ 返回层差异计算器接口
+// 对齐 containerd: diff 服务可插拔，构建器通过此接口计算层差异
+func (s *containerdBuildService) Differ() diff.Differ {
+	if s.differ != nil {
+		return s.differ
+	}
+	// 降级：如果未注入 Differ，创建默认实例
+	return walking.NewLayerDiffer()
 }

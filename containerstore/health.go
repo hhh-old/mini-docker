@@ -95,8 +95,8 @@ func ParseHealthConfig(info *ContainerInfo) *HealthConfig {
 }
 
 // RunHealthCheck 执行一次健康检查
-func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
-	prevResult, _ := LoadHealthResult(info.ID)
+func RunHealthCheck(containerID string, pid int, config *HealthConfig) *HealthResult {
+	prevResult, _ := LoadHealthResult(containerID)
 	failCount := 0
 	if prevResult != nil {
 		failCount = prevResult.FailCount
@@ -115,7 +115,7 @@ func RunHealthCheck(info *ContainerInfo, config *HealthConfig) *HealthResult {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "nsenter",
-		"-t", fmt.Sprintf("%d", info.Pid),
+		"-t", fmt.Sprintf("%d", pid),
 		"-m", "-p", "-n",
 		"/bin/sh", "-c", config.Cmd,
 	)

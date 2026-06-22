@@ -4,113 +4,42 @@ import (
 	"encoding/json"
 	"fmt"
 	"mini-docker/libcontainer/cgroups"
-	"mini-docker/utils"
+	"mini-docker/network"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"mini-docker/constants"
-	"mini-docker/libcontainer"
-	"mini-docker/network"
+	"mini-docker/containerd/metadata"
 	"mini-docker/types"
 )
 
 const (
-	containerStoreDir = constants.ContainerStoreDir
-	containerDataDir  = constants.ContainerDataDir
+	containerDataDir = constants.ContainerDataDir
 )
 
-// 存储位置 ： /var/run/mini-docker/<containerID>.json
-type ContainerInfo struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	Pid               int      `json:"pid"`
-	ShimPID           int      `json:"shim_pid"`
-	Image             string   `json:"image"`
-	Cmd               []string `json:"cmd"`
-	Status            string   `json:"status"` // created, running, paused, stopped, dead, restarting
-	CreatedAt         string   `json:"created_at"`
-	RootFS            string   `json:"rootfs"`
-	CgroupName        string   `json:"cgroup_name"`
-	Network           string   `json:"network"`
-	VethHost          string   `json:"veth_host"`
-	ContainerIP       string   `json:"container_ip"`
-	PortMap           string   `json:"port_map"`
-	OverlayMerged     string   `json:"overlay_merged"`      // OverlayFS merged 挂载点（宿主机上已挂载的容器 rootfs）
-	RestartPolicy     string   `json:"restart_policy"`      // no, always, on-failure
-	MaxRestartRetries int      `json:"max_restart_retries"` // on-failure 最大重启次数
-	Tty               bool     `json:"tty"`
-	ExitCode          int      `json:"exit_code"`
-	FinishedAt        string   `json:"finished_at"`
-	Volumes           []string `json:"volumes"` // 记录容器的 volume 挂载
-	HealthCmd         string   `json:"health_cmd"`
-	HealthInterval    string   `json:"health_interval"`
-	HealthTimeout     string   `json:"health_timeout"`
-	HealthRetries     int      `json:"health_retries"`
-	Memory            string   `json:"memory"`
-	CPUShares         string   `json:"cpu_shares"`
-}
+// ContainerInfo 容器元数据，类型别名为 metadata.ContainerInfo
+// 统一使用 metadata.ContainerInfo 作为唯一权威定义，消除重复结构体和 JSON 桥接
+type ContainerInfo = metadata.ContainerInfo
 
-func ListContainers() ([]*ContainerInfo, error) {
-	if err := os.MkdirAll(containerStoreDir, 0755); err != nil {
-		return nil, err
-	}
-
-	entries, err := os.ReadDir(containerStoreDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var containers []*ContainerInfo
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		infoPath := filepath.Join(containerStoreDir, entry.Name())
-		data, err := os.ReadFile(infoPath)
-		if err != nil {
-			continue
-		}
-
-		var c ContainerInfo
-		if err := json.Unmarshal(data, &c); err != nil {
-			continue
-		}
-
-		if c.Status == libcontainer.StatusRunning {
-			if !utils.CheckProcessAlive(c.Pid) {
-				c.Status = libcontainer.StatusStopped
-				_ = SaveContainerInfo(&c)
-			}
-		}
-
-		containers = append(containers, &c)
-	}
-
-	return containers, nil
-}
-
-// CreateOverlayDirs 在 snapshots/overlay/ 下创建容器的 OverlayFS 目录
+// CreateOverlayDirs 在 snapshots/<id>/ 下创建容器的 OverlayFS 目录
 // 对齐 containerd: 容器可写层由 Snapshotter 管理，与镜像层统一管理
 //
 // Deprecated: 此函数绕过 Snapshotter 直接创建目录，不写入 BoltDB 元数据，
 // 导致 GC 和 lowerDirs() 无法感知该快照。请使用 Snapshotter.Prepare() 替代。
 // 当前容器创建流程已通过 containerd.Client.PrepareSnapshot() 走 Snapshotter.Prepare()。
+// 新目录结构: <root>/snapshots/<id>/fs/（对齐 containerd，替代旧版 <root>/<key>/diff/）
 func CreateOverlayDirs(containerID string) (*types.OverlayDirs, error) {
-	// 容器可写层放在 snapshots/overlay/<container-id>/ 下（对齐 containerd）
-	baseDir := filepath.Join(constants.SnapshotterDir, containerID)
-	diffDir := filepath.Join(baseDir, "diff")
+	// 容器可写层放在 snapshots/<container-id>/ 下（对齐 containerd 新目录结构）
+	baseDir := filepath.Join(constants.SnapshotterDir, "snapshots", containerID)
+	fsDir := filepath.Join(baseDir, "fs")
 	mergedDir := filepath.Join(baseDir, "merged")
 	upperDir := filepath.Join(baseDir, "upper")
 	workDir := filepath.Join(baseDir, "work")
 
 	os.RemoveAll(baseDir)
 
-	for _, dir := range []string{diffDir, mergedDir, upperDir, workDir} {
+	for _, dir := range []string{fsDir, mergedDir, upperDir, workDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("创建目录 %s 失败: %w", dir, err)
 		}
@@ -126,98 +55,13 @@ func CreateOverlayDirs(containerID string) (*types.OverlayDirs, error) {
 	}, nil
 }
 
-func getContainerInfoPath(containerID string) string {
-	return filepath.Join(containerStoreDir, containerID+".json")
-}
-
-func SaveContainerInfo(info *ContainerInfo) (retErr error) {
-	if err := os.MkdirAll(containerStoreDir, 0755); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(info, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	infoPath := getContainerInfoPath(info.ID)
-	tmpFile, err := os.CreateTemp(containerStoreDir, "container-")
-	if err != nil {
-		return err
-	}
-	tmpName := tmpFile.Name()
-
-	defer func() {
-		if retErr != nil {
-			tmpFile.Close()
-			os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		retErr = err
-		return retErr
-	}
-	if err := tmpFile.Close(); err != nil {
-		retErr = err
-		return retErr
-	}
-
-	retErr = os.Rename(tmpName, infoPath)
-	return retErr
-}
-
-func RemoveContainerInfo(containerID string) error {
-	return os.Remove(getContainerInfoPath(containerID))
-}
-
-func LoadContainerInfoByID(containerID string) (*ContainerInfo, error) {
-	infoPath := getContainerInfoPath(containerID)
-	data, err := os.ReadFile(infoPath)
-	if err == nil {
-		var c ContainerInfo
-		if err := json.Unmarshal(data, &c); err == nil {
-			return &c, nil
-		}
-	}
-
-	// 直接路径读取失败，按容器名遍历查找
-	entries, err := os.ReadDir(containerStoreDir)
-	if err != nil {
-		return nil, fmt.Errorf("容器 %s 不存在", containerID)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		fullPath := filepath.Join(containerStoreDir, entry.Name())
-		data, err := os.ReadFile(fullPath)
-		if err != nil {
-			continue
-		}
-
-		var c ContainerInfo
-		if err := json.Unmarshal(data, &c); err != nil {
-			continue
-		}
-
-		if c.Name == containerID {
-			return &c, nil
-		}
-	}
-
-	return nil, fmt.Errorf("容器 %s 不存在", containerID)
-}
-
 // CleanupContainerNetwork 通过重建 NetworkManager 并调用 Disconnect() 来清理网络资源
 // 统一使用 NetworkManager.Disconnect() 作为网络清理的唯一实现，避免逻辑重复
-func CleanupContainerNetwork(info *ContainerInfo) {
-	if info.Network == "" && info.VethHost == "" {
+func CleanupContainerNetwork(networkName, portMap, containerIP, vethHost string) {
+	if networkName == "" && vethHost == "" {
 		return
 	}
-	nm := network.NewManagerFromInfo(info.Network, info.PortMap, info.ContainerIP, info.VethHost)
+	nm := network.NewManagerFromInfo(networkName, portMap, containerIP, vethHost)
 	nm.Disconnect()
 }
 

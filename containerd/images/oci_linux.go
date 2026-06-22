@@ -29,8 +29,9 @@ type syscallStat = syscall.Stat_t
 
   层存储结构（对齐 containerd）：
   /var/lib/mini-docker/snapshots/overlay/
-  └── <layer-digest>/
-      └── diff/       ← 该层解压后的文件（Committed 只读快照）
+  └── snapshots/
+      └── <snapshot-id>/
+          └── fs/        ← 该层解压后的文件（Committed 只读快照）
 
   Content Store（对齐 containerd: io.containerd.content.v1.content/blobs/sha256/）：
   /var/lib/mini-docker/content/sha256/
@@ -52,13 +53,19 @@ type syscallStat = syscall.Stat_t
 =======================================================================
 */
 
-// LayerDiffDir 返回指定层 digest 对应的 diff 目录路径
+// LayerDiffDir 返回指定层 digest 对应的 fs 目录路径
 // 用于外部需要直接访问层文件内容的场景（如容器运行时构建 overlay lowerdir）
-// 注意：此函数直接拼接路径，绕过了 Snapshotter 接口。新代码应优先使用 Snapshotter.DiffPath()，
-// 仅在无法获取 Snapshotter 实例时使用此函数（如纯计算场景）
+//
+// Deprecated: 此函数直接拼接路径，无法解析快照 ID（仅通过 digest 推算 cacheID），
+// 在新 Snapshotter 接口下目录结构已从 <root>/<key>/diff/ 变为 <root>/snapshots/<id>/fs/。
+// 调用方应使用 snap.Stat(key) 获取快照 ID，再通过 diff.FSDir(root, id) 构造路径。
+// 仅在无法获取 Snapshotter 实例时使用此函数（如纯计算场景）。
 func LayerDiffDir(digest string) string {
 	cacheID := content.DigestToCacheID(digest)
-	return filepath.Join(constants.SnapshotterDir, cacheID, "diff")
+	// 新目录结构: <root>/snapshots/<id>/fs/（对齐 containerd）
+	// 注意：cacheID 是快照的 name（key），在新结构中目录名使用数字 ID，
+	// 此处仍用 cacheID 作为目录名仅为向后兼容，新代码请使用 diff.FSDir()
+	return filepath.Join(constants.SnapshotterDir, "snapshots", cacheID, "fs")
 }
 
 // DigestToCacheID 已迁移到 content.DigestToCacheID（统一实现，避免多包重复定义）
